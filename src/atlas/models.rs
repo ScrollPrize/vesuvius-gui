@@ -186,6 +186,36 @@ pub struct AtlasMetadata {
     pub models: HashMap<String, Model>,
 }
 
+fn get_standard_url(data: &[DataEntry], data_type: &str) -> Option<String> {
+    for data_entry in data {
+        if data_entry.data_type == data_type {
+            for origin in &data_entry.origins {
+                for access_root in &origin.access_roots {
+                    if access_root.usage == "standard" {
+                        return Some(format!(
+                            "https://data.aws.ash2txt.org/samples/{}",
+                            origin.path.trim_start_matches('/')
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+impl Segment {
+    pub fn get_obj_url(&self) -> Option<String> {
+        get_standard_url(&self.data, "obj")
+    }
+}
+
+impl Volume {
+    pub fn get_ome_zarr_url(&self) -> Option<String> {
+        get_standard_url(&self.data, "ome-zarr")
+    }
+}
+
 impl AtlasMetadata {
     pub fn get_sample(&self, sample_id: &str) -> Option<&AtlasSample> {
         self.samples.get(sample_id)

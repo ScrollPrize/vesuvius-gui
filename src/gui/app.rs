@@ -171,25 +171,6 @@ impl Default for TemplateApp {
 }
 
 impl TemplateApp {
-    fn get_atlas_obj_url(segment: &crate::atlas::Segment) -> Option<String> {
-        for data_entry in &segment.data {
-            if data_entry.data_type == "obj" {
-                for origin in &data_entry.origins {
-                    for access_root in &origin.access_roots {
-                        if access_root.usage == "public" {
-                            return Some(format!(
-                                "{}/{}",
-                                access_root.url.trim_end_matches('/'),
-                                origin.path.trim_start_matches('/')
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
     fn atlas_obj_cache_path(sample_id: &str, segment_id: &str) -> std::path::PathBuf {
         let dir = BaseDirs::new().unwrap().cache_dir().join("vesuvius-gui");
         dir.join(format!("atlas-segments/{}/{}.obj", sample_id, segment_id))
@@ -662,22 +643,38 @@ impl TemplateApp {
                         }
                     }
                 }
-                UINotification::AtlasObjDownloadReady(sample_id, segment_id, _volume_id) => {
+                UINotification::AtlasObjDownloadReady(sample_id, segment_id, volume_id) => {
                     let obj_file = Self::atlas_obj_cache_path(&sample_id, &segment_id);
                     if obj_file.exists() {
+                        let mut volume_url_opt = None;
+                        let mut segment_info = None;
                         if let Some(atlas) = &self.atlas {
                             if let Some(atlas_sample) = atlas.get_sample(&sample_id) {
+                                if let Some(volume) = atlas_sample.get_volume(&volume_id) {
+                                    volume_url_opt = volume.get_ome_zarr_url();
+                                }
                                 if let Some(segment) = atlas_sample.get_segment(&segment_id) {
-                                    println!("Loading atlas segment from cache: {}", obj_file.display());
-                                    self.setup_segment(
-                                        obj_file.to_str().unwrap(),
-                                        segment.properties.width,
-                                        segment.properties.height,
-                                        None,
-                                        ProjectionKind::None,
-                                    );
+                                    segment_info = Some((segment.properties.width, segment.properties.height));
                                 }
                             }
+                        }
+
+                        if let Some(volume_url) = volume_url_opt {
+                            println!("Loading atlas volume from URL: {}", volume_url);
+                            if let Ok(vol_ref) = NewVolumeReference::from_url(volume_url) {
+                                self.load_volume(&vol_ref);
+                            }
+                        }
+
+                        if let Some((width, height)) = segment_info {
+                            println!("Loading atlas segment from cache: {}", obj_file.display());
+                            self.setup_segment(
+                                obj_file.to_str().unwrap(),
+                                width,
+                                height,
+                                None,
+                                ProjectionKind::None,
+                            );
                         }
                     }
                 }
@@ -1044,6 +1041,24 @@ impl TemplateApp {
                 }
 
                 if let Some((sample_id, segment_id, segment)) = atlas_clicked {
+                    if let Some(atlas) = &self.atlas {
+                        if let Some(atlas_sample) = atlas.get_sample(&sample_id) {
+                            if let Some(volume) = atlas_sample.get_volume(&segment.original_volume_id) {
+                                if let Some(volume_url) = volume.get_ome_zarr_url() {
+                                    println!("Loading atlas volume from URL: {}", volume_url);
+                                    match NewVolumeReference::from_url(volume_url) {
+                                        Ok(vol_ref) => {
+                                            self.load_volume(&vol_ref);
+                                        }
+                                        Err(e) => {
+                                            println!("Failed to load volume: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let obj_cache_path = Self::atlas_obj_cache_path(&sample_id, &segment_id);
                     if obj_cache_path.exists() {
                         println!("Loading atlas segment from cache: {}", obj_cache_path.display());
@@ -1054,7 +1069,7 @@ impl TemplateApp {
                             None,
                             ProjectionKind::None,
                         );
-                    } else if let Some(obj_url) = Self::get_atlas_obj_url(&segment) {
+                    } else if let Some(obj_url) = segment.get_obj_url() {
                         println!("Downloading atlas obj from {}", obj_url);
                         let sender = self.notification_sender.clone();
                         ehttp::fetch(ehttp::Request::get(&obj_url), move |response| {
