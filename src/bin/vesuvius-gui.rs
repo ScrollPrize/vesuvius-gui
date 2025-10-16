@@ -1,3 +1,4 @@
+use vesuvius_gui::atlas::load_atlas_from_directory;
 use vesuvius_gui::catalog::load_catalog;
 use vesuvius_gui::gui::{ObjFileConfig, TemplateApp, VesuviusConfig};
 
@@ -45,6 +46,10 @@ pub struct Args {
     /// The id of a volume to open, URL to a zarr/ome-zarr volume, or local path to zarr/ome-zarr directory
     #[clap(short, long)]
     volume: Option<Option<String>>,
+
+    /// Path to vesuvius-atlas data directory
+    #[clap(long)]
+    atlas: Option<String>,
 }
 
 impl TryFrom<Args> for VesuviusConfig {
@@ -137,6 +142,13 @@ async fn main() -> eframe::Result<()> {
     let args = Args::parse();
     let catalog = load_catalog();
 
+    let atlas_path = args.atlas.clone().or_else(|| std::env::var("VESUVIUS_ATLAS").ok());
+    let atlas = atlas_path.and_then(|path| {
+        load_atlas_from_directory(&path)
+            .map_err(|e| eprintln!("Warning: Failed to load atlas from {}: {}", path, e))
+            .ok()
+    });
+
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
 
     let native_options = Default::default();
@@ -146,7 +158,7 @@ async fn main() -> eframe::Result<()> {
         Ok(config) => eframe::run_native(
             "vesuvius-gui",
             native_options,
-            Box::new(|cc| Ok(Box::new(TemplateApp::new(cc, catalog, config)))),
+            Box::new(|cc| Ok(Box::new(TemplateApp::new(cc, catalog, atlas, config)))),
         ),
         Err(e) => {
             eprintln!("{}", e);

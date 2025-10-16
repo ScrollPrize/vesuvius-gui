@@ -1,3 +1,4 @@
+use crate::atlas::AtlasMetadata;
 use crate::catalog::obj_repository::ObjRepository;
 use crate::catalog::Catalog;
 use crate::catalog::Segment;
@@ -66,6 +67,7 @@ impl Default for SegmentMode {
 
 enum UINotification {
     ObjDownloadReady(Segment),
+    AtlasObjDownloadReady(String, String, String),
 }
 
 pub struct ObjFileConfig {
@@ -117,6 +119,8 @@ pub struct TemplateApp {
     #[serde(skip)]
     catalog: Catalog,
     #[serde(skip)]
+    atlas: Option<AtlasMetadata>,
+    #[serde(skip)]
     obj_repository: ObjRepository,
     #[serde(skip)]
     selected_segment: Option<Segment>,
@@ -135,6 +139,7 @@ pub struct TemplateApp {
 impl Default for TemplateApp {
     fn default() -> Self {
         let catalog = Catalog::default();
+        let atlas = None;
         let obj_repository = ObjRepository::new(&catalog);
         let (notification_sender, notification_receiver) = std::sync::mpsc::channel();
         Self {
@@ -152,6 +157,7 @@ impl Default for TemplateApp {
             extra_resolutions: 1,
             segment_mode: None,
             catalog,
+            atlas,
             obj_repository,
             selected_segment: None,
             downloading_segment: None,
@@ -165,8 +171,32 @@ impl Default for TemplateApp {
 }
 
 impl TemplateApp {
+    fn get_atlas_obj_url(segment: &crate::atlas::Segment) -> Option<String> {
+        for data_entry in &segment.data {
+            if data_entry.data_type == "obj" {
+                for origin in &data_entry.origins {
+                    for access_root in &origin.access_roots {
+                        if access_root.usage == "public" {
+                            return Some(format!(
+                                "{}/{}",
+                                access_root.url.trim_end_matches('/'),
+                                origin.path.trim_start_matches('/')
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn atlas_obj_cache_path(sample_id: &str, segment_id: &str) -> std::path::PathBuf {
+        let dir = BaseDirs::new().unwrap().cache_dir().join("vesuvius-gui");
+        dir.join(format!("atlas-segments/{}/{}.obj", sample_id, segment_id))
+    }
+
     /// Called once before the first frame.
-    pub fn new(cc: &eframe::CreationContext<'_>, catalog: Catalog, config: VesuviusConfig) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, catalog: Catalog, atlas: Option<AtlasMetadata>, config: VesuviusConfig) -> Self {
         // This is also where you can customize the look and feel of egui using
         // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
         let mut app: TemplateApp = if let Some(storage) = cc.storage {
@@ -176,6 +206,7 @@ impl TemplateApp {
         };
         app.obj_repository = ObjRepository::new(&catalog);
         app.catalog = catalog;
+        app.atlas = atlas;
         if let Some(dir) = config.data_dir {
             app.data_dir = dir;
         } else {
@@ -621,12 +652,32 @@ impl TemplateApp {
         }
 
         let mut switch_segment = None;
-        for n in self.notification_receiver.try_iter() {
+        let notifications: Vec<_> = self.notification_receiver.try_iter().collect();
+        for n in notifications {
             match n {
                 UINotification::ObjDownloadReady(segment) => {
                     if let Some(obj_file) = self.obj_repository.get(&segment) {
                         if self.downloading_segment.as_ref().map_or(false, |s| s == &segment) {
                             switch_segment = Some((segment, obj_file));
+                        }
+                    }
+                }
+                UINotification::AtlasObjDownloadReady(sample_id, segment_id, _volume_id) => {
+                    let obj_file = Self::atlas_obj_cache_path(&sample_id, &segment_id);
+                    if obj_file.exists() {
+                        if let Some(atlas) = &self.atlas {
+                            if let Some(atlas_sample) = atlas.get_sample(&sample_id) {
+                                if let Some(segment) = atlas_sample.get_segment(&segment_id) {
+                                    println!("Loading atlas segment from cache: {}", obj_file.display());
+                                    self.setup_segment(
+                                        obj_file.to_str().unwrap(),
+                                        segment.properties.width,
+                                        segment.properties.height,
+                                        None,
+                                        ProjectionKind::None,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -935,6 +986,92 @@ impl TemplateApp {
                             });
                     });
                 });
+
+                let mut atlas_clicked = None;
+                if let Some(atlas) = &self.atlas {
+                    for (sample_id, atlas_sample) in &atlas.samples {
+                        egui::CollapsingHeader::new(format!("Atlas: {}", sample_id)).show(ui, |ui| {
+                            let mut table = TableBuilder::new(ui)
+                                .vscroll(true)
+                                .column(Column::auto())
+                                .column(Column::remainder().at_least(130.0))
+                                .column(Column::auto())
+                                .column(Column::auto())
+                                .column(Column::auto());
+
+                            table = table.sense(egui::Sense::click());
+
+                            table
+                                .header(20.0, |mut header| {
+                                    header.col(|_ui| {});
+                                    header.col(|ui| {
+                                        ui.strong("ID");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("Width");
+                                    });
+                                    header.col(|ui| {
+                                        ui.strong("Height");
+                                    });
+                                    header.col(|_ui| {});
+                                })
+                                .body(|mut body| {
+                                    for (segment_id, segment) in &atlas_sample.segments {
+                                        body.row(20.0, |mut row| {
+                                            row.col(|_ui| {});
+                                            fn l(text: impl Into<WidgetText>) -> Label {
+                                                Label::new(text).selectable(false)
+                                            }
+                                            row.col(|ui| {
+                                                l(segment_id).ui(ui);
+                                            });
+                                            row.col(|ui| {
+                                                l(format!("{}", segment.properties.width)).ui(ui);
+                                            });
+                                            row.col(|ui| {
+                                                l(format!("{}", segment.properties.height)).ui(ui);
+                                            });
+                                            row.col(|_ui| {});
+
+                                            if row.response().clicked() {
+                                                atlas_clicked = Some((sample_id.clone(), segment_id.clone(), segment.clone()));
+                                            }
+                                        });
+                                    }
+                                });
+                        });
+                    }
+                }
+
+                if let Some((sample_id, segment_id, segment)) = atlas_clicked {
+                    let obj_cache_path = Self::atlas_obj_cache_path(&sample_id, &segment_id);
+                    if obj_cache_path.exists() {
+                        println!("Loading atlas segment from cache: {}", obj_cache_path.display());
+                        self.setup_segment(
+                            obj_cache_path.to_str().unwrap(),
+                            segment.properties.width,
+                            segment.properties.height,
+                            None,
+                            ProjectionKind::None,
+                        );
+                    } else if let Some(obj_url) = Self::get_atlas_obj_url(&segment) {
+                        println!("Downloading atlas obj from {}", obj_url);
+                        let sender = self.notification_sender.clone();
+                        ehttp::fetch(ehttp::Request::get(&obj_url), move |response| {
+                            if let Ok(response) = response {
+                                let obj_file = Self::atlas_obj_cache_path(&sample_id, &segment_id);
+                                std::fs::create_dir_all(&obj_file.parent().unwrap()).unwrap();
+                                let mut file = std::fs::File::create(&obj_file).unwrap();
+                                let bytes = response.bytes;
+                                println!("Downloaded {} bytes to {}", bytes.len(), obj_file.display());
+                                std::io::copy(&mut std::io::Cursor::new(bytes), &mut file).unwrap();
+                                let volume_id = segment.original_volume_id.clone();
+                                let _ = sender.send(UINotification::AtlasObjDownloadReady(sample_id, segment_id, volume_id));
+                            }
+                        });
+                    }
+                }
+
                 if let Some(segment) = clicked {
                     if let Some(obj_file) = self.obj_repository.get(&segment) {
                         self.load_volume_by_ref(&segment.volume_ref());
