@@ -1,0 +1,217 @@
+use serde::Deserialize;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccessRoot {
+    #[serde(rename = "type")]
+    pub root_type: String,
+    pub url: String,
+    pub usage: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DataOrigin {
+    pub path: String,
+    pub access_roots: Vec<AccessRoot>,
+    pub copy_info: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DataEntry {
+    #[serde(rename = "type")]
+    pub data_type: String,
+    pub origins: Vec<DataOrigin>,
+    pub properties: Option<serde_json::Value>,
+    pub parameters: Option<serde_json::Value>,
+    pub creation_info: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Creation {
+    pub date: String,
+    pub process: String,
+    pub metadata: Option<serde_json::Value>,
+    pub derived_from: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransformTo {
+    pub to_volume_id: String,
+    pub matrix: Vec<Vec<f64>>,
+    pub derivation_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VolumeTransforms {
+    pub from_volume_id: String,
+    pub transforms: Vec<TransformTo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SampleProperties {
+    pub volume_transforms: Option<Vec<VolumeTransforms>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Sample {
+    pub id: String,
+    pub canonical_volume_id: Option<String>,
+    pub properties: Option<SampleProperties>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanProperties {
+    #[serde(rename = "energy_keV")]
+    pub energy_kev: Option<f64>,
+    pub detector_distance_mm: Option<f64>,
+    pub pixel_size_um: Option<f64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Scan {
+    pub id: String,
+    pub sample_id: String,
+    pub long_id: Option<String>,
+    pub creation: Creation,
+    pub properties: Option<ScanProperties>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VolumeProperties {
+    #[serde(rename = "energy_keV")]
+    pub energy_kev: Option<f64>,
+    pub detector_distance_mm: Option<f64>,
+    pub pixel_size_um: Option<f64>,
+    pub data_format: Option<String>,
+    pub shape: Option<Vec<usize>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Volume {
+    pub id: String,
+    pub sample_id: String,
+    pub scan_id: String,
+    pub long_id: Option<String>,
+    pub suffix: Option<String>,
+    pub creation: Creation,
+    pub properties: Option<VolumeProperties>,
+    #[serde(default)]
+    pub data: Vec<DataEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SegmentProperties {
+    pub width: usize,
+    pub height: usize,
+    pub volume_coverage: Option<HashMap<String, serde_json::Value>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Segment {
+    pub id: String,
+    pub sample_id: String,
+    pub long_id: Option<String>,
+    pub suffix: Option<String>,
+    pub original_volume_id: String,
+    pub creation: Creation,
+    pub properties: SegmentProperties,
+    #[serde(default)]
+    pub data: Vec<DataEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelProperties {
+    pub architecture: String,
+    pub task: String,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Model {
+    pub id: String,
+    pub long_id: Option<String>,
+    pub suffix: Option<String>,
+    pub creation: Creation,
+    pub properties: ModelProperties,
+    #[serde(default)]
+    pub data: Vec<DataEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AtlasSample {
+    pub sample: Sample,
+    #[serde(default)]
+    pub scans: HashMap<String, Scan>,
+    #[serde(default)]
+    pub volumes: HashMap<String, Volume>,
+    #[serde(default)]
+    pub segments: HashMap<String, Segment>,
+}
+
+impl AtlasSample {
+    pub fn get_scan(&self, scan_id: &str) -> Option<&Scan> {
+        self.scans.get(scan_id)
+    }
+
+    pub fn get_volume(&self, volume_id: &str) -> Option<&Volume> {
+        self.volumes.get(volume_id)
+    }
+
+    pub fn get_segment(&self, segment_id: &str) -> Option<&Segment> {
+        self.segments.get(segment_id)
+    }
+
+    pub fn find_segments_for_volume(&self, volume_id: &str) -> Vec<&Segment> {
+        self.segments
+            .values()
+            .filter(|s| s.original_volume_id == volume_id)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AtlasMetadata {
+    #[serde(default)]
+    pub samples: HashMap<String, AtlasSample>,
+    #[serde(default)]
+    pub models: HashMap<String, Model>,
+}
+
+impl AtlasMetadata {
+    pub fn get_sample(&self, sample_id: &str) -> Option<&AtlasSample> {
+        self.samples.get(sample_id)
+    }
+
+    pub fn sample_ids(&self) -> Vec<&str> {
+        self.samples.keys().map(|s| s.as_str()).collect()
+    }
+
+    pub fn get_data_urls(&self, data_entry: &DataEntry, usage: &str) -> Vec<String> {
+        data_entry
+            .origins
+            .iter()
+            .flat_map(|origin| {
+                origin
+                    .access_roots
+                    .iter()
+                    .filter(|root| root.usage == usage)
+                    .map(move |root| {
+                        format!(
+                            "{}/{}",
+                            root.url.trim_end_matches('/'),
+                            origin.path.trim_start_matches('/')
+                        )
+                    })
+            })
+            .collect()
+    }
+}
