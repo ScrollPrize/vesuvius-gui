@@ -99,7 +99,6 @@ impl<C: ColorScheme> OmeZarrContext<C> {
                 let cache_path = format!("{}/{}", local_cache_dir, dataset.path);
                 ZarrArray::from_url(&url_path, &cache_path).into_ctx().into_ctx()
             })
-            .take(4) // FIXME
             .collect();
 
         Self {
@@ -129,7 +128,6 @@ impl<C: ColorScheme> OmeZarrContext<C> {
                 let path = format!("{}/{}", path, dataset.path);
                 ZarrArray::from_path(&path).into_ctx().into_ctx()
             })
-            .take(4) // FIXME
             .collect();
 
         Self {
