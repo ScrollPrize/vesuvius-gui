@@ -996,7 +996,9 @@ impl TemplateApp {
 
                 let mut atlas_clicked = None;
                 if let Some(atlas) = &self.atlas {
-                    for (sample_id, atlas_sample) in &atlas.samples {
+                    let mut samples: Vec<_> = atlas.samples.iter().collect();
+                    samples.sort_by_key(|(id, _)| *id);
+                    for (sample_id, atlas_sample) in samples {
                         egui::CollapsingHeader::new(format!("Atlas: {}", sample_id)).show(ui, |ui| {
                             let mut table = TableBuilder::new(ui)
                                 .vscroll(true)
@@ -1023,7 +1025,9 @@ impl TemplateApp {
                                     header.col(|_ui| {});
                                 })
                                 .body(|mut body| {
-                                    for (segment_id, segment) in &atlas_sample.segments {
+                                    let mut segments: Vec<_> = atlas_sample.segments.iter().collect();
+                                    segments.sort_by_key(|(id, _)| *id);
+                                    for (segment_id, segment) in segments {
                                         body.row(20.0, |mut row| {
                                             row.col(|_ui| {});
                                             fn l(text: impl Into<WidgetText>) -> Label {
