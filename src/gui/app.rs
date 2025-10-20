@@ -1,4 +1,4 @@
-use crate::atlas::AtlasMetadata;
+use crate::atlas::{AtlasMetadata, AtlasSample};
 use crate::catalog::obj_repository::ObjRepository;
 use crate::catalog::Catalog;
 use crate::catalog::Segment;
@@ -490,6 +490,47 @@ impl TemplateApp {
             })
     }
 
+    fn format_volume_label(&self, atlas_sample: &AtlasSample, volume_id: &str, shortcut_num: Option<usize>) -> String {
+        atlas_sample.get_volume(volume_id)
+            .and_then(|volume| volume.properties.as_ref())
+            .and_then(|props| {
+                let base = format!(
+                    "{:.2}µm, {}keV, {:.2}m",
+                    props.pixel_size_um?,
+                    props.energy_kev?,
+                    props.detector_distance_mm? / 1000.0
+                );
+                Some(if let Some(num) = shortcut_num {
+                    format!("{:.2}µm (^{})", props.pixel_size_um?, num)
+                } else {
+                    base
+                })
+            })
+            .unwrap_or_else(|| volume_id.to_string())
+    }
+
+    fn get_sorted_volumes(&self, atlas_sample: &AtlasSample) -> Vec<String> {
+        if let Some(segment_mode) = self.segment_mode.as_ref() {
+            let mut sorted_volumes = segment_mode.available_volumes.clone();
+            sorted_volumes.sort_by(|a, b| {
+                let props_a = atlas_sample.get_volume(a).and_then(|v| v.properties.as_ref());
+                let props_b = atlas_sample.get_volume(b).and_then(|v| v.properties.as_ref());
+                match (props_a, props_b) {
+                    (Some(pa), Some(pb)) => {
+                        pa.pixel_size_um.partial_cmp(&pb.pixel_size_um)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| pa.energy_kev.partial_cmp(&pb.energy_kev).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| pa.detector_distance_mm.partial_cmp(&pb.detector_distance_mm).unwrap_or(std::cmp::Ordering::Equal))
+                    }
+                    _ => std::cmp::Ordering::Equal,
+                }
+            });
+            sorted_volumes
+        } else {
+            Vec::new()
+        }
+    }
+
     fn controls(&mut self, _frame: &eframe::Frame, ui: &mut Ui) {
         fn slider<T: emath::Numeric>(
             ui: &mut Ui,
@@ -524,34 +565,19 @@ impl TemplateApp {
                                 let current_volume_id = segment_mode.current_base_volume_id.clone().unwrap_or_default();
                                 let mut selected_volume_id = current_volume_id.clone();
 
-                                let format_volume_label = |vol_id: &str, include_id: bool| -> String {
-                                    let label = atlas_sample.get_volume(vol_id)
-                                        .and_then(|volume| volume.properties.as_ref())
-                                        .and_then(|props| {
-                                            Some(format!(
-                                                "{:.2}µm, {}keV, {:.2}m",
-                                                props.pixel_size_um?,
-                                                props.energy_kev?,
-                                                props.detector_distance_mm? / 1000.0
-                                            ))
-                                        })
-                                        .unwrap_or_else(|| vol_id.to_string());
-
-                                    if include_id && label != vol_id {
-                                        format!("{} ({})", label, vol_id)
-                                    } else {
-                                        label
-                                    }
-                                };
-
-                                let current_display = format_volume_label(&current_volume_id, false);
+                                let current_display = self.format_volume_label(atlas_sample, &current_volume_id, None);
 
                                 egui::ComboBox::from_id_salt("BaseVolume")
                                     .selected_text(current_display)
                                     .show_ui(ui, |ui| {
                                         for volume_id in &segment_mode.available_volumes {
-                                            let label = format_volume_label(volume_id, true);
-                                            ui.selectable_value(&mut selected_volume_id, volume_id.clone(), label);
+                                            let label = self.format_volume_label(atlas_sample, volume_id, None);
+                                            let label_with_id = if &label != volume_id {
+                                                format!("{} ({})", label, volume_id)
+                                            } else {
+                                                label
+                                            };
+                                            ui.selectable_value(&mut selected_volume_id, volume_id.clone(), label_with_id);
                                         }
                                     });
 
@@ -571,24 +597,14 @@ impl TemplateApp {
                         ui.label("(segment mode)");
                         ui.end_row();
 
-                            ui.label("");
-                            if ui.button("Unload segment").clicked() {
-                                self.segment_mode = None;
-                                if self.layout == GuiLayout::UV {
-                                    self.layout = GuiLayout::Grid;
-                                }
+                        ui.label("");
+                        if ui.button("Unload segment").clicked() {
+                            self.segment_mode = None;
+                            if self.layout == GuiLayout::UV {
+                                self.layout = GuiLayout::Grid;
                             }
-                            ui.end_row();
-                        } else {
-                            ui.label("Volume");
-                            if ui.button("Unload segment").clicked() {
-                                self.segment_mode = None;
-                                if self.layout == GuiLayout::UV {
-                                    self.layout = GuiLayout::Grid;
-                                }
-                            }
-                            ui.end_row();
                         }
+                        ui.end_row();
                     }
                 } else {
                     ui.label("Volume");
@@ -924,30 +940,14 @@ impl TemplateApp {
                 }
 
                 if let Some((_, _, atlas_sample)) = self.get_atlas_context() {
-                    if let Some(segment_mode) = self.segment_mode.as_ref() {
-                        if !segment_mode.available_volumes.is_empty() {
-                            let mut sorted_volumes = segment_mode.available_volumes.clone();
-                            sorted_volumes.sort_by(|a, b| {
-                                let props_a = atlas_sample.get_volume(a).and_then(|v| v.properties.as_ref());
-                                let props_b = atlas_sample.get_volume(b).and_then(|v| v.properties.as_ref());
-                                match (props_a, props_b) {
-                                    (Some(pa), Some(pb)) => {
-                                        pa.pixel_size_um.partial_cmp(&pb.pixel_size_um)
-                                            .unwrap_or(std::cmp::Ordering::Equal)
-                                            .then_with(|| pa.energy_kev.partial_cmp(&pb.energy_kev).unwrap_or(std::cmp::Ordering::Equal))
-                                            .then_with(|| pa.detector_distance_mm.partial_cmp(&pb.detector_distance_mm).unwrap_or(std::cmp::Ordering::Equal))
-                                    }
-                                    _ => std::cmp::Ordering::Equal,
-                                }
-                            });
+                    let sorted_volumes = self.get_sorted_volumes(atlas_sample);
+                    if !sorted_volumes.is_empty() {
+                        let keys = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
+                                   egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9];
 
-                            let keys = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
-                                       egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9];
-
-                            for (idx, volume_id) in sorted_volumes.iter().enumerate().take(9) {
-                                if i.modifiers.ctrl && i.key_pressed(keys[idx]) {
-                                    self.pending_volume_switch = Some(volume_id.clone());
-                                }
+                        for (idx, volume_id) in sorted_volumes.iter().enumerate().take(9) {
+                            if i.modifiers.ctrl && i.key_pressed(keys[idx]) {
+                                self.pending_volume_switch = Some(volume_id.clone());
                             }
                         }
                     }
@@ -1353,55 +1353,32 @@ impl eframe::App for TemplateApp {
                         layout_button(ui, &mut self.layout, GuiLayout::UV, "UV (5)");
                     }
 
-                    if let Some(segment_mode) = self.segment_mode.as_ref() {
-                        if let (Some(sample_id), Some(segment_id)) = (&segment_mode.sample_id, &segment_mode.segment_id) {
-                            if !segment_mode.available_volumes.is_empty() {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let current_volume_id = segment_mode.current_base_volume_id.clone().unwrap_or_default();
+                    let volume_buttons = self.get_atlas_context().map(|(_, _, atlas_sample)| {
+                        (self.get_sorted_volumes(atlas_sample).into_iter()
+                            .take(9)
+                            .enumerate()
+                            .map(|(idx, vol_id)| {
+                                let label = self.format_volume_label(atlas_sample, &vol_id, Some(idx + 1));
+                                (vol_id, label)
+                            })
+                            .collect::<Vec<_>>(),
+                         self.segment_mode.as_ref().and_then(|sm| sm.current_base_volume_id.clone()))
+                    });
 
-                                    let mut sorted_volumes = segment_mode.available_volumes.clone();
-                                    if let Some(atlas) = &self.atlas {
-                                        if let Some(atlas_sample) = atlas.get_sample(sample_id) {
-                                            sorted_volumes.sort_by(|a, b| {
-                                                let props_a = atlas_sample.get_volume(a).and_then(|v| v.properties.as_ref());
-                                                let props_b = atlas_sample.get_volume(b).and_then(|v| v.properties.as_ref());
-                                                match (props_a, props_b) {
-                                                    (Some(pa), Some(pb)) => {
-                                                        pa.pixel_size_um.partial_cmp(&pb.pixel_size_um)
-                                                            .unwrap_or(std::cmp::Ordering::Equal)
-                                                            .then_with(|| pa.energy_kev.partial_cmp(&pb.energy_kev).unwrap_or(std::cmp::Ordering::Equal))
-                                                            .then_with(|| pa.detector_distance_mm.partial_cmp(&pb.detector_distance_mm).unwrap_or(std::cmp::Ordering::Equal))
-                                                    }
-                                                    _ => std::cmp::Ordering::Equal,
-                                                }
-                                            });
-                                        }
+                    if let Some((volume_labels, current_volume_id)) = volume_buttons {
+                        if !volume_labels.is_empty() {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let current_volume_id = current_volume_id.unwrap_or_default();
+
+                                for (volume_id, label) in volume_labels.iter().rev() {
+                                    if ui.selectable_label(volume_id == &current_volume_id, label).clicked() {
+                                        self.pending_volume_switch = Some(volume_id.clone());
                                     }
+                                }
 
-                                    for (idx, volume_id) in sorted_volumes.iter().enumerate().take(9).rev() {
-                                        let label = self.atlas
-                                            .as_ref()
-                                            .and_then(|atlas| atlas.get_sample(sample_id))
-                                            .and_then(|sample| sample.get_volume(volume_id))
-                                            .and_then(|volume| volume.properties.as_ref())
-                                            .and_then(|props| {
-                                                Some(format!(
-                                                    "{:.2}µm (^{})",
-                                                    props.pixel_size_um?,
-                                                    idx + 1
-                                                ))
-                                            })
-                                            .unwrap_or_else(|| format!("{} (^{})", volume_id, idx + 1));
-
-                                        if ui.selectable_label(volume_id == &current_volume_id, label).clicked() {
-                                            self.pending_volume_switch = Some(volume_id.clone());
-                                        }
-                                    }
-
-                                    ui.separator();
-                                    ui.label("Volume");
-                                });
-                            }
+                                ui.separator();
+                                ui.label("Volume");
+                            });
                         }
                     }
                 });
