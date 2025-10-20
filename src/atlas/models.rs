@@ -1,3 +1,4 @@
+use crate::volume::AffineTransform;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -177,7 +178,7 @@ impl AtlasSample {
             .collect()
     }
 
-    pub fn get_transform(&self, source_volume_id: &str, target_volume_id: &str) -> Option<Vec<Vec<f64>>> {
+    pub fn get_transform(&self, source_volume_id: &str, target_volume_id: &str) -> Option<AffineTransform> {
         if source_volume_id == target_volume_id {
             return None;
         }
@@ -188,7 +189,7 @@ impl AtlasSample {
                     if &vt.from_volume_id == source_volume_id {
                         for transform_to in &vt.transforms {
                             if &transform_to.to_volume_id == target_volume_id {
-                                return Some(transform_to.matrix.clone());
+                                return Some(AffineTransform::from_vec(&transform_to.matrix));
                             }
                         }
                     }

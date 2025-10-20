@@ -200,7 +200,7 @@ impl TemplateApp {
         let mut segment_info = None;
         let mut available_volumes = Vec::new();
         let mut current_volume_id = None;
-        let mut transform_matrix: Option<Vec<Vec<f64>>> = None;
+        let mut transform: Option<AffineTransform> = None;
 
         if let Some(atlas) = &self.atlas {
             if let Some(atlas_sample) = atlas.get_sample(sample_id) {
@@ -214,14 +214,14 @@ impl TemplateApp {
                     current_volume_id = Some(volume_id.to_string());
 
                     if volume_id != &segment.original_volume_id {
-                        transform_matrix = atlas_sample.get_transform(&segment.original_volume_id, volume_id);
+                        transform = atlas_sample.get_transform(&segment.original_volume_id, volume_id);
                     }
 
                     if let Some(volume) = atlas_sample.get_volume(volume_id) {
                         volume_url_opt = volume.get_ome_zarr_url();
                     }
 
-                    let coord_scale_matrix = if source_volume_id != volume_id {
+                    let coord_scale_transform = if source_volume_id != volume_id {
                         atlas_sample.get_transform(source_volume_id, volume_id)
                     } else {
                         None
@@ -235,7 +235,7 @@ impl TemplateApp {
                         (segment.properties.width, segment.properties.height)
                     };
 
-                    segment_info = Some((width, height, coord_scale_matrix));
+                    segment_info = Some((width, height, coord_scale_transform));
 
                     available_volumes = atlas_sample
                         .get_volumes_for_segment(segment_id)
@@ -252,25 +252,9 @@ impl TemplateApp {
             }
         }
 
-        if let Some((width, height, coord_scale_matrix)) = segment_info {
+        if let Some((width, height, coord_scale_transform)) = segment_info {
             let obj_cache_path = Self::atlas_obj_cache_path(sample_id, segment_id);
             if obj_cache_path.exists() {
-                let transform = transform_matrix.map(|matrix| AffineTransform {
-                    matrix: [
-                        [matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3]],
-                        [matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3]],
-                        [matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3]],
-                    ],
-                });
-
-                let coord_scale_transform = coord_scale_matrix.map(|matrix| AffineTransform {
-                    matrix: [
-                        [matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3]],
-                        [matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3]],
-                        [matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3]],
-                    ],
-                });
-
                 self.setup_segment(
                     obj_cache_path.to_str().unwrap(),
                     width,
@@ -409,15 +393,9 @@ impl TemplateApp {
             let old_coord = segment.coord;
             let old_zoom = self.zoom;
 
-            let scale = if let Some(t) = coord_scale_transform_owned.as_ref() {
-                let m = &t.matrix;
-                let scale_x = (m[0][0] * m[0][0] + m[0][1] * m[0][1] + m[0][2] * m[0][2]).sqrt();
-                let scale_y = (m[1][0] * m[1][0] + m[1][1] * m[1][1] + m[1][2] * m[1][2]).sqrt();
-                let scale_z = (m[2][0] * m[2][0] + m[2][1] * m[2][1] + m[2][2] * m[2][2]).sqrt();
-                (scale_x + scale_y + scale_z) / 3.0
-            } else {
-                1.0
-            };
+            let scale = coord_scale_transform_owned.as_ref()
+                .map(|t| t.scale_factor())
+                .unwrap_or(1.0);
 
             let scaled_width = (width as f64 * scale) as usize;
             let scaled_height = (height as f64 * scale) as usize;
