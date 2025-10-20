@@ -392,6 +392,11 @@ impl TemplateApp {
             if let Some((sample_id, segment_id)) = atlas_metadata {
                 segment.sample_id = Some(sample_id);
                 segment.segment_id = Some(segment_id);
+            } else {
+                segment.sample_id = None;
+                segment.segment_id = None;
+                segment.current_base_volume_id = None;
+                segment.available_volumes.clear();
             }
 
             self.segment_mode = Some(segment)
@@ -442,6 +447,11 @@ impl TemplateApp {
             if let Some((sample_id, segment_id)) = atlas_metadata {
                 segment.sample_id = Some(sample_id);
                 segment.segment_id = Some(segment_id);
+            } else {
+                segment.sample_id = None;
+                segment.segment_id = None;
+                segment.current_base_volume_id = None;
+                segment.available_volumes.clear();
             }
 
             self.segment_mode = Some(segment)
