@@ -205,29 +205,38 @@ impl TemplateApp {
         if let Some(atlas) = &self.atlas {
             if let Some(atlas_sample) = atlas.get_sample(sample_id) {
                 if let Some(segment) = atlas_sample.get_segment(segment_id) {
-                    // Determine which volume to use
+                    let source_volume_id = self.segment_mode.as_ref()
+                        .and_then(|sm| sm.current_base_volume_id.as_ref())
+                        .map(|s| s.as_str())
+                        .unwrap_or(&segment.original_volume_id);
+
                     let volume_id = target_volume_id.unwrap_or(&segment.original_volume_id);
                     current_volume_id = Some(volume_id.to_string());
 
-                    // Get transform if not using original volume
-                    if volume_id != segment.original_volume_id {
-                        transform_matrix = atlas_sample.get_transform_for_segment(segment_id, volume_id);
-                        if transform_matrix.is_none() {
-                            println!(
-                                "Warning: No transform found from {} to {}",
-                                segment.original_volume_id, volume_id
-                            );
-                        }
+                    if volume_id != &segment.original_volume_id {
+                        transform_matrix = atlas_sample.get_transform(&segment.original_volume_id, volume_id);
                     }
 
-                    // Load the target volume
                     if let Some(volume) = atlas_sample.get_volume(volume_id) {
                         volume_url_opt = volume.get_ome_zarr_url();
                     }
 
-                    segment_info = Some((segment.properties.width, segment.properties.height));
+                    let coord_scale_matrix = if source_volume_id != volume_id {
+                        atlas_sample.get_transform(source_volume_id, volume_id)
+                    } else {
+                        None
+                    };
 
-                    // Get list of available volumes for this segment
+                    let (width, height) = if target_volume_id.is_some() {
+                        self.segment_mode.as_ref()
+                            .map(|seg_mode| (seg_mode.width, seg_mode.height))
+                            .unwrap_or((segment.properties.width, segment.properties.height))
+                    } else {
+                        (segment.properties.width, segment.properties.height)
+                    };
+
+                    segment_info = Some((width, height, coord_scale_matrix));
+
                     available_volumes = atlas_sample
                         .get_volumes_for_segment(segment_id)
                         .into_iter()
@@ -238,23 +247,23 @@ impl TemplateApp {
         }
 
         if let Some(volume_url) = volume_url_opt {
-            println!("Loading atlas volume from URL: {}", volume_url);
-            match NewVolumeReference::from_url(volume_url) {
-                Ok(vol_ref) => {
-                    self.load_volume(&vol_ref);
-                }
-                Err(e) => {
-                    println!("Failed to load volume: {}", e);
-                }
+            if let Ok(vol_ref) = NewVolumeReference::from_url(volume_url) {
+                self.load_volume(&vol_ref);
             }
         }
 
-        if let Some((width, height)) = segment_info {
+        if let Some((width, height, coord_scale_matrix)) = segment_info {
             let obj_cache_path = Self::atlas_obj_cache_path(sample_id, segment_id);
             if obj_cache_path.exists() {
-                println!("Loading atlas segment from cache: {}", obj_cache_path.display());
-
                 let transform = transform_matrix.map(|matrix| AffineTransform {
+                    matrix: [
+                        [matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3]],
+                        [matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3]],
+                        [matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3]],
+                    ],
+                });
+
+                let coord_scale_transform = coord_scale_matrix.map(|matrix| AffineTransform {
                     matrix: [
                         [matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3]],
                         [matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3]],
@@ -267,6 +276,7 @@ impl TemplateApp {
                     width,
                     height,
                     transform.as_ref(),
+                    coord_scale_transform.as_ref(),
                     ProjectionKind::None,
                     Some((sample_id.to_string(), segment_id.to_string())),
                 );
@@ -323,7 +333,7 @@ impl TemplateApp {
             projection,
         }) = config.obj_file
         {
-            app.setup_segment(&obj_file, width, height, transform.as_ref(), projection, None);
+            app.setup_segment(&obj_file, width, height, transform.as_ref(), None, projection, None);
         }
 
         if let Some(segment_file) = config.overlay_dir {
@@ -356,6 +366,7 @@ impl TemplateApp {
         width: usize,
         height: usize,
         transform: Option<&AffineTransform>,
+        coord_scale_transform: Option<&AffineTransform>,
         projection: ProjectionKind,
         atlas_metadata: Option<(String, String)>,
     ) {
@@ -392,19 +403,45 @@ impl TemplateApp {
             let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
             let base = self.world.clone();
             let transform_owned = transform.cloned();
-            let obj_volume = ObjVolume::load_from_obj(&segment_file, base, width, height, &transform_owned, projection);
+            let coord_scale_transform_owned = coord_scale_transform.cloned();
+
+            let is_reload = segment.filename == segment_file;
+            let old_coord = segment.coord;
+            let old_zoom = self.zoom;
+
+            let scale = if let Some(t) = coord_scale_transform_owned.as_ref() {
+                let m = &t.matrix;
+                let scale_x = (m[0][0] * m[0][0] + m[0][1] * m[0][1] + m[0][2] * m[0][2]).sqrt();
+                let scale_y = (m[1][0] * m[1][0] + m[1][1] * m[1][1] + m[1][2] * m[1][2]).sqrt();
+                let scale_z = (m[2][0] * m[2][0] + m[2][1] * m[2][1] + m[2][2] * m[2][2]).sqrt();
+                (scale_x + scale_y + scale_z) / 3.0
+            } else {
+                1.0
+            };
+
+            let scaled_width = (width as f64 * scale) as usize;
+            let scaled_height = (height as f64 * scale) as usize;
+
+            let obj_volume = ObjVolume::load_from_obj(&segment_file, base, scaled_width, scaled_height, &transform_owned, projection);
             let width = obj_volume.width() as i32;
             let height = obj_volume.height() as i32;
 
             let volume = Arc::new(obj_volume);
             let obj2 = volume.clone();
-            println!("Loaded Obj volume with size {}x{}", width, height);
 
-            if segment.filename != segment_file {
+            if is_reload {
+                segment.coord = [
+                    (old_coord[0] as f64 * scale) as i32,
+                    (old_coord[1] as f64 * scale) as i32,
+                    (old_coord[2] as f64 * scale) as i32,
+                ];
+                self.zoom = (old_zoom as f64 / scale) as f32;
+            } else {
                 segment.coord = [width / 2, height / 2, 0];
                 segment.filename = segment_file.to_string();
                 segment.info = segment_file.to_string();
             }
+
             segment.width = width as usize;
             segment.height = height as usize;
             segment.ranges = [0..=width, 0..=height, -40..=40];
@@ -847,6 +884,7 @@ impl TemplateApp {
                 segment.width,
                 segment.height,
                 None,
+                None,
                 ProjectionKind::None,
                 None,
             );
@@ -1244,7 +1282,7 @@ impl TemplateApp {
                 if let Some(segment) = clicked {
                     if let Some(obj_file) = self.obj_repository.get(&segment) {
                         self.load_volume_by_ref(&segment.volume_ref());
-                        self.setup_segment(&obj_file.to_str().unwrap().to_string(), segment.width, segment.height, None, ProjectionKind::None, None);
+                        self.setup_segment(&obj_file.to_str().unwrap().to_string(), segment.width, segment.height, None, None, ProjectionKind::None, None);
                         self.selected_segment = Some(segment);
                     } else {
                         let sender = self.notification_sender.clone();

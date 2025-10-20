@@ -177,10 +177,7 @@ impl AtlasSample {
             .collect()
     }
 
-    pub fn get_transform_for_segment(&self, segment_id: &str, target_volume_id: &str) -> Option<Vec<Vec<f64>>> {
-        let segment = self.get_segment(segment_id)?;
-        let source_volume_id = &segment.original_volume_id;
-
+    pub fn get_transform(&self, source_volume_id: &str, target_volume_id: &str) -> Option<Vec<Vec<f64>>> {
         if source_volume_id == target_volume_id {
             return None;
         }
@@ -220,7 +217,7 @@ impl AtlasSample {
 
             let can_render = vol_id == &segment.original_volume_id
                 || has_coverage
-                || self.get_transform_for_segment(segment_id, vol_id).is_some();
+                || self.get_transform(&segment.original_volume_id, vol_id).is_some();
 
             if can_render {
                 result.push((vol_id.clone(), volume, has_coverage));
