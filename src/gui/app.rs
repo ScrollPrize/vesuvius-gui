@@ -139,6 +139,8 @@ pub struct TemplateApp {
     #[serde(skip)]
     downloading_segment: Option<Segment>,
     #[serde(skip)]
+    downloading_atlas_segment: Option<(String, String)>, // (sample_id, segment_id)
+    #[serde(skip)]
     notification_sender: Sender<UINotification>,
     #[serde(skip)]
     notification_receiver: Receiver<UINotification>,
@@ -175,6 +177,7 @@ impl Default for TemplateApp {
             obj_repository,
             selected_segment: None,
             downloading_segment: None,
+            downloading_atlas_segment: None,
             notification_sender,
             notification_receiver,
             overlay: None,
@@ -888,6 +891,7 @@ impl TemplateApp {
                 }
                 UINotification::AtlasObjDownloadReady(sample_id, segment_id, _volume_id) => {
                     self.load_atlas_segment(&sample_id, &segment_id);
+                    self.downloading_atlas_segment = None;
                 }
             }
         }
@@ -1265,7 +1269,21 @@ impl TemplateApp {
                                                 Label::new(text).selectable(false)
                                             }
                                             row.col(|ui| {
-                                                l(segment_id).ui(ui);
+                                                let obj_cache_path = Self::atlas_obj_cache_path(&sample_id, &segment_id);
+                                                let cached = obj_cache_path.exists();
+                                                let mut text = RichText::new(segment_id.as_str());
+                                                if cached {
+                                                    text = text.color(Color32::DARK_GREEN);
+                                                } else if self.downloading_atlas_segment == Some((sample_id.clone(), segment_id.clone())) {
+                                                    let time = std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_millis() / 600;
+                                                    if time % 2 == 0 {
+                                                        text = text.color(Color32::YELLOW);
+                                                    }
+                                                }
+                                                l(text).ui(ui);
                                             });
                                             row.col(|ui| {
                                                 l(format!("{}", segment.properties.width)).ui(ui);
@@ -1291,6 +1309,7 @@ impl TemplateApp {
                         self.load_atlas_segment(&sample_id, &segment_id);
                     } else if let Some(obj_url) = segment.get_obj_url() {
                         println!("Downloading atlas obj from {}", obj_url);
+                        self.downloading_atlas_segment = Some((sample_id.clone(), segment_id.clone()));
                         let sender = self.notification_sender.clone();
                         let volume_id = segment.original_volume_id.clone();
                         ehttp::fetch(ehttp::Request::get(&obj_url), move |response| {
