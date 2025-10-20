@@ -50,6 +50,32 @@ impl AffineTransform {
         (scale_x + scale_y + scale_z) / 3.0
     }
 
+    pub fn transform_point_f64(&self, point: [f64; 3]) -> [f64; 3] {
+        let m = &self.matrix;
+        let x = point[0];
+        let y = point[1];
+        let z = point[2];
+
+        [
+            m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3],
+            m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3],
+            m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3],
+        ]
+    }
+
+    pub fn transform_point(&self, point: [i32; 3]) -> [i32; 3] {
+        let result = self.transform_point_f64([
+            point[0] as f64,
+            point[1] as f64,
+            point[2] as f64,
+        ]);
+        [
+            result[0] as i32,
+            result[1] as i32,
+            result[2] as i32,
+        ]
+    }
+
     /// Invert this affine transformation matrix
     pub fn invert(&self) -> Result<Self, Error> {
         let m = &self.matrix;

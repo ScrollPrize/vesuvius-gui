@@ -201,6 +201,7 @@ impl TemplateApp {
         let mut available_volumes = Vec::new();
         let mut current_volume_id = None;
         let mut transform: Option<AffineTransform> = None;
+        let mut xyz_transform: Option<AffineTransform> = None;
 
         if let Some(atlas) = &self.atlas {
             if let Some(atlas_sample) = atlas.get_sample(sample_id) {
@@ -226,6 +227,10 @@ impl TemplateApp {
                     } else {
                         None
                     };
+
+                    if target_volume_id.is_some() && source_volume_id != volume_id {
+                        xyz_transform = atlas_sample.get_transform(source_volume_id, volume_id);
+                    }
 
                     let (width, height) = if target_volume_id.is_some() {
                         self.segment_mode.as_ref()
@@ -270,6 +275,10 @@ impl TemplateApp {
                     segment_mode.sample_id = Some(sample_id.to_string());
                     segment_mode.current_base_volume_id = current_volume_id;
                     segment_mode.available_volumes = available_volumes;
+                }
+
+                if let Some(xyz_tf) = xyz_transform {
+                    self.coord = xyz_tf.transform_point(self.coord);
                 }
             }
         }
