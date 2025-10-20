@@ -480,6 +480,16 @@ impl TemplateApp {
         self.segment_mode.is_some() && self.sync_coordinates
     }
 
+    fn get_atlas_context(&self) -> Option<(&str, &str, &AtlasSample)> {
+        self.segment_mode.as_ref()
+            .and_then(|sm| sm.sample_id.as_ref().zip(sm.segment_id.as_ref()))
+            .and_then(|(sample_id, segment_id)| {
+                self.atlas.as_ref()
+                    .and_then(|atlas| atlas.get_sample(sample_id))
+                    .map(|atlas_sample| (sample_id.as_str(), segment_id.as_str(), atlas_sample))
+            })
+    }
+
     fn controls(&mut self, _frame: &eframe::Frame, ui: &mut Ui) {
         fn slider<T: emath::Numeric>(
             ui: &mut Ui,
@@ -502,13 +512,12 @@ impl TemplateApp {
             .spacing([40.0, 4.0])
             .show(ui, |ui| {
                 if self.is_segment_mode() {
-                    if let Some(segment_mode) = self.segment_mode.as_ref() {
-                        if let (Some(sample_id), Some(segment_id)) = (&segment_mode.sample_id, &segment_mode.segment_id)
-                        {
-                            ui.label("Segment");
-                            ui.label(format!("{}/{}", sample_id, segment_id));
-                            ui.end_row();
+                    if let Some((sample_id, segment_id, atlas_sample)) = self.get_atlas_context() {
+                        ui.label("Segment");
+                        ui.label(format!("{}/{}", sample_id, segment_id));
+                        ui.end_row();
 
+                        if let Some(segment_mode) = self.segment_mode.as_ref() {
                             if !segment_mode.available_volumes.is_empty() {
                                 ui.label("Base Volume");
 
@@ -516,10 +525,7 @@ impl TemplateApp {
                                 let mut selected_volume_id = current_volume_id.clone();
 
                                 let format_volume_label = |vol_id: &str, include_id: bool| -> String {
-                                    let label = self.atlas
-                                        .as_ref()
-                                        .and_then(|atlas| atlas.get_sample(sample_id))
-                                        .and_then(|sample| sample.get_volume(vol_id))
+                                    let label = atlas_sample.get_volume(vol_id)
                                         .and_then(|volume| volume.properties.as_ref())
                                         .and_then(|props| {
                                             Some(format!(
@@ -559,6 +565,11 @@ impl TemplateApp {
                                 ui.label("(segment mode)");
                                 ui.end_row();
                             }
+                        }
+                    } else if self.segment_mode.is_some() {
+                        ui.label("Volume");
+                        ui.label("(segment mode)");
+                        ui.end_row();
 
                             ui.label("");
                             if ui.button("Unload segment").clicked() {
@@ -899,17 +910,47 @@ impl TemplateApp {
                 if i.key_pressed(egui::Key::C) {
                     self.catalog_panel_open = !self.catalog_panel_open;
                 }
-                if i.key_pressed(egui::Key::Num1) {
+                if i.key_pressed(egui::Key::Num1) && !i.modifiers.ctrl {
                     self.layout = GuiLayout::Grid;
                 }
-                if i.key_pressed(egui::Key::Num2) {
+                if i.key_pressed(egui::Key::Num2) && !i.modifiers.ctrl {
                     self.layout = GuiLayout::XY;
                 }
-                if i.key_pressed(egui::Key::Num3) {
+                if i.key_pressed(egui::Key::Num3) && !i.modifiers.ctrl {
                     self.layout = GuiLayout::XZ;
                 }
-                if i.key_pressed(egui::Key::Num4) {
+                if i.key_pressed(egui::Key::Num4) && !i.modifiers.ctrl {
                     self.layout = GuiLayout::YZ;
+                }
+
+                if let Some((_, _, atlas_sample)) = self.get_atlas_context() {
+                    if let Some(segment_mode) = self.segment_mode.as_ref() {
+                        if !segment_mode.available_volumes.is_empty() {
+                            let mut sorted_volumes = segment_mode.available_volumes.clone();
+                            sorted_volumes.sort_by(|a, b| {
+                                let props_a = atlas_sample.get_volume(a).and_then(|v| v.properties.as_ref());
+                                let props_b = atlas_sample.get_volume(b).and_then(|v| v.properties.as_ref());
+                                match (props_a, props_b) {
+                                    (Some(pa), Some(pb)) => {
+                                        pa.pixel_size_um.partial_cmp(&pb.pixel_size_um)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                            .then_with(|| pa.energy_kev.partial_cmp(&pb.energy_kev).unwrap_or(std::cmp::Ordering::Equal))
+                                            .then_with(|| pa.detector_distance_mm.partial_cmp(&pb.detector_distance_mm).unwrap_or(std::cmp::Ordering::Equal))
+                                    }
+                                    _ => std::cmp::Ordering::Equal,
+                                }
+                            });
+
+                            let keys = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
+                                       egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9];
+
+                            for (idx, volume_id) in sorted_volumes.iter().enumerate().take(9) {
+                                if i.modifiers.ctrl && i.key_pressed(keys[idx]) {
+                                    self.pending_volume_switch = Some(volume_id.clone());
+                                }
+                            }
+                        }
+                    }
                 }
                 if self.is_segment_mode() {
                     if i.key_pressed(egui::Key::I) {
@@ -1284,7 +1325,7 @@ impl eframe::App for TemplateApp {
         egui::TopBottomPanel::top("op_bar")
             .frame(egui::Frame::NONE.inner_margin(4.0))
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.visuals_mut().button_frame = false;
                     ui.toggle_value(&mut self.catalog_panel_open, "📜 (C)atalog");
 
@@ -1310,6 +1351,58 @@ impl eframe::App for TemplateApp {
                     layout_button(ui, &mut self.layout, GuiLayout::YZ, "YZ (4)");
                     if self.is_segment_mode() {
                         layout_button(ui, &mut self.layout, GuiLayout::UV, "UV (5)");
+                    }
+
+                    if let Some(segment_mode) = self.segment_mode.as_ref() {
+                        if let (Some(sample_id), Some(segment_id)) = (&segment_mode.sample_id, &segment_mode.segment_id) {
+                            if !segment_mode.available_volumes.is_empty() {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let current_volume_id = segment_mode.current_base_volume_id.clone().unwrap_or_default();
+
+                                    let mut sorted_volumes = segment_mode.available_volumes.clone();
+                                    if let Some(atlas) = &self.atlas {
+                                        if let Some(atlas_sample) = atlas.get_sample(sample_id) {
+                                            sorted_volumes.sort_by(|a, b| {
+                                                let props_a = atlas_sample.get_volume(a).and_then(|v| v.properties.as_ref());
+                                                let props_b = atlas_sample.get_volume(b).and_then(|v| v.properties.as_ref());
+                                                match (props_a, props_b) {
+                                                    (Some(pa), Some(pb)) => {
+                                                        pa.pixel_size_um.partial_cmp(&pb.pixel_size_um)
+                                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                                            .then_with(|| pa.energy_kev.partial_cmp(&pb.energy_kev).unwrap_or(std::cmp::Ordering::Equal))
+                                                            .then_with(|| pa.detector_distance_mm.partial_cmp(&pb.detector_distance_mm).unwrap_or(std::cmp::Ordering::Equal))
+                                                    }
+                                                    _ => std::cmp::Ordering::Equal,
+                                                }
+                                            });
+                                        }
+                                    }
+
+                                    for (idx, volume_id) in sorted_volumes.iter().enumerate().take(9).rev() {
+                                        let label = self.atlas
+                                            .as_ref()
+                                            .and_then(|atlas| atlas.get_sample(sample_id))
+                                            .and_then(|sample| sample.get_volume(volume_id))
+                                            .and_then(|volume| volume.properties.as_ref())
+                                            .and_then(|props| {
+                                                Some(format!(
+                                                    "{:.2}µm (^{})",
+                                                    props.pixel_size_um?,
+                                                    idx + 1
+                                                ))
+                                            })
+                                            .unwrap_or_else(|| format!("{} (^{})", volume_id, idx + 1));
+
+                                        if ui.selectable_label(volume_id == &current_volume_id, label).clicked() {
+                                            self.pending_volume_switch = Some(volume_id.clone());
+                                        }
+                                    }
+
+                                    ui.separator();
+                                    ui.label("Volume");
+                                });
+                            }
+                        }
                     }
                 });
             });
