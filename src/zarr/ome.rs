@@ -227,6 +227,7 @@ impl<C: ColorScheme + 'static + Send + Sync> PaintVolume for OmeZarrContext<C> {
 
                 let v = self.get([z as usize, y as usize, x as usize], scale);
                 if v != 0 {
+                    let v = _config.filter(v);
                     buffer.set(im_u, im_v, C::get_color(v));
                 }
             }

@@ -497,17 +497,7 @@ impl PaintVolume for VolumeGrid64x4Mapped {
                                             }
                                             let value = tile[off as usize];
 
-                                            if filters_active {
-                                                let pluscon = ((value as i32 - config.threshold_min as i32).max(0)
-                                                    * 255
-                                                    / (255 - (config.threshold_min + config.threshold_max) as i32))
-                                                    .min(255)
-                                                    as u8;
-
-                                                (((pluscon & mask) as f32) / (mask as f32) * 255.0) as u8
-                                            } else {
-                                                value
-                                            };
+                                            let value = config.filter(value);
                                             buffer.set_gray(u as usize, v as usize, value);
                                         }
                                     }

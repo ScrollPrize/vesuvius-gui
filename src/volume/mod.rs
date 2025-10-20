@@ -86,6 +86,17 @@ impl DrawingConfig {
             _ => 0xff,
         }) >> self.mask_shift
     }
+    pub fn filter(&self, value: u8) -> u8 {
+        if self.filters_active() {
+            let pluscon = ((value as i32 - self.threshold_min as i32).max(0) * 255
+                / (255 - (self.threshold_min + self.threshold_max) as i32))
+                .min(255) as u8;
+
+            (((pluscon & self.bit_mask()) as f32) / (self.bit_mask() as f32) * 255.0) as u8
+        } else {
+            value
+        }
+    }
 }
 impl Default for DrawingConfig {
     fn default() -> Self {
