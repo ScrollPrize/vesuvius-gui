@@ -500,38 +500,36 @@ impl TemplateApp {
                                 let current_volume_id = segment_mode.current_base_volume_id.clone().unwrap_or_default();
                                 let mut selected_volume_id = current_volume_id.clone();
 
+                                let format_volume_label = |vol_id: &str, include_id: bool| -> String {
+                                    let label = self.atlas
+                                        .as_ref()
+                                        .and_then(|atlas| atlas.get_sample(sample_id))
+                                        .and_then(|sample| sample.get_volume(vol_id))
+                                        .and_then(|volume| volume.properties.as_ref())
+                                        .and_then(|props| {
+                                            Some(format!(
+                                                "{:.2}µm, {}keV, {:.2}m",
+                                                props.pixel_size_um?,
+                                                props.energy_kev?,
+                                                props.detector_distance_mm? / 1000.0
+                                            ))
+                                        })
+                                        .unwrap_or_else(|| vol_id.to_string());
+
+                                    if include_id && label != vol_id {
+                                        format!("{} ({})", label, vol_id)
+                                    } else {
+                                        label
+                                    }
+                                };
+
+                                let current_display = format_volume_label(&current_volume_id, false);
+
                                 egui::ComboBox::from_id_salt("BaseVolume")
-                                    .selected_text(current_volume_id.clone())
+                                    .selected_text(current_display)
                                     .show_ui(ui, |ui| {
                                         for volume_id in &segment_mode.available_volumes {
-                                            let mut label = volume_id.clone();
-
-                                            if let Some(atlas) = &self.atlas {
-                                                if let Some(atlas_sample) = atlas.get_sample(sample_id) {
-                                                    if let Some(volume) = atlas_sample.get_volume(volume_id) {
-                                                        if let Some(props) = &volume.properties {
-                                                            let mut details = Vec::new();
-                                                            if let Some(energy) = props.energy_kev {
-                                                                details.push(format!("{}keV", energy));
-                                                            }
-                                                            if let Some(pixel_size) = props.pixel_size_um {
-                                                                details.push(format!("{:.2}µm", pixel_size));
-                                                            }
-                                                            if !details.is_empty() {
-                                                                label =
-                                                                    format!("{} ({})", volume_id, details.join(", "));
-                                                            }
-                                                        }
-
-                                                        let has_coverage =
-                                                            atlas_sample.has_coverage(segment_id, volume_id);
-                                                        if has_coverage {
-                                                            label = format!("{} ✓", label);
-                                                        }
-                                                    }
-                                                }
-                                            }
-
+                                            let label = format_volume_label(volume_id, true);
                                             ui.selectable_value(&mut selected_volume_id, volume_id.clone(), label);
                                         }
                                     });
