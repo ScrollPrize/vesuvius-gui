@@ -176,6 +176,71 @@ impl AtlasSample {
             .filter(|s| s.original_volume_id == volume_id)
             .collect()
     }
+
+    pub fn get_transform_for_segment(&self, segment_id: &str, target_volume_id: &str) -> Option<Vec<Vec<f64>>> {
+        let segment = self.get_segment(segment_id)?;
+        let source_volume_id = &segment.original_volume_id;
+
+        if source_volume_id == target_volume_id {
+            return None;
+        }
+
+        if let Some(ref props) = self.sample.properties {
+            if let Some(ref transforms) = props.volume_transforms {
+                for vt in transforms {
+                    if &vt.from_volume_id == source_volume_id {
+                        for transform_to in &vt.transforms {
+                            if &transform_to.to_volume_id == target_volume_id {
+                                return Some(transform_to.matrix.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn get_volumes_for_segment(&self, segment_id: &str) -> Vec<(String, &Volume, bool)> {
+        let segment = match self.get_segment(segment_id) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+
+        for (vol_id, volume) in &self.volumes {
+            let has_coverage = segment
+                .properties
+                .volume_coverage
+                .as_ref()
+                .map(|coverage| coverage.contains_key(vol_id))
+                .unwrap_or(false);
+
+            let can_render = vol_id == &segment.original_volume_id
+                || has_coverage
+                || self.get_transform_for_segment(segment_id, vol_id).is_some();
+
+            if can_render {
+                result.push((vol_id.clone(), volume, has_coverage));
+            }
+        }
+
+        result
+    }
+
+    pub fn has_coverage(&self, segment_id: &str, volume_id: &str) -> bool {
+        if let Some(segment) = self.get_segment(segment_id) {
+            if &segment.original_volume_id == volume_id {
+                return true;
+            }
+            if let Some(ref coverage) = segment.properties.volume_coverage {
+                return coverage.contains_key(volume_id);
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -38,7 +38,7 @@ impl TileCacheKey {
         extra_resolutions: u32,
         world: &Volume,
     ) -> Self {
-        let volume_id = world as *const Volume as usize;
+        let volume_id = Arc::as_ptr(&world.volume) as *const () as usize;
 
         let min_level = (32 - ((ZOOM_RES_FACTOR / zoom) as u32).leading_zeros()).min(4).max(0);
 
@@ -502,11 +502,12 @@ impl VolumePane {
                             //println!("Tile ({}, {}) for pane {:?} is ready", tile_x, tile_y, self.pane_type);
                             let texture = ui.ctx().load_texture(
                                 format!(
-                                    "{}_{}_{}_{}",
+                                    "{}_{}_{}_{}_{}",
                                     self.pane_type.label(),
                                     key.tile_u,
                                     key.tile_v,
-                                    self.pane_type.coordinates().2
+                                    self.pane_type.coordinates().2,
+                                    key.volume_id
                                 ),
                                 image.as_ref().clone(),
                                 Default::default(),

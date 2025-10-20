@@ -46,6 +46,14 @@ pub struct SegmentMode {
     uv_pane: VolumePane,
     #[serde(skip)]
     convert_to_world_coords: Box<dyn Fn([i32; 3]) -> [i32; 3]>,
+    #[serde(skip)]
+    segment_id: Option<String>,
+    #[serde(skip)]
+    sample_id: Option<String>,
+    #[serde(skip)]
+    current_base_volume_id: Option<String>,
+    #[serde(skip)]
+    available_volumes: Vec<String>,
 }
 
 impl Default for SegmentMode {
@@ -61,6 +69,10 @@ impl Default for SegmentMode {
             surface_volume: Arc::new(EmptyVolume {}),
             uv_pane: VolumePane::new(PaneType::UV, true),
             convert_to_world_coords: Box::new(|x| x),
+            segment_id: None,
+            sample_id: None,
+            current_base_volume_id: None,
+            available_volumes: Vec::new(),
         }
     }
 }
@@ -134,6 +146,8 @@ pub struct TemplateApp {
     overlay: Option<Box<dyn PaintVolume>>,
     catalog_panel_open: bool,
     layout: GuiLayout,
+    #[serde(skip)]
+    pending_volume_switch: Option<String>,
 }
 
 impl Default for TemplateApp {
@@ -166,6 +180,7 @@ impl Default for TemplateApp {
             overlay: None,
             catalog_panel_open: true,
             layout: GuiLayout::Grid,
+            pending_volume_switch: None,
         }
     }
 }
@@ -177,16 +192,47 @@ impl TemplateApp {
     }
 
     fn load_atlas_segment(&mut self, sample_id: &str, segment_id: &str) {
+        self.load_atlas_segment_with_volume(sample_id, segment_id, None);
+    }
+
+    fn load_atlas_segment_with_volume(&mut self, sample_id: &str, segment_id: &str, target_volume_id: Option<&str>) {
         let mut volume_url_opt = None;
         let mut segment_info = None;
+        let mut available_volumes = Vec::new();
+        let mut current_volume_id = None;
+        let mut transform_matrix: Option<Vec<Vec<f64>>> = None;
 
         if let Some(atlas) = &self.atlas {
             if let Some(atlas_sample) = atlas.get_sample(sample_id) {
                 if let Some(segment) = atlas_sample.get_segment(segment_id) {
-                    if let Some(volume) = atlas_sample.get_volume(&segment.original_volume_id) {
+                    // Determine which volume to use
+                    let volume_id = target_volume_id.unwrap_or(&segment.original_volume_id);
+                    current_volume_id = Some(volume_id.to_string());
+
+                    // Get transform if not using original volume
+                    if volume_id != segment.original_volume_id {
+                        transform_matrix = atlas_sample.get_transform_for_segment(segment_id, volume_id);
+                        if transform_matrix.is_none() {
+                            println!(
+                                "Warning: No transform found from {} to {}",
+                                segment.original_volume_id, volume_id
+                            );
+                        }
+                    }
+
+                    // Load the target volume
+                    if let Some(volume) = atlas_sample.get_volume(volume_id) {
                         volume_url_opt = volume.get_ome_zarr_url();
                     }
+
                     segment_info = Some((segment.properties.width, segment.properties.height));
+
+                    // Get list of available volumes for this segment
+                    available_volumes = atlas_sample
+                        .get_volumes_for_segment(segment_id)
+                        .into_iter()
+                        .map(|(vol_id, _, _)| vol_id)
+                        .collect();
                 }
             }
         }
@@ -207,19 +253,41 @@ impl TemplateApp {
             let obj_cache_path = Self::atlas_obj_cache_path(sample_id, segment_id);
             if obj_cache_path.exists() {
                 println!("Loading atlas segment from cache: {}", obj_cache_path.display());
+
+                let transform = transform_matrix.map(|matrix| AffineTransform {
+                    matrix: [
+                        [matrix[0][0], matrix[0][1], matrix[0][2], matrix[0][3]],
+                        [matrix[1][0], matrix[1][1], matrix[1][2], matrix[1][3]],
+                        [matrix[2][0], matrix[2][1], matrix[2][2], matrix[2][3]],
+                    ],
+                });
+
                 self.setup_segment(
                     obj_cache_path.to_str().unwrap(),
                     width,
                     height,
-                    None,
+                    transform.as_ref(),
                     ProjectionKind::None,
+                    Some((sample_id.to_string(), segment_id.to_string())),
                 );
+
+                if let Some(segment_mode) = self.segment_mode.as_mut() {
+                    segment_mode.segment_id = Some(segment_id.to_string());
+                    segment_mode.sample_id = Some(sample_id.to_string());
+                    segment_mode.current_base_volume_id = current_volume_id;
+                    segment_mode.available_volumes = available_volumes;
+                }
             }
         }
     }
 
     /// Called once before the first frame.
-    pub fn new(cc: &eframe::CreationContext<'_>, catalog: Catalog, atlas: Option<AtlasMetadata>, config: VesuviusConfig) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        catalog: Catalog,
+        atlas: Option<AtlasMetadata>,
+        config: VesuviusConfig,
+    ) -> Self {
         // This is also where you can customize the look and feel of egui using
         // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
         let mut app: TemplateApp = if let Some(storage) = cc.storage {
@@ -255,7 +323,7 @@ impl TemplateApp {
             projection,
         }) = config.obj_file
         {
-            app.setup_segment(&obj_file, width, height, transform, projection);
+            app.setup_segment(&obj_file, width, height, transform.as_ref(), projection, None);
         }
 
         if let Some(segment_file) = config.overlay_dir {
@@ -287,8 +355,9 @@ impl TemplateApp {
         segment_file: &str,
         width: usize,
         height: usize,
-        transform: Option<AffineTransform>,
+        transform: Option<&AffineTransform>,
         projection: ProjectionKind,
+        atlas_metadata: Option<(String, String)>,
     ) {
         if segment_file.ends_with(".ppm") {
             let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
@@ -313,12 +382,17 @@ impl TemplateApp {
             //segment.surface_volume = ppm;
             segment.convert_to_world_coords = Box::new(move |coord| ppm2.convert_to_world_coords(coord));
 
+            if let Some((sample_id, segment_id)) = atlas_metadata {
+                segment.sample_id = Some(sample_id);
+                segment.segment_id = Some(segment_id);
+            }
+
             self.segment_mode = Some(segment)
         } else if segment_file.ends_with(".obj") {
             let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
-            let old = self.world.clone();
-            let base = old;
-            let obj_volume = ObjVolume::load_from_obj(&segment_file, base, width, height, &transform, projection);
+            let base = self.world.clone();
+            let transform_owned = transform.cloned();
+            let obj_volume = ObjVolume::load_from_obj(&segment_file, base, width, height, &transform_owned, projection);
             let width = obj_volume.width() as i32;
             let height = obj_volume.height() as i32;
 
@@ -337,6 +411,11 @@ impl TemplateApp {
             segment.world = Volume::from_ref(volume.clone());
             segment.surface_volume = volume;
             segment.convert_to_world_coords = Box::new(move |coords| obj2.convert_to_volume_coords(coords));
+
+            if let Some((sample_id, segment_id)) = atlas_metadata {
+                segment.sample_id = Some(sample_id);
+                segment.segment_id = Some(segment_id);
+            }
 
             self.segment_mode = Some(segment)
         }
@@ -407,15 +486,88 @@ impl TemplateApp {
             .num_columns(2)
             .spacing([40.0, 4.0])
             .show(ui, |ui| {
-                ui.label("Volume");
                 if self.is_segment_mode() {
-                    if ui.button("Unload segment").clicked() {
-                        self.segment_mode = None;
-                        if self.layout == GuiLayout::UV {
-                            self.layout = GuiLayout::Grid;
+                    if let Some(segment_mode) = self.segment_mode.as_ref() {
+                        if let (Some(sample_id), Some(segment_id)) = (&segment_mode.sample_id, &segment_mode.segment_id)
+                        {
+                            ui.label("Segment");
+                            ui.label(format!("{}/{}", sample_id, segment_id));
+                            ui.end_row();
+
+                            if !segment_mode.available_volumes.is_empty() {
+                                ui.label("Base Volume");
+
+                                let current_volume_id = segment_mode.current_base_volume_id.clone().unwrap_or_default();
+                                let mut selected_volume_id = current_volume_id.clone();
+
+                                egui::ComboBox::from_id_salt("BaseVolume")
+                                    .selected_text(current_volume_id.clone())
+                                    .show_ui(ui, |ui| {
+                                        for volume_id in &segment_mode.available_volumes {
+                                            let mut label = volume_id.clone();
+
+                                            if let Some(atlas) = &self.atlas {
+                                                if let Some(atlas_sample) = atlas.get_sample(sample_id) {
+                                                    if let Some(volume) = atlas_sample.get_volume(volume_id) {
+                                                        if let Some(props) = &volume.properties {
+                                                            let mut details = Vec::new();
+                                                            if let Some(energy) = props.energy_kev {
+                                                                details.push(format!("{}keV", energy));
+                                                            }
+                                                            if let Some(pixel_size) = props.pixel_size_um {
+                                                                details.push(format!("{:.2}µm", pixel_size));
+                                                            }
+                                                            if !details.is_empty() {
+                                                                label =
+                                                                    format!("{} ({})", volume_id, details.join(", "));
+                                                            }
+                                                        }
+
+                                                        let has_coverage =
+                                                            atlas_sample.has_coverage(segment_id, volume_id);
+                                                        if has_coverage {
+                                                            label = format!("{} ✓", label);
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            ui.selectable_value(&mut selected_volume_id, volume_id.clone(), label);
+                                        }
+                                    });
+
+                                if selected_volume_id != current_volume_id {
+                                    self.pending_volume_switch = Some(selected_volume_id.clone());
+                                }
+
+                                ui.end_row();
+                            } else {
+                                ui.label("Volume");
+                                ui.label("(segment mode)");
+                                ui.end_row();
+                            }
+
+                            ui.label("");
+                            if ui.button("Unload segment").clicked() {
+                                self.segment_mode = None;
+                                if self.layout == GuiLayout::UV {
+                                    self.layout = GuiLayout::Grid;
+                                }
+                            }
+                            ui.end_row();
+                        } else {
+                            ui.label("Volume");
+                            if ui.button("Unload segment").clicked() {
+                                self.segment_mode = None;
+                                if self.layout == GuiLayout::UV {
+                                    self.layout = GuiLayout::Grid;
+                                }
+                            }
+                            ui.end_row();
                         }
                     }
                 } else {
+                    ui.label("Volume");
                     ui.add_enabled_ui(!self.is_segment_mode(), |ui| {
                         egui::ComboBox::from_id_salt("Volume")
                             .selected_text(self.selected_volume().label())
@@ -431,8 +583,8 @@ impl TemplateApp {
                                 }
                             });
                     });
+                    ui.end_row();
                 }
-                ui.end_row();
                 let sync_coordinates = self.should_sync_coords();
                 slider(
                     ui,
@@ -698,9 +850,24 @@ impl TemplateApp {
                 segment.height,
                 None,
                 ProjectionKind::None,
+                None,
             );
             self.selected_segment = Some(segment);
             self.downloading_segment = None;
+        }
+
+        if let Some(new_volume_id) = self.pending_volume_switch.take() {
+            let segment_info = self.segment_mode.as_ref().and_then(|segment_mode| {
+                segment_mode
+                    .sample_id
+                    .as_ref()
+                    .zip(segment_mode.segment_id.as_ref())
+                    .map(|(sample_id, segment_id)| (sample_id.clone(), segment_id.clone()))
+            });
+
+            if let Some((sample_id, segment_id)) = segment_info {
+                self.load_atlas_segment_with_volume(&sample_id, &segment_id, Some(&new_volume_id));
+            }
         }
 
         if self.catalog_panel_open {
@@ -1079,7 +1246,7 @@ impl TemplateApp {
                 if let Some(segment) = clicked {
                     if let Some(obj_file) = self.obj_repository.get(&segment) {
                         self.load_volume_by_ref(&segment.volume_ref());
-                        self.setup_segment(&obj_file.to_str().unwrap().to_string(), segment.width, segment.height, None, ProjectionKind::None);
+                        self.setup_segment(&obj_file.to_str().unwrap().to_string(), segment.width, segment.height, None, ProjectionKind::None, None);
                         self.selected_segment = Some(segment);
                     } else {
                         let sender = self.notification_sender.clone();
