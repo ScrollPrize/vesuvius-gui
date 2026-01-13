@@ -5,6 +5,7 @@ use std::io::{Cursor, Read};
 pub mod catalog;
 pub mod downloader;
 pub mod model;
+pub mod remap_config;
 pub mod volume;
 
 #[cfg(test)]

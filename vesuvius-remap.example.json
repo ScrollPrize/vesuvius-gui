@@ -1,0 +1,26 @@
+{
+  "_doc": [
+    "Optional path / URL remap config. Copy this file to e.g. vesuvius-remap.json,",
+    "edit the entries, and point the VESUVIUS_REMAP_CONFIG env var at it (typically",
+    "via .envrc). When the env var is unset, no remappings are applied.",
+    "",
+    "Fields:",
+    "  atlas_url_rewrites:",
+    "    Whitelist atlas access roots by URL prefix (and optionally `usage`).",
+    "    Each entry matches a URL prefix and optionally rewrites it. Omit `usage`",
+    "    to match any usage. Omit `rewrite_to` to allow the URL through unchanged.",
+    "  volume_overrides:",
+    "    Map a volume id (as returned by VolumeReference::id) to a direct OME-zarr",
+    "    URL. The GUI uses the override instead of the default tile layout."
+  ],
+  "atlas_url_rewrites": [
+    {
+      "usage": "private-internet",
+      "match_url_prefix": "https://example.invalid",
+      "rewrite_to": "https://example.test/volumes"
+    }
+  ],
+  "volume_overrides": {
+    "00000000000000": "https://example.test/volumes/some.zarr/"
+  }
+}

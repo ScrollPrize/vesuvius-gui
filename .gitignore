@@ -1,2 +1,7 @@
 /target
 /data*
+
+# Local remap config (see vesuvius-remap.example.json). Pointed to by
+# VESUVIUS_REMAP_CONFIG, typically set in .envrc.
+/vesuvius-remap.json
+/vesuvius-remap.local.json

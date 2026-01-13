@@ -1,3 +1,4 @@
+use vesuvius_rs::remap_config::RemapConfig;
 use vesuvius_rs::volume::AffineTransform;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -257,6 +258,15 @@ fn get_standard_url(data: &[DataEntry], data_type: &str) -> Option<String> {
                     if access_root.usage == "standard" {
                         return Some(format!(
                             "https://data.aws.ash2txt.org/samples/{}",
+                            origin.path.trim_start_matches('/')
+                        ));
+                    }
+                    if let Some(rewritten) =
+                        RemapConfig::get().rewrite_atlas_url(&access_root.usage, &access_root.url)
+                    {
+                        return Some(format!(
+                            "{}/{}",
+                            rewritten.trim_end_matches('/'),
                             origin.path.trim_start_matches('/')
                         ));
                     }

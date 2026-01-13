@@ -151,7 +151,7 @@ trait Downloader: Sync + Send + Debug {
     fn download(&self, from_url: &str, to_path: &str);
 }
 
-const SIMPLE_DOWNLOADER_WORKERS: usize = 16;
+const SIMPLE_DOWNLOADER_WORKERS: usize = 32;
 
 /// Per-download log messages are at `info` level but gated by `VESUVIUS_LOG_DOWNLOADS` so
 /// they don't spam at the workspace's default `RUST_LOG=info`. Set the env var to any

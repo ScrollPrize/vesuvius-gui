@@ -553,7 +553,11 @@ impl TemplateApp {
     }
 
     fn load_volume_by_ref(&mut self, volume_ref: &dyn VolumeReference) {
-        let new_vol = NewVolumeReference::Volume64x4(volume_ref.owned());
+        let id = volume_ref.id();
+        let new_vol = vesuvius_rs::remap_config::RemapConfig::get()
+            .volume_override_url(&id)
+            .and_then(|url| NewVolumeReference::from_url(url).ok())
+            .unwrap_or_else(|| NewVolumeReference::Volume64x4(volume_ref.owned()));
         self.load_volume(&new_vol);
     }
 
