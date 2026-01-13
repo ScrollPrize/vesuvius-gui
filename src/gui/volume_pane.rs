@@ -11,10 +11,14 @@ use std::task::{Context, Poll};
 const ZOOM_RES_FACTOR: f32 = 1.;
 const TILE_SIZE: usize = 256;
 
-// Time-to-live for cached tiles in seconds
-const TILE_TTL_BASE_SECONDS: u64 = 2;
-// Random jitter range (0 to this many seconds added to base TTL)
-const TILE_TTL_JITTER_SECONDS: u64 = 8;
+// Time-to-live for cached tiles in milliseconds
+const TILE_TTL_BASE_MS: u64 = 500;
+// Random jitter range (0 to this many milliseconds added to base TTL)
+const TILE_TTL_JITTER_MS: u64 = 500;
+// TTL multiplier for each successive unchanged recalculation (exponential backoff)
+const TILE_TTL_BACKOFF_MULTIPLIER: u64 = 2;
+// Maximum TTL backoff factor
+const TILE_TTL_MAX_BACKOFF: u64 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TileCacheKey {
@@ -81,27 +85,52 @@ enum AsyncTexture {
     Ready {
         texture: egui::TextureHandle,
         cached_at: std::time::Instant,
+        content_hash: u64,   // Hash of tile pixel data
+        backoff_factor: u64, // TTL multiplier for unchanged tiles (1, 2, 4, 8, 16)
     },
     ReadyRecalculating {
         texture: egui::TextureHandle,
         future: Arc<Mutex<CancellableImageFuture>>,
         cached_at: std::time::Instant,
+        content_hash: u64,   // Hash of current tile data
+        backoff_factor: u64, // Current backoff factor to preserve
     },
 }
 
 impl AsyncTexture {
-    /// Check if this tile needs recalculation based on TTL
+    /// Check if this tile needs recalculation based on TTL with backoff
     fn needs_recalculation(&self) -> bool {
         match self {
-            AsyncTexture::Ready { cached_at, .. } | AsyncTexture::ReadyRecalculating { cached_at, .. } => {
+            AsyncTexture::Ready {
+                cached_at,
+                backoff_factor,
+                ..
+            }
+            | AsyncTexture::ReadyRecalculating {
+                cached_at,
+                backoff_factor,
+                ..
+            } => {
                 use rand::Rng;
-                let jitter = rand::thread_rng().gen_range(0..=TILE_TTL_JITTER_SECONDS);
-                let ttl = std::time::Duration::from_secs(TILE_TTL_BASE_SECONDS + jitter);
+                let jitter = rand::thread_rng().gen_range(0..=TILE_TTL_JITTER_MS);
+                let base_ttl = TILE_TTL_BASE_MS + jitter;
+                let ttl = std::time::Duration::from_millis(base_ttl * backoff_factor);
                 cached_at.elapsed() > ttl
             }
             AsyncTexture::Loading { .. } => false,
         }
     }
+}
+
+/// Calculate a simple hash of image pixel data
+fn hash_image(image: &ColorImage) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    image.size.hash(&mut hasher);
+    image.pixels.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Poll a future with deadline, shared logic for Loading and ReadyRecalculating states
@@ -540,11 +569,18 @@ impl VolumePane {
         }
 
         match cached_value {
-            Some(AsyncTexture::Ready { texture, cached_at }) => {
+            Some(AsyncTexture::Ready {
+                texture,
+                cached_at,
+                content_hash,
+                backoff_factor,
+            }) => {
                 // Check if tile needs recalculation
                 let async_tex = AsyncTexture::Ready {
                     texture: texture.clone(),
                     cached_at,
+                    content_hash,
+                    backoff_factor,
                 };
 
                 if async_tex.needs_recalculation() {
@@ -556,7 +592,9 @@ impl VolumePane {
                         AsyncTexture::ReadyRecalculating {
                             texture: texture.clone(),
                             future: new_future,
-                            cached_at, // Keep old timestamp for now
+                            cached_at,
+                            content_hash,
+                            backoff_factor,
                         },
                     );
                 } else {
@@ -570,6 +608,8 @@ impl VolumePane {
                 texture,
                 future,
                 cached_at,
+                content_hash,
+                backoff_factor,
             }) => {
                 // Poll the recalculation future briefly (non-blocking check)
                 // Use minimal deadline since we don't want to block UI
@@ -577,6 +617,16 @@ impl VolumePane {
 
                 match poll_tile_future(future.clone(), quick_deadline) {
                     Poll::Ready(new_image) => {
+                        // Calculate hash of new image to check if content changed
+                        let new_hash = hash_image(new_image.as_ref());
+
+                        // If content unchanged, increase backoff; otherwise reset
+                        let new_backoff = if new_hash == content_hash {
+                            (backoff_factor * TILE_TTL_BACKOFF_MULTIPLIER).min(TILE_TTL_MAX_BACKOFF)
+                        } else {
+                            1 // Reset backoff when content changes
+                        };
+
                         // Recalculation complete - swap to new texture
                         let new_texture = ui.ctx().load_texture(
                             format!(
@@ -595,7 +645,9 @@ impl VolumePane {
                             key,
                             AsyncTexture::Ready {
                                 texture: new_texture.clone(),
-                                cached_at: std::time::Instant::now(), // Reset TTL
+                                cached_at: std::time::Instant::now(),
+                                content_hash: new_hash,
+                                backoff_factor: new_backoff,
                             },
                         );
                         Some(new_texture)
@@ -609,6 +661,8 @@ impl VolumePane {
                                 texture: texture.clone(),
                                 future: future.clone(),
                                 cached_at,
+                                content_hash,
+                                backoff_factor,
                             },
                         );
                         ui.ctx().request_repaint(); // Check again next frame
@@ -621,6 +675,7 @@ impl VolumePane {
                 // Poll until deadline (from function parameter, typically 20ms)
                 match poll_tile_future(future.clone(), deadline) {
                     Poll::Ready(image) => {
+                        let content_hash = hash_image(image.as_ref());
                         let texture = ui.ctx().load_texture(
                             format!(
                                 "{}_{}_{}_{}_{}",
@@ -639,6 +694,8 @@ impl VolumePane {
                             AsyncTexture::Ready {
                                 texture: texture.clone(),
                                 cached_at: std::time::Instant::now(),
+                                content_hash,
+                                backoff_factor: 1, // Initial backoff
                             },
                         );
                         return Some(texture);
