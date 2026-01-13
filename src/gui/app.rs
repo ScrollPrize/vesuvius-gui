@@ -23,7 +23,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-pub(crate) const ZOOM_MIN: f32 = 0.025;
+pub(crate) const ZOOM_MIN: f32 = 0.01;
 pub(crate) const ZOOM_MAX: f32 = 8.0;
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -169,8 +169,8 @@ impl Default for TemplateApp {
             drawing_config: Default::default(),
             sync_coordinates: true,
             show_overlay: true,
-            ranges: [0..=20000, 0..=20000, 0..=30000],
-            extra_resolutions: 1,
+            ranges: [0..=20000, 0..=20000, 0..=80000],
+            extra_resolutions: 0,
             segment_mode: None,
             catalog,
             atlas,

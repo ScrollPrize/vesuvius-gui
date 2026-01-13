@@ -40,7 +40,7 @@ impl TileCacheKey {
     ) -> Self {
         let volume_id = Arc::as_ptr(&world.volume) as *const () as usize;
 
-        let min_level = (32 - ((ZOOM_RES_FACTOR / zoom) as u32).leading_zeros()).min(4).max(0);
+        let min_level = (32 - ((ZOOM_RES_FACTOR / zoom) as u32).leading_zeros()).max(0);
 
         Self {
             pane_type,
@@ -610,7 +610,7 @@ impl VolumePane {
         tile_coord[d_coord] = key.w;
 
         let min_level = key.min_level;
-        let max_level: u32 = (min_level + key.extra_resolutions).min(4);
+        let max_level: u32 = min_level + key.extra_resolutions;
 
         for level in (min_level..=max_level).rev() {
             let sfactor = 1 << level as u8;
