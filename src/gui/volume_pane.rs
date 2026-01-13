@@ -11,6 +11,11 @@ use std::task::{Context, Poll};
 const ZOOM_RES_FACTOR: f32 = 1.;
 const TILE_SIZE: usize = 256;
 
+// Time-to-live for cached tiles in seconds
+const TILE_TTL_BASE_SECONDS: u64 = 2;
+// Random jitter range (0 to this many seconds added to base TTL)
+const TILE_TTL_JITTER_SECONDS: u64 = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TileCacheKey {
     pane_type: PaneType,
@@ -69,8 +74,55 @@ impl Drop for CancellableImageFuture {
 
 #[derive(Clone)]
 enum AsyncTexture {
-    Loading(Arc<Mutex<CancellableImageFuture>>),
-    Ready(egui::TextureHandle),
+    Loading {
+        future: Arc<Mutex<CancellableImageFuture>>,
+        started_at: std::time::Instant,
+    },
+    Ready {
+        texture: egui::TextureHandle,
+        cached_at: std::time::Instant,
+    },
+    ReadyRecalculating {
+        texture: egui::TextureHandle,
+        future: Arc<Mutex<CancellableImageFuture>>,
+        cached_at: std::time::Instant,
+    },
+}
+
+impl AsyncTexture {
+    /// Check if this tile needs recalculation based on TTL
+    fn needs_recalculation(&self) -> bool {
+        match self {
+            AsyncTexture::Ready { cached_at, .. } | AsyncTexture::ReadyRecalculating { cached_at, .. } => {
+                use rand::Rng;
+                let jitter = rand::thread_rng().gen_range(0..=TILE_TTL_JITTER_SECONDS);
+                let ttl = std::time::Duration::from_secs(TILE_TTL_BASE_SECONDS + jitter);
+                cached_at.elapsed() > ttl
+            }
+            AsyncTexture::Loading { .. } => false,
+        }
+    }
+}
+
+/// Poll a future with deadline, shared logic for Loading and ReadyRecalculating states
+fn poll_tile_future(future: Arc<Mutex<CancellableImageFuture>>, deadline: std::time::Instant) -> Poll<Arc<ColorImage>> {
+    let mut future_guard = future.lock().unwrap();
+    let waker = futures::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+
+    loop {
+        let poll_result = tokio::task::block_in_place(|| future_guard.future.as_mut().poll(&mut context));
+
+        match poll_result {
+            Poll::Ready(image) => return Poll::Ready(image),
+            Poll::Pending => {
+                if std::time::Instant::now() >= deadline {
+                    return Poll::Pending;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 type TileCache = FramePublisher<TileCacheKey, AsyncTexture>;
@@ -451,7 +503,14 @@ impl VolumePane {
             None => {
                 let handle = self.create_tile_async(&key, world);
 
-                set(ui, key, AsyncTexture::Loading(handle));
+                set(
+                    ui,
+                    key,
+                    AsyncTexture::Loading {
+                        future: handle,
+                        started_at: std::time::Instant::now(),
+                    },
+                );
             }
             _ => {}
         }
@@ -481,62 +540,137 @@ impl VolumePane {
         }
 
         match cached_value {
-            Some(AsyncTexture::Ready(texture)) => {
-                // Texture is ready, return it and refresh cache
-                set(ui, key, AsyncTexture::Ready(texture.clone()));
+            Some(AsyncTexture::Ready { texture, cached_at }) => {
+                // Check if tile needs recalculation
+                let async_tex = AsyncTexture::Ready {
+                    texture: texture.clone(),
+                    cached_at,
+                };
+
+                if async_tex.needs_recalculation() {
+                    // TTL expired - start recalculation while showing old tile
+                    let new_future = self.create_tile_async(&key, world);
+                    set(
+                        ui,
+                        key.clone(),
+                        AsyncTexture::ReadyRecalculating {
+                            texture: texture.clone(),
+                            future: new_future,
+                            cached_at, // Keep old timestamp for now
+                        },
+                    );
+                } else {
+                    // Refresh cache entry to keep it alive
+                    set(ui, key, async_tex);
+                }
                 Some(texture)
             }
-            Some(AsyncTexture::Loading(holder)) => {
-                let future = &mut holder.lock().unwrap().future;
 
-                // Create a waker that will work properly with tokio futures
-                let waker = futures::task::noop_waker();
-                let mut context = Context::from_waker(&waker);
+            Some(AsyncTexture::ReadyRecalculating {
+                texture,
+                future,
+                cached_at,
+            }) => {
+                // Poll the recalculation future briefly (non-blocking check)
+                // Use minimal deadline since we don't want to block UI
+                let quick_deadline = std::time::Instant::now() + std::time::Duration::from_micros(100);
 
-                // Poll repeatedly until deadline is reached or future is ready
-                loop {
-                    let poll_result = tokio::task::block_in_place(|| future.as_mut().poll(&mut context));
-
-                    match poll_result {
-                        Poll::Ready(image) => {
-                            //println!("Tile ({}, {}) for pane {:?} is ready", tile_x, tile_y, self.pane_type);
-                            let texture = ui.ctx().load_texture(
-                                format!(
-                                    "{}_{}_{}_{}_{}",
-                                    self.pane_type.label(),
-                                    key.tile_u,
-                                    key.tile_v,
-                                    self.pane_type.coordinates().2,
-                                    key.volume_id
-                                ),
-                                image.as_ref().clone(),
-                                Default::default(),
-                            );
-                            // Store the ready texture and return it
-                            set(ui, key, AsyncTexture::Ready(texture.clone()));
-                            return Some(texture);
-                        }
-                        Poll::Pending => {
-                            // Check if deadline has passed
-                            if std::time::Instant::now() >= deadline {
-                                break;
-                            }
-                            // Small yield to prevent busy waiting
-                            std::thread::yield_now();
-                        }
+                match poll_tile_future(future.clone(), quick_deadline) {
+                    Poll::Ready(new_image) => {
+                        // Recalculation complete - swap to new texture
+                        let new_texture = ui.ctx().load_texture(
+                            format!(
+                                "{}_{}_{}_{}_{}",
+                                self.pane_type.label(),
+                                key.tile_u,
+                                key.tile_v,
+                                self.pane_type.coordinates().2,
+                                key.volume_id
+                            ),
+                            new_image.as_ref().clone(),
+                            Default::default(),
+                        );
+                        set(
+                            ui,
+                            key,
+                            AsyncTexture::Ready {
+                                texture: new_texture.clone(),
+                                cached_at: std::time::Instant::now(), // Reset TTL
+                            },
+                        );
+                        Some(new_texture)
+                    }
+                    Poll::Pending => {
+                        // Still recalculating - keep showing old texture
+                        set(
+                            ui,
+                            key,
+                            AsyncTexture::ReadyRecalculating {
+                                texture: texture.clone(),
+                                future: future.clone(),
+                                cached_at,
+                            },
+                        );
+                        ui.ctx().request_repaint(); // Check again next frame
+                        Some(texture)
                     }
                 }
-
-                // Deadline exceeded, still loading
-                set(ui, key, AsyncTexture::Loading(holder.clone()));
-                ui.ctx().request_repaint();
-                None
             }
+
+            Some(AsyncTexture::Loading { future, started_at }) => {
+                // Poll until deadline (from function parameter, typically 20ms)
+                match poll_tile_future(future.clone(), deadline) {
+                    Poll::Ready(image) => {
+                        let texture = ui.ctx().load_texture(
+                            format!(
+                                "{}_{}_{}_{}_{}",
+                                self.pane_type.label(),
+                                key.tile_u,
+                                key.tile_v,
+                                self.pane_type.coordinates().2,
+                                key.volume_id
+                            ),
+                            image.as_ref().clone(),
+                            Default::default(),
+                        );
+                        set(
+                            ui,
+                            key,
+                            AsyncTexture::Ready {
+                                texture: texture.clone(),
+                                cached_at: std::time::Instant::now(),
+                            },
+                        );
+                        return Some(texture);
+                    }
+                    Poll::Pending => {
+                        // Deadline exceeded, still loading
+                        set(
+                            ui,
+                            key,
+                            AsyncTexture::Loading {
+                                future: future.clone(),
+                                started_at,
+                            },
+                        );
+                        ui.ctx().request_repaint();
+                        None
+                    }
+                }
+            }
+
             None => {
                 // Start async rendering
                 let handle = self.create_tile_async(&key, world);
 
-                set(ui, key, AsyncTexture::Loading(handle));
+                set(
+                    ui,
+                    key,
+                    AsyncTexture::Loading {
+                        future: handle,
+                        started_at: std::time::Instant::now(),
+                    },
+                );
                 ui.ctx().request_repaint();
                 None
             }
