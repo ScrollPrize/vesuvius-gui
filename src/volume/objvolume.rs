@@ -235,6 +235,7 @@ pub struct ObjFile {
     has_inverted_uv_tris: bool,
     uv_index: UVIndex,
     xyz_index: XYZIndex,
+    projection_dimensions: Option<(usize, usize)>, // Some((width, height)) for orthographic projections
 }
 impl ObjFile {
     pub fn new(mut object: Object, transform: &Option<AffineTransform>, projection: ProjectionKind) -> Self {
@@ -259,7 +260,7 @@ impl ObjFile {
             });
         }
 
-        if projection == ProjectionKind::OrthographicXZ {
+        let projection_dimensions = if projection == ProjectionKind::OrthographicXZ {
             object.normals.iter_mut().for_each(|n| {
                 n.x = 0.0;
                 n.y = 1.0;
@@ -285,6 +286,8 @@ impl ObjFile {
                 tex.u = (x - min_x) / dx;
                 tex.v = (z - min_z) / dz;
             });
+
+            Some((dx.ceil() as usize, dz.ceil() as usize))
         } else {
             // rescale tex to 0..1
             let min_u = object.tex_vertices.iter().map(|v| v.u).fold(f64::INFINITY, f64::min);
@@ -305,7 +308,9 @@ impl ObjFile {
                 tex.u = (tex.u - min_u) / du;
                 tex.v = (tex.v - min_v) / dv;
             });
-        }
+
+            None
+        };
 
         let has_inverted_uv_tris = Self::has_inverted_uv_tris(object.clone());
         let target_cell_num = 100.;
@@ -321,6 +326,7 @@ impl ObjFile {
             has_inverted_uv_tris,
             uv_index,
             xyz_index,
+            projection_dimensions,
         }
     }
     fn has_inverted_uv_tris(obj: Object) -> bool {
@@ -372,12 +378,22 @@ impl ObjVolume {
         transform: &Option<AffineTransform>,
         projection: ProjectionKind,
     ) -> Self {
-        Self::new(
-            Arc::new(Self::load_obj(obj_file_path, transform, projection)),
-            base_volume,
-            width,
-            height,
-        )
+        let obj_file = Arc::new(Self::load_obj(obj_file_path, transform, projection));
+
+        // Use projection dimensions for orthographic projections to maintain 1:1 scale
+        let (final_width, final_height) = if let Some((proj_width, proj_height)) = obj_file.projection_dimensions {
+            if proj_width != width || proj_height != height {
+                println!(
+                    "Note: Adjusting dimensions from {}x{} to {}x{} to maintain 1:1 scale for orthographic projection",
+                    width, height, proj_width, proj_height
+                );
+            }
+            (proj_width, proj_height)
+        } else {
+            (width, height)
+        };
+
+        Self::new(obj_file, base_volume, final_width, final_height)
     }
     pub fn new(obj: Arc<ObjFile>, base_volume: Volume, width: usize, height: usize) -> Self {
         Self {
