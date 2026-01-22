@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use derive_more::with_trait::Debug;
 use directories::BaseDirs;
 use ehttp::Request;
-use fxhash::{FxHashMap, FxHashSet};
+use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use libm::modf;
 pub use ome::OmeZarrContext;
 pub use ome::{ColorScheme, FourColors, GrayScale};
@@ -475,14 +475,14 @@ impl Deref for ZarrContextCacheEntry {
 }
 
 struct ZarrContextCache<const N: usize> {
-    cache: DashMap<[usize; N], Option<ZarrContextCacheEntry>>,
+    cache: DashMap<[usize; N], Option<ZarrContextCacheEntry>, FxBuildHasher>,
     access_counter: AtomicU64,
     non_empty_entries: AtomicU64,
 }
 impl<const N: usize> ZarrContextCache<N> {
     fn new() -> Self {
         ZarrContextCache {
-            cache: DashMap::with_shard_amount(1024),
+            cache: DashMap::with_hasher_and_shard_amount(FxBuildHasher::default(), 1024),
             access_counter: AtomicU64::new(0),
             non_empty_entries: AtomicU64::new(0),
         }

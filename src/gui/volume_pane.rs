@@ -2,6 +2,8 @@ use crate::gui::app::{ZOOM_MAX, ZOOM_MIN};
 use crate::volume::{DrawingConfig, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
 use egui::cache::FramePublisher;
 use egui::{Color32, ColorImage, PointerButton, Response, Ui, Vec2};
+use fxhash::FxBuildHasher;
+use std::hash::BuildHasher;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
@@ -124,10 +126,9 @@ impl AsyncTexture {
 
 /// Calculate a simple hash of image pixel data
 fn hash_image(image: &ColorImage) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FxBuildHasher::default().build_hasher();
     image.size.hash(&mut hasher);
     image.pixels.hash(&mut hasher);
     hasher.finish()
