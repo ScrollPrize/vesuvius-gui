@@ -33,6 +33,7 @@ log             = { version = "0.4" }
 lz4-compression = { version = "0.7" }
 nalgebra        = { version = "0.33" }
 num_cpus        = { version = "1" }
+quanta          = { version = "0.12" }
 rand            = { version = "0.8" }
 rayon           = { version = "1" }
 regex           = { version = "1", default-features=false, features = ["unicode-perl"] }

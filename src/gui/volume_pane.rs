@@ -82,18 +82,18 @@ impl Drop for CancellableImageFuture {
 enum AsyncTexture {
     Loading {
         future: Arc<Mutex<CancellableImageFuture>>,
-        started_at: std::time::Instant,
+        started_at: quanta::Instant,
     },
     Ready {
         texture: egui::TextureHandle,
-        cached_at: std::time::Instant,
+        cached_at: quanta::Instant,
         content_hash: u64,   // Hash of tile pixel data
         backoff_factor: u64, // TTL multiplier for unchanged tiles (1, 2, 4, 8, 16)
     },
     ReadyRecalculating {
         texture: egui::TextureHandle,
         future: Arc<Mutex<CancellableImageFuture>>,
-        cached_at: std::time::Instant,
+        cached_at: quanta::Instant,
         content_hash: u64,   // Hash of current tile data
         backoff_factor: u64, // Current backoff factor to preserve
     },
@@ -134,11 +134,12 @@ fn hash_image(image: &ColorImage) -> u64 {
     hasher.finish()
 }
 
-/// Poll a future with deadline, shared logic for Loading and ReadyRecalculating states
-fn poll_tile_future(future: Arc<Mutex<CancellableImageFuture>>, deadline: std::time::Instant) -> Poll<Arc<ColorImage>> {
+/// Poll a future with timeout, shared logic for Loading and ReadyRecalculating states
+fn poll_tile_future(future: Arc<Mutex<CancellableImageFuture>>, timeout: std::time::Duration) -> Poll<Arc<ColorImage>> {
     let mut future_guard = future.lock().unwrap();
     let waker = futures::task::noop_waker();
     let mut context = Context::from_waker(&waker);
+    let start = quanta::Instant::now();
 
     loop {
         let poll_result = tokio::task::block_in_place(|| future_guard.future.as_mut().poll(&mut context));
@@ -146,7 +147,7 @@ fn poll_tile_future(future: Arc<Mutex<CancellableImageFuture>>, deadline: std::t
         match poll_result {
             Poll::Ready(image) => return Poll::Ready(image),
             Poll::Pending => {
-                if std::time::Instant::now() >= deadline {
+                if start.elapsed() >= timeout {
                     return Poll::Pending;
                 }
                 std::thread::yield_now();
@@ -506,11 +507,11 @@ impl VolumePane {
             self.ensure_tile_async(ui, key.clone(), world);
         }
 
-        let millis = 20; //if self.pane_type == PaneType::UV { 10 } else { 20 };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+        let millis = 50; //if self.pane_type == PaneType::UV { 10 } else { 20 };
+        let timeout = std::time::Duration::from_millis(millis);
         let mut ready_tiles = Vec::new();
         for (key, tile_rect) in keys_and_rects {
-            if let Some(texture) = self.get_or_create_tile_async(ui, key, world, deadline) {
+            if let Some(texture) = self.get_or_create_tile_async(ui, key, world, timeout) {
                 ready_tiles.push((texture, tile_rect));
             }
         }
@@ -538,7 +539,7 @@ impl VolumePane {
                     key,
                     AsyncTexture::Loading {
                         future: handle,
-                        started_at: std::time::Instant::now(),
+                        started_at: quanta::Instant::now(),
                     },
                 );
             }
@@ -551,7 +552,7 @@ impl VolumePane {
         ui: &Ui,
         key: TileCacheKey,
         world: &Volume,
-        deadline: std::time::Instant,
+        timeout: std::time::Duration,
     ) -> Option<egui::TextureHandle> {
         // Calculate paint_zoom for cache key (same logic as in create_tile)
 
@@ -613,10 +614,8 @@ impl VolumePane {
                 backoff_factor,
             }) => {
                 // Poll the recalculation future briefly (non-blocking check)
-                // Use minimal deadline since we don't want to block UI
-                let quick_deadline = std::time::Instant::now() + std::time::Duration::from_micros(100);
-
-                match poll_tile_future(future.clone(), quick_deadline) {
+                // Use minimal timeout since we don't want to block UI
+                match poll_tile_future(future.clone(), std::time::Duration::from_micros(100)) {
                     Poll::Ready(new_image) => {
                         // Calculate hash of new image to check if content changed
                         let new_hash = hash_image(new_image.as_ref());
@@ -646,7 +645,7 @@ impl VolumePane {
                             key,
                             AsyncTexture::Ready {
                                 texture: new_texture.clone(),
-                                cached_at: std::time::Instant::now(),
+                                cached_at: quanta::Instant::now(),
                                 content_hash: new_hash,
                                 backoff_factor: new_backoff,
                             },
@@ -673,8 +672,8 @@ impl VolumePane {
             }
 
             Some(AsyncTexture::Loading { future, started_at }) => {
-                // Poll until deadline (from function parameter, typically 20ms)
-                match poll_tile_future(future.clone(), deadline) {
+                // Poll until timeout (from function parameter, typically 50ms)
+                match poll_tile_future(future.clone(), timeout) {
                     Poll::Ready(image) => {
                         let content_hash = hash_image(image.as_ref());
                         let texture = ui.ctx().load_texture(
@@ -694,7 +693,7 @@ impl VolumePane {
                             key,
                             AsyncTexture::Ready {
                                 texture: texture.clone(),
-                                cached_at: std::time::Instant::now(),
+                                cached_at: quanta::Instant::now(),
                                 content_hash,
                                 backoff_factor: 1, // Initial backoff
                             },
@@ -726,7 +725,7 @@ impl VolumePane {
                     key,
                     AsyncTexture::Loading {
                         future: handle,
-                        started_at: std::time::Instant::now(),
+                        started_at: quanta::Instant::now(),
                     },
                 );
                 ui.ctx().request_repaint();
@@ -774,9 +773,6 @@ impl VolumePane {
     }
 
     fn create_tile_sync(&self, key: &TileCacheKey, world: Volume) -> egui::ColorImage {
-        use std::time::Instant;
-        let _start = Instant::now();
-
         let (u_coord, v_coord, d_coord) = self.pane_type.coordinates();
 
         // Use integer paint zoom levels like the original code
