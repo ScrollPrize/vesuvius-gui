@@ -1058,12 +1058,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastrand"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
-
-[[package]]
 name = "fax"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3504,19 +3498,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tempfile"
-version = "3.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15b61f8f20e3a6f7e0649d825294eaf317edce30f82cf6026e7e4cb9222a7d1e"
-dependencies = [
- "fastrand",
- "getrandom 0.3.3",
- "once_cell",
- "rustix 1.0.8",
- "windows-sys 0.60.2",
-]
-
-[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3907,15 +3888,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vesuvius-atlas-rs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vesuvius-rs",
+]
+
+[[package]]
 name = "vesuvius-gui"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-recursion",
- "base64",
  "clap",
- "dashmap",
- "derive_more",
  "directories",
  "eframe",
  "egui",
@@ -3926,16 +3911,51 @@ dependencies = [
  "futures",
  "fxhash",
  "image",
+ "log",
+ "quanta",
+ "rand 0.8.5",
+ "serde",
+ "tokio",
+ "vesuvius-atlas-rs",
+ "vesuvius-rs",
+]
+
+[[package]]
+name = "vesuvius-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "clap",
+ "directories",
+ "ehttp",
+ "futures",
+ "image",
  "indicatif",
+ "num_cpus",
+ "regex",
+ "tokio",
+ "vesuvius-rs",
+]
+
+[[package]]
+name = "vesuvius-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "dashmap",
+ "derive_more",
+ "directories",
+ "ecolor",
+ "ehttp",
+ "fxhash",
  "itertools",
  "libm",
  "log",
  "lz4-compression",
  "memmap",
  "nalgebra",
- "num_cpus",
- "quanta",
- "rand 0.8.5",
  "rayon",
  "regex",
  "reqwest",
@@ -3943,9 +3963,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "tiff",
- "tokio",
  "wavefront_obj",
 ]
 

@@ -1,4 +1,4 @@
-use crate::volume::AffineTransform;
+use vesuvius_rs::volume::AffineTransform;
 use serde::Deserialize;
 use std::collections::HashMap;
 

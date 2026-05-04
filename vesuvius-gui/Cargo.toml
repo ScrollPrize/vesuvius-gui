@@ -1,0 +1,28 @@
+[package]
+name = "vesuvius-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[dependencies]
+vesuvius-rs       = { path = "../vesuvius-rs" }
+vesuvius-atlas-rs = { path = "../vesuvius-atlas-rs" }
+
+clap        = { workspace = true }
+directories = { workspace = true }
+eframe      = { workspace = true }
+egui        = { workspace = true }
+egui_extras = { workspace = true }
+ehttp       = { workspace = true }
+emath       = { workspace = true }
+futures     = { workspace = true }
+fxhash      = { workspace = true }
+image       = { workspace = true }
+log         = { workspace = true }
+quanta      = { workspace = true }
+rand        = { workspace = true }
+serde       = { workspace = true }
+tokio       = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = { workspace = true }

@@ -2,10 +2,8 @@
 
 use std::io::{Cursor, Read};
 
-pub mod atlas;
 pub mod catalog;
 pub mod downloader;
-pub mod gui;
 pub mod model;
 pub mod volume;
 pub mod zarr;

@@ -1,5 +1,5 @@
 use crate::gui::app::{ZOOM_MAX, ZOOM_MIN};
-use crate::volume::{DrawingConfig, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
+use vesuvius_rs::volume::{DrawingConfig, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
 use egui::cache::FramePublisher;
 use egui::{Color32, ColorImage, PointerButton, Response, Ui, Vec2};
 use fxhash::FxBuildHasher;
@@ -121,6 +121,14 @@ impl AsyncTexture {
             }
             AsyncTexture::Loading { .. } => false,
         }
+    }
+}
+
+fn to_color_image(image: vesuvius_rs::volume::Image) -> ColorImage {
+    ColorImage {
+        size: [image.width, image.height],
+        pixels: image.data,
+        ..Default::default()
     }
 }
 
@@ -370,7 +378,7 @@ impl VolumePane {
                 let width = (frame_width as f32 / scaling) as usize;
                 let height = (frame_height as f32 / scaling) as usize;
 
-                let mut image = crate::volume::Image::new_from_color(width, height, Color32::TRANSPARENT);
+                let mut image = vesuvius_rs::volume::Image::new_from_color(width, height, Color32::TRANSPARENT);
                 surface_vol.paint_plane_intersection(
                     *coord,
                     u_coord,
@@ -384,7 +392,7 @@ impl VolumePane {
                     drawing_config,
                     &mut image,
                 );
-                let image: egui::ColorImage = image.into();
+                let image: egui::ColorImage = to_color_image(image);
                 let texture = ui.ctx().load_texture(self.pane_type.label(), image, Default::default());
                 // Adjust rect to be relative to response.rect
                 let adjusted_rect = egui::Rect::from_min_size(response.rect.min, response.rect.size());
@@ -781,7 +789,7 @@ impl VolumePane {
         // Always use fixed tile size - let paint_zoom handle the scaling
         let tile_width = TILE_SIZE;
         let tile_height = TILE_SIZE;
-        let mut image = crate::volume::Image::new(tile_width, tile_height);
+        let mut image = vesuvius_rs::volume::Image::new(tile_width, tile_height);
 
         // Calculate world coordinates for this tile
         // When paint_zoom > 1, each tile covers a larger world area
@@ -817,7 +825,6 @@ impl VolumePane {
             );
         }
 
-        let image: egui::ColorImage = image.into();
-        image
+        to_color_image(image)
     }
 }

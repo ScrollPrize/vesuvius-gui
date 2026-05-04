@@ -1,10 +1,13 @@
-[package]
-name = "vesuvius-gui"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.70"
+[workspace]
+members = [
+    "vesuvius-rs",
+    "vesuvius-atlas-rs",
+    "vesuvius-gui",
+    "vesuvius-render",
+]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
 anyhow          = { version = "1" }
 async-recursion = { version = "1" }
 base64          = { version = "0.22" }
@@ -12,45 +15,41 @@ clap            = { version = "4", features = [ "derive" ] }
 dashmap         = { version = "6" }
 derive_more     = { version = "2", features = [ "debug" ] }
 directories     = { version = "6" }
+ecolor          = { version = "0.32" }
 eframe          = { version = "0.32", default-features = false, features = [
-    #"accesskit",     # Make egui comptaible with screen readers. NOTE: adds a lot of dependencies.
-    #"default_fonts", # Embed the default egui fonts.
     "x11", "wayland",
-    "glow",          # Use the glow rendering backend. Alternative: "wgpu".
-    "persistence",   # Enable restoring app state when restarting the app.
+    "glow",
+    "persistence",
 ] }
 egui            = { version = "0.32" }
 egui_extras     = { version = "0.32", features = [ "all_loaders" ] }
 ehttp           = { version = "0.5", features = ["native-async"] }
-emath           = { version = "0.32"}
+emath           = { version = "0.32" }
+env_logger      = { version = "0.11", default-features = false, features = [] }
 futures         = { version = "0.3" }
 fxhash          = { version = "0.2" }
-image           = { version = "0.25", default-features=false, features = ["png", "tiff", "jpeg"] }
-indicatif       = { version = "0.18", features = ["rayon"]}
+image           = { version = "0.25", default-features = false, features = ["png", "tiff", "jpeg"] }
+indicatif       = { version = "0.18", features = ["rayon"] }
 itertools       = { version = "0.14" }
 libm            = { version = "0.2" }
 log             = { version = "0.4" }
 lz4-compression = { version = "0.7" }
+memmap          = { version = "0.7" }
 nalgebra        = { version = "0.33" }
 num_cpus        = { version = "1" }
 quanta          = { version = "0.12" }
 rand            = { version = "0.8" }
 rayon           = { version = "1" }
-regex           = { version = "1", default-features=false, features = ["unicode-perl"] }
-reqwest         = { version = "0.12", default-features=false, features = ["blocking", "http2", "rustls-tls"] }
+regex           = { version = "1", default-features = false, features = ["unicode-perl"] }
+reqwest         = { version = "0.12", default-features = false, features = ["blocking", "http2", "rustls-tls"] }
 ruzstd          = { version = "0.8" }
 serde           = { version = "1", features = ["derive"] }
 serde_json      = { version = "1" }
 sha2            = { version = "0.10" }
 tempfile        = { version = "3" }
 tiff            = { version = "0.10" }
-tokio           = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync" ]}
+tokio           = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync" ] }
 wavefront_obj   = { version = "11.0" }
-
-# native:
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-env_logger = { version = "0.11", default-features = false, features = [] }
-memmap     = { version = "0.7" }
 
 [profile.release-with-debug]
 inherits = "release"

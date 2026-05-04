@@ -1,0 +1,20 @@
+[package]
+name = "vesuvius-render"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[dependencies]
+vesuvius-rs = { path = "../vesuvius-rs" }
+
+anyhow          = { workspace = true }
+async-recursion = { workspace = true }
+clap            = { workspace = true }
+directories     = { workspace = true }
+ehttp           = { workspace = true }
+futures         = { workspace = true }
+image           = { workspace = true }
+indicatif       = { workspace = true }
+num_cpus        = { workspace = true }
+regex           = { workspace = true }
+tokio           = { workspace = true }

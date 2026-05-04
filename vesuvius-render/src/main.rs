@@ -10,10 +10,10 @@ use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use vesuvius_gui::downloader::{DownloadState as DS, Downloader};
-use vesuvius_gui::model::Quality;
-use vesuvius_gui::model::{FullVolumeReference, VolumeReference};
-use vesuvius_gui::volume::{
+use vesuvius_rs::downloader::{DownloadState as DS, Downloader};
+use vesuvius_rs::model::Quality;
+use vesuvius_rs::model::{FullVolumeReference, VolumeReference};
+use vesuvius_rs::volume::{
     self, AffineTransform, DrawingConfig, Image, ObjFile, ObjVolume, PaintVolume, ProjectionKind, Volume, VolumeCons,
     VoxelPaintVolume, VoxelVolume,
 };

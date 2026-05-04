@@ -1,10 +1,12 @@
-use vesuvius_gui::atlas::load_atlas_from_directory;
-use vesuvius_gui::catalog::load_catalog;
-use vesuvius_gui::gui::{ObjFileConfig, TemplateApp, VesuviusConfig};
+mod gui;
+
+use crate::gui::{ObjFileConfig, TemplateApp, VesuviusConfig};
+use vesuvius_atlas_rs::load_atlas_from_directory;
+use vesuvius_rs::catalog::load_catalog;
 
 use clap::Parser;
-use vesuvius_gui::model::{NewVolumeReference, VolumeReference};
-use vesuvius_gui::volume::{AffineTransform, ProjectionKind};
+use vesuvius_rs::model::{NewVolumeReference, VolumeReference};
+use vesuvius_rs::volume::{AffineTransform, ProjectionKind};
 
 /// Vesuvius GUI, an app to visualize and explore 3D data of the Vesuvius Challenge (https://scrollprize.org)
 #[derive(Parser, Debug)]

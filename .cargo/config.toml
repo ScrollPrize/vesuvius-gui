@@ -6,3 +6,12 @@ rustflags = ["--cfg", "tokio_unstable"]
 
 [profile.release-with-debug.package.vesuvius-gui]
 debug = 1
+
+[profile.release-with-debug.package.vesuvius-render]
+debug = 1
+
+[profile.release-with-debug.package.vesuvius-rs]
+debug = 1
+
+[profile.release-with-debug.package.vesuvius-atlas-rs]
+debug = 1

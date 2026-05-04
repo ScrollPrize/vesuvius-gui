@@ -1,6 +1,6 @@
 use super::{ZarrContext, ZarrContextBase};
 use crate::{volume::PaintVolume, zarr::ZarrArray};
-use egui::Color32;
+use ecolor::Color32;
 use memmap::MmapOptions;
 use std::{
     collections::{HashMap, HashSet},

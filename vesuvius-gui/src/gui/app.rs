@@ -1,11 +1,11 @@
-use crate::atlas::{AtlasMetadata, AtlasSample};
-use crate::catalog::obj_repository::ObjRepository;
-use crate::catalog::Catalog;
-use crate::catalog::Segment;
 use crate::gui::{PaneType, VolumePane};
-use crate::model::*;
-use crate::volume::*;
-use crate::zarr::ZarrArray;
+use vesuvius_atlas_rs::{AtlasMetadata, AtlasSample};
+use vesuvius_rs::catalog::obj_repository::ObjRepository;
+use vesuvius_rs::catalog::Catalog;
+use vesuvius_rs::catalog::Segment;
+use vesuvius_rs::model::*;
+use vesuvius_rs::volume::*;
+use vesuvius_rs::zarr::ZarrArray;
 use directories::BaseDirs;
 use egui::CollapsingHeader;
 use egui::Color32;

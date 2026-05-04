@@ -7,7 +7,7 @@ mod ppmvolume;
 mod transform;
 mod volume64x4;
 
-use egui::{Color32, ColorImage};
+use ecolor::Color32;
 pub use empty::EmptyVolume;
 pub use generic::AutoPaintVolume;
 pub use grid500::VolumeGrid500Mapped;
@@ -160,8 +160,8 @@ pub trait VoxelVolume {
 }
 
 pub struct Image {
-    width: usize,
-    height: usize,
+    pub width: usize,
+    pub height: usize,
     pub data: Vec<Color32>,
 }
 impl Image {
@@ -184,15 +184,6 @@ impl Image {
     }
     pub fn set_gray(&mut self, x: usize, y: usize, value: u8) {
         self.set(x, y, Color32::from_gray(value));
-    }
-}
-impl From<Image> for ColorImage {
-    fn from(value: Image) -> Self {
-        ColorImage {
-            size: [value.width, value.height],
-            pixels: value.data,
-            ..Default::default()
-        }
     }
 }
 
