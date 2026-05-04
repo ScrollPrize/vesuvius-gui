@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use super::{default_cache_dir_for_url, ZarrArray, ZarrContext};
+use super::{default_cache_dir_for_url, parse_json, ZarrArray, ZarrContext};
 use ehttp::Request;
 use serde::Deserialize;
 
@@ -88,8 +88,7 @@ impl OmeZarrContext {
         let attrs = {
             let target_file = format!("{}/.zattrs", path);
             let zarray = std::fs::read_to_string(&target_file).unwrap();
-            println!("zarray: {}", zarray);
-            serde_json::from_str::<OmeZarrAttrs>(&zarray).unwrap()
+            parse_json::<OmeZarrAttrs>(&zarray, &target_file)
         };
 
         let ome_zarr = OmeZarr { attrs };
@@ -121,8 +120,7 @@ impl OmeZarrContext {
         }
 
         let zarray = std::fs::read_to_string(&target_file).unwrap();
-        println!("zarray: {}", zarray);
-        serde_json::from_str::<OmeZarrAttrs>(&zarray).unwrap()
+        parse_json::<OmeZarrAttrs>(&zarray, &target_file)
     }
 
     pub fn get(&self, xyz: [usize; 3], scale: u8) -> u8 {

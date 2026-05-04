@@ -32,9 +32,27 @@ enum ZarrDataType {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(try_from = "u8", into = "u8")]
 enum ZarrVersion {
-    #[serde(rename = "2")]
-    V2 = 2,
+    V2,
+}
+
+impl TryFrom<u8> for ZarrVersion {
+    type Error = String;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            2 => Ok(ZarrVersion::V2),
+            other => Err(format!("unsupported zarr_format `{}`, expected 2", other)),
+        }
+    }
+}
+
+impl From<ZarrVersion> for u8 {
+    fn from(v: ZarrVersion) -> u8 {
+        match v {
+            ZarrVersion::V2 => 2,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -65,7 +83,7 @@ struct ZarrCompressor {
     clevel: u8,
     #[serde(rename = "cname")]
     compression_name: ZarrCompressionName,
-    id: String,
+    id: ZarrCompressorId,
     shuffle: u8,
 }
 
@@ -75,12 +93,12 @@ struct ZarrFilters {}
 struct ZarrArrayDef {
     chunks: Vec<usize>,
     compressor: Option<ZarrCompressor>,
-    dtype: String,
+    dtype: ZarrDataType,
     fill_value: u8,
     filters: Option<ZarrFilters>,
     order: ZarrOrder,
     shape: Vec<usize>,
-    zarr_format: u8,
+    zarr_format: ZarrVersion,
     dimension_separator: Option<String>,
 }
 
@@ -103,8 +121,9 @@ struct ZarrDirectory {
 }
 impl ZarrFileAccess for ZarrDirectory {
     fn load_array_def(&self) -> ZarrArrayDef {
-        let zarray = std::fs::read_to_string(format!("{}/.zarray", self.path)).unwrap();
-        serde_json::from_str::<ZarrArrayDef>(&zarray).unwrap()
+        let path = format!("{}/.zarray", self.path);
+        let zarray = std::fs::read_to_string(&path).unwrap();
+        parse_json(&zarray, &path)
     }
 
     fn chunk_file_for(&self, array_def: &ZarrArrayDef, chunk_no: &[usize]) -> Option<Arc<File>> {
@@ -198,7 +217,7 @@ impl ZarrFileAccess for RemoteZarrDirectory {
         }
 
         let zarray = std::fs::read_to_string(&target_file).unwrap();
-        serde_json::from_str::<ZarrArrayDef>(&zarray).unwrap()
+        parse_json(&zarray, &target_file)
     }
 
     fn chunk_file_for(&self, array_def: &ZarrArrayDef, chunk_no: &[usize]) -> Option<Arc<File>> {
@@ -264,8 +283,7 @@ impl ZarrFileAccess for BlockingRemoteZarrDirectory {
         }
 
         let zarray = std::fs::read_to_string(&target_file).unwrap();
-        serde_json::from_str::<ZarrArrayDef>(&zarray)
-            .expect(format!("Failed to parse .zarray from {}", target_file).as_str())
+        parse_json(&zarray, &target_file)
     }
 
     fn chunk_file_for(&self, array_def: &ZarrArrayDef, chunk_no: &[usize]) -> Option<Arc<File>> {
@@ -341,6 +359,21 @@ impl ZarrFileAccess for BlockingRemoteZarrDirectory {
     }
 }
 
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(json: &str, source: &str) -> T {
+    let de = &mut serde_json::Deserializer::from_str(json);
+    serde_path_to_error::deserialize(de).unwrap_or_else(|err| {
+        let path = err.path().to_string();
+        panic!(
+            "Failed to parse {} (source: {}) at .{}: {}\n--- content ---\n{}\n--- end content ---",
+            std::any::type_name::<T>(),
+            source,
+            path,
+            err.into_inner(),
+            json,
+        )
+    })
+}
+
 pub fn default_cache_dir_for_url(url: &str) -> String {
     let canonical_url = if url.ends_with("/") { &url[..url.len() - 1] } else { url };
     let sha256 = format!("{:x}", Sha256::digest(canonical_url.as_bytes()));
@@ -360,9 +393,8 @@ impl<const N: usize> ZarrArray<N, u8> {
         self.access
             .chunk_file_for(&self.def, &chunk_no)
             .map(|chunk_file| match &self.def.compressor {
-                Some(compressor) => match compressor.id.as_str() {
-                    "blosc" => ChunkContext::Heap(BloscChunk::load_data_from_file(&chunk_file)),
-                    _ => panic!("Unsupported compressor: {}", compressor.id),
+                Some(compressor) => match compressor.id {
+                    ZarrCompressorId::Blosc => ChunkContext::Heap(BloscChunk::load_data_from_file(&chunk_file)),
                 },
                 _ => ChunkContext::Raw(RawContext::load_from_file(&chunk_file)),
             })
@@ -436,10 +468,6 @@ impl RawContext {
     fn load_from_file(chunk_file: &File) -> RawContext {
         let data = unsafe { memmap::Mmap::map(chunk_file).unwrap() };
         RawContext { data }
-    }
-    fn load(chunk_file: &str) -> RawContext {
-        let file = std::fs::File::open(chunk_file).unwrap();
-        Self::load_from_file(&file)
     }
     fn get(&self, idx: usize) -> u8 {
         self.data[idx]
