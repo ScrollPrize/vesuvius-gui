@@ -6,7 +6,9 @@ pub mod catalog;
 pub mod downloader;
 pub mod model;
 pub mod volume;
-pub mod zarr;
+
+#[cfg(test)]
+mod zarr_test;
 
 pub fn zstd_decompress(input: &[u8]) -> Vec<u8> {
     let mut uncompressed = Vec::new();

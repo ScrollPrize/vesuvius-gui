@@ -1,7 +1,16 @@
-use crate::zstd_decompress;
 use derive_more::Debug;
 use memmap::MmapOptions;
 use std::fs::File;
+use std::io::{Cursor, Read};
+
+fn zstd_decompress(input: &[u8]) -> Vec<u8> {
+    let mut uncompressed = Vec::new();
+    ruzstd::decoding::StreamingDecoder::new(Cursor::new(input))
+        .unwrap()
+        .read_to_end(&mut uncompressed)
+        .unwrap();
+    uncompressed
+}
 
 #[derive(Debug, Clone)]
 pub enum BloscShuffle {

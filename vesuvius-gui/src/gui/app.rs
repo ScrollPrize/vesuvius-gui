@@ -5,7 +5,7 @@ use vesuvius_rs::catalog::Catalog;
 use vesuvius_rs::catalog::Segment;
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
-use vesuvius_rs::zarr::ZarrArray;
+use vesuvius_zarr::ZarrArray;
 use directories::BaseDirs;
 use egui::CollapsingHeader;
 use egui::Color32;

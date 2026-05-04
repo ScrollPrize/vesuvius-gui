@@ -2,6 +2,7 @@
 members = [
     "vesuvius-rs",
     "vesuvius-atlas-rs",
+    "vesuvius-zarr",
     "vesuvius-gui",
     "vesuvius-render",
 ]

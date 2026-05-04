@@ -1,9 +1,6 @@
-mod blosc;
-mod ome;
-#[cfg(test)]
-mod test;
+pub mod blosc;
+pub mod ome;
 
-use crate::volume::{PaintVolume, VoxelPaintVolume, VoxelVolume};
 use blosc::BloscChunk;
 use dashmap::DashMap;
 use derive_more::with_trait::Debug;
@@ -12,7 +9,6 @@ use ehttp::Request;
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use libm::modf;
 pub use ome::OmeZarrContext;
-pub use ome::{ColorScheme, FourColors, GrayScale};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -554,8 +550,32 @@ pub struct ZarrContext<const N: usize> {
     state: RefCell<ZarrContextState<N>>,
 }
 
+impl<const N: usize, T> ZarrArray<N, T> {
+    pub fn shape(&self) -> &[usize] {
+        &self.def.shape
+    }
+}
+
+impl<const N: usize> ZarrContextBase<N> {
+    pub fn shape(&self) -> &[usize] {
+        self.array.shape()
+    }
+}
+
+impl<const N: usize> ZarrContext<N> {
+    pub fn shape(&self) -> &[usize] {
+        self.array.shape()
+    }
+}
+
 impl ZarrContext<3> {
-    fn get(&self, index: [usize; 3]) -> Option<u8> {
+    pub fn cache_missing(&self) -> bool {
+        self.cache_missing
+    }
+    pub fn purge_missing_cache(&self) {
+        self.cache.purge_missing();
+    }
+    pub fn get(&self, index: [usize; 3]) -> Option<u8> {
         if index[0] > self.array.def.shape[0]
             || index[1] > self.array.def.shape[1]
             || index[2] > self.array.def.shape[2]
@@ -590,7 +610,7 @@ impl ZarrContext<3> {
             self.get_from_cache(chunk_no, idx)
         }
     }
-    fn get_interpolated(&self, xyz: [f64; 3]) -> Option<u8> {
+    pub fn get_interpolated(&self, xyz: [f64; 3]) -> Option<u8> {
         let (dx, x0) = modf(xyz[0]);
         let x0 = x0 as usize;
         let x1 = x0 + 1;
@@ -694,7 +714,7 @@ impl ZarrContext<3> {
         state.last_context = Some(chunk.clone());
         chunk.map(|c| c.get(idx))
     }
-    fn shareable(&self) -> Box<dyn (FnOnce() -> ZarrContext<3>) + Send + Sync> {
+    pub fn shareable(&self) -> Box<dyn (FnOnce() -> ZarrContext<3>) + Send + Sync> {
         let array = self.array.clone();
         let cache = self.cache.clone();
         let cache_missing = self.cache_missing;
@@ -726,98 +746,3 @@ impl Clone for ZarrContext<3> {
     }
 }
 
-impl PaintVolume for ZarrContext<3> {
-    fn paint(
-        &self,
-        xyz: [i32; 3],
-        u_coord: usize,
-        v_coord: usize,
-        plane_coord: usize,
-        width: usize,
-        height: usize,
-        _sfactor: u8,
-        paint_zoom: u8,
-        _config: &crate::volume::DrawingConfig,
-        buffer: &mut crate::volume::Image,
-    ) {
-        //assert!(_sfactor == 1);
-        let _sfactor = 1;
-        if !self.cache_missing {
-            // clean missing entries from cache
-            self.cache.purge_missing();
-        }
-
-        let fi32 = _sfactor as f64;
-
-        for im_u in 0..width {
-            for im_v in 0..height {
-                let im_rel_u = (im_u as i32 - width as i32 / 2) * paint_zoom as i32;
-                let im_rel_v = (im_v as i32 - height as i32 / 2) * paint_zoom as i32;
-
-                let mut uvw: [f64; 3] = [0.; 3];
-                uvw[u_coord] = (xyz[u_coord] + im_rel_u) as f64 / fi32;
-                uvw[v_coord] = (xyz[v_coord] + im_rel_v) as f64 / fi32;
-                uvw[plane_coord] = (xyz[plane_coord]) as f64 / fi32;
-
-                let [x, y, z] = uvw;
-
-                if x < 0.0 || y < 0.0 || z < 0.0 {
-                    continue;
-                }
-
-                let v = self.get([z as usize, y as usize, x as usize]).unwrap_or(0);
-                if v != 0 {
-                    //println!("painting at {} {} {} {}", x, y, z, v);
-                    /* let color = match v {
-                        1 => Color32::RED,
-                        2 => Color32::GREEN,
-                        3 => Color32::YELLOW,
-                        _ => Color32::BLUE,
-                    };
-                    buffer.set(im_u, im_v, color); */
-                    buffer.set_gray(im_u, im_v, v);
-                }
-            }
-        }
-    }
-
-    fn shared(&self) -> crate::volume::VolumeCons {
-        let array = self.array.clone();
-        let cache = self.cache.clone();
-        let cache_missing = self.cache_missing;
-        Box::new(move || {
-            ZarrContext {
-                array,
-                cache_missing,
-                cache,
-                state: ZarrContextState {
-                    last_chunk_no: [usize::MAX; 3],
-                    last_context: None,
-                }
-                .into(),
-            }
-            .into_volume()
-        })
-    }
-}
-impl VoxelVolume for ZarrContext<3> {
-    fn get(&self, xyz: [f64; 3], downsampling: i32) -> u8 {
-        self.get([
-            (xyz[2] * downsampling as f64) as usize,
-            (xyz[1] * downsampling as f64) as usize,
-            (xyz[0] * downsampling as f64) as usize,
-        ])
-        .unwrap_or(0)
-    }
-    fn get_interpolated(&self, xyz: [f64; 3], downsampling: i32) -> u8 {
-        self.get_interpolated([
-            (xyz[2] * downsampling as f64) as f64,
-            (xyz[1] * downsampling as f64) as f64,
-            (xyz[0] * downsampling as f64) as f64,
-        ])
-        .unwrap_or(0)
-    }
-    fn reset_for_painting(&self) {
-        self.cache.purge_missing();
-    }
-}

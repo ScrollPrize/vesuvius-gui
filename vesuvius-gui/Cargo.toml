@@ -7,6 +7,7 @@ rust-version = "1.70"
 [dependencies]
 vesuvius-rs       = { path = "../vesuvius-rs" }
 vesuvius-atlas-rs = { path = "../vesuvius-atlas-rs" }
+vesuvius-zarr     = { path = "../vesuvius-zarr" }
 
 clap        = { workspace = true }
 directories = { workspace = true }

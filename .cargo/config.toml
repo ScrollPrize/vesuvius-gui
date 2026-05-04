@@ -15,3 +15,6 @@ debug = 1
 
 [profile.release-with-debug.package.vesuvius-atlas-rs]
 debug = 1
+
+[profile.release-with-debug.package.vesuvius-zarr]
+debug = 1

@@ -3918,6 +3918,7 @@ dependencies = [
  "tokio",
  "vesuvius-atlas-rs",
  "vesuvius-rs",
+ "vesuvius-zarr",
 ]
 
 [[package]]
@@ -3964,7 +3965,27 @@ dependencies = [
  "serde_json",
  "sha2",
  "tiff",
+ "vesuvius-zarr",
  "wavefront_obj",
+]
+
+[[package]]
+name = "vesuvius-zarr"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "derive_more",
+ "directories",
+ "ehttp",
+ "fxhash",
+ "libm",
+ "lz4-compression",
+ "memmap",
+ "reqwest",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

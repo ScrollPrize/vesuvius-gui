@@ -1,7 +1,7 @@
-use super::{ZarrContext, ZarrContextBase};
-use crate::{volume::PaintVolume, zarr::ZarrArray};
+use crate::volume::PaintVolume;
 use ecolor::Color32;
 use memmap::MmapOptions;
+use vesuvius_zarr::{ZarrArray, ZarrContext, ZarrContextBase};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -31,7 +31,7 @@ fn write_points(array: &mut ZarrContext<3>) -> SparsePointCloud {
         writer.write((z as u16).to_le_bytes().as_ref()).unwrap();
     }
 
-    let shape = array.array.def.shape.clone();
+    let shape = array.shape().to_vec();
     let mut count: u64 = 0;
     for z in 0..shape[0] {
         if z % 1 == 0 {
@@ -255,7 +255,7 @@ impl PaintVolume for ConnectedFullMapVolume {
 
 #[allow(dead_code)]
 fn connected_components(array: &ZarrContextBase<3> /* , full: &FullMapVolume */) {
-    let shape = array.array.def.shape.clone();
+    let shape = array.shape().to_vec();
 
     let file = OpenOptions::new()
         .read(true)
@@ -458,7 +458,7 @@ fn connected_components(array: &ZarrContextBase<3> /* , full: &FullMapVolume */)
 
 #[allow(dead_code)]
 fn write_points2(array: &mut ZarrContext<3>) -> SparsePointCloud {
-    let shape = array.array.def.shape.clone();
+    let shape = array.shape().to_vec();
 
     let file = OpenOptions::new()
         .read(true)

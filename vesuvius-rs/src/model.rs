@@ -1,9 +1,12 @@
 use crate::{
     downloader::SimpleDownloader,
-    volume::{LayersMappedVolume, Volume, VolumeGrid500Mapped, VolumeGrid64x4Mapped, VoxelPaintVolume},
-    zarr::{default_cache_dir_for_url, GrayScale, OmeZarrContext, ZarrArray},
+    volume::{
+        GrayScale, LayersMappedVolume, OmeZarrPaintVolume, Volume, VolumeGrid500Mapped, VolumeGrid64x4Mapped,
+        VoxelPaintVolume,
+    },
 };
 use std::{path::Path, sync::Arc};
+use vesuvius_zarr::{default_cache_dir_for_url, OmeZarrContext, ZarrArray};
 
 #[derive(Copy, Clone, Debug)]
 pub struct Quality {
@@ -302,9 +305,12 @@ impl NewVolumeReference {
             }
             NewVolumeReference::OmeZarr { location, .. } => match location {
                 VolumeLocation::RemoteUrl(url) => {
-                    OmeZarrContext::<GrayScale>::from_url_to_default_cache_dir(url).into_volume()
+                    OmeZarrPaintVolume::<GrayScale>::new(OmeZarrContext::from_url_to_default_cache_dir(url))
+                        .into_volume()
                 }
-                VolumeLocation::LocalPath(path) => OmeZarrContext::<GrayScale>::from_path(path).into_volume(),
+                VolumeLocation::LocalPath(path) => {
+                    OmeZarrPaintVolume::<GrayScale>::new(OmeZarrContext::from_path(path)).into_volume()
+                }
             },
             NewVolumeReference::Zarr { location, .. } => match location {
                 VolumeLocation::RemoteUrl(url) => ZarrArray::from_url_to_default_cache_dir(url)

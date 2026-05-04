@@ -6,6 +6,7 @@ mod objvolume;
 mod ppmvolume;
 mod transform;
 mod volume64x4;
+mod zarr_paint;
 
 use ecolor::Color32;
 pub use empty::EmptyVolume;
@@ -18,6 +19,7 @@ pub use ppmvolume::PPMVolume;
 use std::sync::Arc;
 pub use transform::AffineTransform;
 pub use volume64x4::VolumeGrid64x4Mapped;
+pub use zarr_paint::{ColorScheme, FourColors, GrayScale, OmeZarrPaintVolume};
 
 #[derive(Copy, Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum CompositingMode {
