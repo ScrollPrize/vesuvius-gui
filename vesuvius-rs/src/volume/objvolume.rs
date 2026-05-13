@@ -327,7 +327,7 @@ impl ObjFile {
         log::info!("ObjFile::new projection_or_uv_rescale took {:?}", t_proj.elapsed());
 
         let t_inv = Instant::now();
-        let has_inverted_uv_tris = Self::has_inverted_uv_tris(object.clone());
+        let has_inverted_uv_tris = Self::has_inverted_uv_tris(&object);
         log::info!("ObjFile::new inversion_check took {:?}", t_inv.elapsed());
 
         let target_cell_num = 100.;
@@ -351,7 +351,7 @@ impl ObjFile {
             projection_dimensions,
         }
     }
-    fn has_inverted_uv_tris(obj: Object) -> bool {
+    fn has_inverted_uv_tris(obj: &Object) -> bool {
         for s in obj.geometry[0].shapes.iter().skip(1) {
             match s.primitive {
                 Primitive::Triangle(i1, i2, i3) => {
