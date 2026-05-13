@@ -63,7 +63,7 @@ impl ObjRepository {
         let s = segment.clone();
         let obj_file = Self::file_for(segment);
         // use existing or download
-        println!(
+        log::info!(
             "Downloading obj file from {} to {}",
             segment.urls.obj_url,
             &obj_file.to_str().unwrap()
@@ -74,7 +74,7 @@ impl ObjRepository {
                 std::fs::create_dir_all(&obj_file.parent().unwrap()).unwrap();
                 let mut file = std::fs::File::create(&obj_file).unwrap();
                 let bytes = response.bytes;
-                println!("Downloaded {} bytes", bytes.len());
+                log::info!("Downloaded {} bytes", bytes.len());
                 std::io::copy(&mut Cursor::new(bytes), &mut file).unwrap();
                 let _ = sender.send((&s).into()); // ignore result
                 on_done(s);

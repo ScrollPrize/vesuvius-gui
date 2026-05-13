@@ -336,7 +336,7 @@ impl TemplateApp {
             if segment_file.contains(".zarr") {
                 app.overlay = Some({
                     if segment_file.starts_with("http") {
-                        println!("Loading zarr from url: {}", segment_file);
+                        log::info!("Loading zarr from url: {}", segment_file);
                         Box::new(
                             ZarrArray::from_url_to_default_cache_dir(&segment_file)
                                 .into_ctx()
@@ -1318,7 +1318,7 @@ impl TemplateApp {
                     if obj_cache_path.exists() {
                         self.load_atlas_segment(&sample_id, &segment_id);
                     } else if let Some(obj_url) = segment.get_obj_url() {
-                        println!("Downloading atlas obj from {}", obj_url);
+                        log::info!("Downloading atlas obj from {}", obj_url);
                         self.downloading_atlas_segment = Some((sample_id.clone(), segment_id.clone()));
                         let sender = self.notification_sender.clone();
                         let volume_id = segment.original_volume_id.clone();
@@ -1328,7 +1328,7 @@ impl TemplateApp {
                                 std::fs::create_dir_all(&obj_file.parent().unwrap()).unwrap();
                                 let mut file = std::fs::File::create(&obj_file).unwrap();
                                 let bytes = response.bytes;
-                                println!("Downloaded {} bytes to {}", bytes.len(), obj_file.display());
+                                log::info!("Downloaded {} bytes to {}", bytes.len(), obj_file.display());
                                 std::io::copy(&mut std::io::Cursor::new(bytes), &mut file).unwrap();
                                 let _ = sender.send(UINotification::AtlasObjDownloadReady(sample_id, segment_id, volume_id));
                             }

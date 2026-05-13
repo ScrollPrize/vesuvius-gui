@@ -171,10 +171,10 @@ impl SimpleDownloader {
 
                 ongoing.insert(from.clone());
                 downloading.fetch_add(1, Ordering::Acquire);
-                println!("Starting download from {} to {}", from, to);
+                log::debug!("Starting download from {} to {}", from, to);
                 let inner_counter = downloading.clone();
                 ehttp::fetch(Request::get(&from), move |result| {
-                    println!("Downloaded from {} to {}", from, to);
+                    log::debug!("Downloaded from {} to {}", from, to);
                     let response = result.unwrap();
                     inner_counter.fetch_sub(1, Ordering::Acquire);
                     if response.status == 200 {
@@ -183,8 +183,11 @@ impl SimpleDownloader {
                         let tmp_file = format!("{}.tmp", to);
                         std::fs::write(&tmp_file, &data).unwrap();
                         std::fs::rename(tmp_file, to).unwrap();
+                    } else if response.status == 404 {
+                        // expected for sparse zarrs — missing chunks are normal
+                        log::debug!("Missing chunk (404) at {}", from);
                     } else {
-                        println!("Failed to download from {}, status {}", from, response.status);
+                        log::warn!("Failed to download from {}, status {}", from, response.status);
                     }
                 });
             }

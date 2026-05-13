@@ -86,7 +86,7 @@ impl SimpleDownloader {
                             {
                                 *state.lock().unwrap() = DownloadState::Downloading;
                                 if log_downloads {
-                                    println!("Downloading {} {} {} {}", x, y, z, quality.downsampling_factor);
+                                    log::debug!("Downloading {} {} {} {}", x, y, z, quality.downsampling_factor);
                                 }
                                 //let url = format!("https://vesuvius.virtual-void.net/tiles/scroll/332/volume/20231027191953/download/128-16?x={}&y={}&z={}", x, y, z);
                                 //let url = format!("http://localhost:8095/tiles/scroll/332/volume/20231027191953/download/128-16?x={}&y={}&z={}", x, y, z);
@@ -120,7 +120,7 @@ impl SimpleDownloader {
                                     if let Ok(res) = response {
                                         if res.status == 200 {
                                             if log_downloads {
-                                                println!(
+                                                log::debug!(
                                                     "got tile {}/{}/{} q{} after {} ms (downloading: {})",
                                                     x,
                                                     y,
@@ -152,17 +152,17 @@ impl SimpleDownloader {
                                             *state.lock().unwrap() = DownloadState::Done;
                                             let _ = notifier.send((x, y, z, quality));
                                         } else if res.status == 420 {
-                                            println!("delayed tile {}/{}/{} q{}", x, y, z, quality.downsampling_factor);
+                                            log::warn!("delayed tile {}/{}/{} q{}", x, y, z, quality.downsampling_factor);
                                             *state.lock().unwrap() = DownloadState::Delayed;
                                         } else {
-                                            println!(
+                                            log::warn!(
                                                 "failed to download tile {}/{}/{} q{}: {}",
                                                 x, y, z, quality.downsampling_factor, res.status
                                             );
                                             *state.lock().unwrap() = DownloadState::Failed;
                                         }
                                     } else {
-                                        println!(
+                                        log::warn!(
                                             "failed to download tile {}/{}/{} q{}: {}",
                                             x,
                                             y,
@@ -206,12 +206,12 @@ impl SimpleDownloader {
                 } else if res.status == 401 {
                     return false;
                 } else {
-                    println!("failed to check authorization: {}", res.status);
+                    log::warn!("failed to check authorization: {}", res.status);
                     false
                 }
             }
             Err(e) => {
-                println!("Request failed: {}", e);
+                log::warn!("Request failed: {}", e);
                 false
             }
         }
