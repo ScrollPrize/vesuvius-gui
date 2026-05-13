@@ -3,7 +3,17 @@ use crate::volume::{AffineTransform, CompositingMode, VoxelPaintVolume};
 use libm::{pow, sqrt};
 use std::sync::Arc;
 use std::time::Instant;
-use wavefront_obj::obj::{self, Object, Primitive, Vertex};
+use wavefront_obj::obj::{self, Object, Primitive, TVertex, Vertex};
+
+/// Compact per-triangle indices: vertex/tex/normal for each of the 3 corners.
+/// Replaces wavefront_obj's `Shape` (~176 B with allocator-pressure inner Vecs)
+/// with 36 B of plain POD that clones as a single memcpy.
+#[derive(Copy, Clone, Debug)]
+pub struct Triangle {
+    pub v: [u32; 3],
+    pub t: [u32; 3],
+    pub n: [u32; 3],
+}
 
 // TODO: create a single AABB index for both XYZ and UV index
 struct XYZIndex {
@@ -13,7 +23,7 @@ struct XYZIndex {
     grid: Vec<Vec<usize>>, // n * n * n cell with indices to the faces
 }
 impl XYZIndex {
-    fn new(object: &Object, n: usize) -> Self {
+    fn new(vertices: &[Vertex], triangles: &[Triangle], n: usize) -> Self {
         let mut grid = vec![vec![]; n * n * n];
 
         fn minmax(vertices: &[Vertex], coord: impl Fn(&Vertex) -> f64) -> (f64, f64) {
@@ -23,53 +33,44 @@ impl XYZIndex {
             )
         }
 
-        let (min_x, max_x) = minmax(&object.vertices, |v| v.x);
-        let (min_y, max_y) = minmax(&object.vertices, |v| v.y);
-        let (min_z, max_z) = minmax(&object.vertices, |v| v.z);
+        let (min_x, max_x) = minmax(vertices, |v| v.x);
+        let (min_y, max_y) = minmax(vertices, |v| v.y);
+        let (min_z, max_z) = minmax(vertices, |v| v.z);
 
         let dx = (max_x - min_x) / n as f64;
         let dy = (max_y - min_y) / n as f64;
         let dz = (max_z - min_z) / n as f64;
 
-        for (i, s) in object.geometry[0].shapes.iter().enumerate() {
-            match s.primitive {
-                Primitive::Triangle(i1, i2, i3) => {
-                    let v1 = &i1.0;
-                    let v2 = &i2.0;
-                    let v3 = &i3.0;
+        for (i, tri) in triangles.iter().enumerate() {
+            let vert1 = vertices[tri.v[0] as usize];
+            let vert2 = vertices[tri.v[1] as usize];
+            let vert3 = vertices[tri.v[2] as usize];
 
-                    let vert1 = object.vertices[*v1];
-                    let vert2 = object.vertices[*v2];
-                    let vert3 = object.vertices[*v3];
+            let min_x_t = vert1.x.min(vert2.x).min(vert3.x);
+            let max_x_t = vert1.x.max(vert2.x).max(vert3.x);
 
-                    let min_x_t = vert1.x.min(vert2.x).min(vert3.x);
-                    let max_x_t = vert1.x.max(vert2.x).max(vert3.x);
+            let min_y_t = vert1.y.min(vert2.y).min(vert3.y);
+            let max_y_t = vert1.y.max(vert2.y).max(vert3.y);
 
-                    let min_y_t = vert1.y.min(vert2.y).min(vert3.y);
-                    let max_y_t = vert1.y.max(vert2.y).max(vert3.y);
+            let min_z_t = vert1.z.min(vert2.z).min(vert3.z);
+            let max_z_t = vert1.z.max(vert2.z).max(vert3.z);
 
-                    let min_z_t = vert1.z.min(vert2.z).min(vert3.z);
-                    let max_z_t = vert1.z.max(vert2.z).max(vert3.z);
+            let min_x_cell = (((min_x_t - min_x) / dx) as usize).max(0).min(n - 1);
+            let max_x_cell = (((max_x_t - min_x) / dx) as usize).max(0).min(n - 1);
 
-                    let min_x_cell = (((min_x_t - min_x) / dx) as usize).max(0).min(n - 1);
-                    let max_x_cell = (((max_x_t - min_x) / dx) as usize).max(0).min(n - 1);
+            let min_y_cell = (((min_y_t - min_y) / dy) as usize).max(0).min(n - 1);
+            let max_y_cell = (((max_y_t - min_y) / dy) as usize).max(0).min(n - 1);
 
-                    let min_y_cell = (((min_y_t - min_y) / dy) as usize).max(0).min(n - 1);
-                    let max_y_cell = (((max_y_t - min_y) / dy) as usize).max(0).min(n - 1);
+            let min_z_cell = (((min_z_t - min_z) / dz) as usize).max(0).min(n - 1);
+            let max_z_cell = (((max_z_t - min_z) / dz) as usize).max(0).min(n - 1);
 
-                    let min_z_cell = (((min_z_t - min_z) / dz) as usize).max(0).min(n - 1);
-                    let max_z_cell = (((max_z_t - min_z) / dz) as usize).max(0).min(n - 1);
-
-                    for x in min_x_cell..=max_x_cell {
-                        for y in min_y_cell..=max_y_cell {
-                            for z in min_z_cell..=max_z_cell {
-                                let idx = x * n * n + y * n + z;
-                                grid[idx].push(i);
-                            }
-                        }
+            for x in min_x_cell..=max_x_cell {
+                for y in min_y_cell..=max_y_cell {
+                    for z in min_z_cell..=max_z_cell {
+                        let idx = x * n * n + y * n + z;
+                        grid[idx].push(i);
                     }
                 }
-                _ => todo!(),
             }
         }
 
@@ -129,57 +130,40 @@ struct UVIndex {
     grid: Vec<Vec<usize>>, // rows * cols cell with indices to the faces
 }
 impl UVIndex {
-    fn new(object: &Object, rows: usize, cols: usize) -> Self {
+    fn new(tex_vertices: &[TVertex], triangles: &[Triangle], rows: usize, cols: usize) -> Self {
         let mut grid = vec![vec![]; rows * cols];
 
-        let min_u = object.tex_vertices.iter().map(|v| v.u).fold(f64::INFINITY, f64::min);
-        let max_u = object
-            .tex_vertices
-            .iter()
-            .map(|v| v.u)
-            .fold(f64::NEG_INFINITY, f64::max);
+        let min_u = tex_vertices.iter().map(|v| v.u).fold(f64::INFINITY, f64::min);
+        let max_u = tex_vertices.iter().map(|v| v.u).fold(f64::NEG_INFINITY, f64::max);
 
-        let min_v = object.tex_vertices.iter().map(|v| v.v).fold(f64::INFINITY, f64::min);
-        let max_v = object
-            .tex_vertices
-            .iter()
-            .map(|v| v.v)
-            .fold(f64::NEG_INFINITY, f64::max);
+        let min_v = tex_vertices.iter().map(|v| v.v).fold(f64::INFINITY, f64::min);
+        let max_v = tex_vertices.iter().map(|v| v.v).fold(f64::NEG_INFINITY, f64::max);
 
         let du = (max_u - min_u) / cols as f64;
         let dv = (max_v - min_v) / rows as f64;
 
-        for (i, s) in object.geometry[0].shapes.iter().enumerate() {
-            match s.primitive {
-                Primitive::Triangle(i1, i2, i3) => {
-                    let v1 = &i1.1.unwrap();
-                    let v2 = &i2.1.unwrap();
-                    let v3 = &i3.1.unwrap();
+        for (i, tri) in triangles.iter().enumerate() {
+            let vert1 = tex_vertices[tri.t[0] as usize];
+            let vert2 = tex_vertices[tri.t[1] as usize];
+            let vert3 = tex_vertices[tri.t[2] as usize];
 
-                    let vert1 = object.tex_vertices[*v1];
-                    let vert2 = object.tex_vertices[*v2];
-                    let vert3 = object.tex_vertices[*v3];
+            let min_u_t = vert1.u.min(vert2.u).min(vert3.u);
+            let max_u_t = vert1.u.max(vert2.u).max(vert3.u);
 
-                    let min_u_t = vert1.u.min(vert2.u).min(vert3.u);
-                    let max_u_t = vert1.u.max(vert2.u).max(vert3.u);
+            let min_v_t = vert1.v.min(vert2.v).min(vert3.v);
+            let max_v_t = vert1.v.max(vert2.v).max(vert3.v);
 
-                    let min_v_t = vert1.v.min(vert2.v).min(vert3.v);
-                    let max_v_t = vert1.v.max(vert2.v).max(vert3.v);
+            let min_col = (((min_u_t - min_u) / du) as usize).max(0).min(cols - 1);
+            let max_col = (((max_u_t - min_u) / du) as usize).max(0).min(cols - 1);
 
-                    let min_col = (((min_u_t - min_u) / du) as usize).max(0).min(cols - 1);
-                    let max_col = (((max_u_t - min_u) / du) as usize).max(0).min(cols - 1);
+            let min_row = (((min_v_t - min_v) / dv) as usize).max(0).min(rows - 1);
+            let max_row = (((max_v_t - min_v) / dv) as usize).max(0).min(rows - 1);
 
-                    let min_row = (((min_v_t - min_v) / dv) as usize).max(0).min(rows - 1);
-                    let max_row = (((max_v_t - min_v) / dv) as usize).max(0).min(rows - 1);
-
-                    for row in min_row..=max_row {
-                        for col in min_col..=max_col {
-                            let idx = row * cols + col;
-                            grid[idx].push(i);
-                        }
-                    }
+            for row in min_row..=max_row {
+                for col in min_col..=max_col {
+                    let idx = row * cols + col;
+                    grid[idx].push(i);
                 }
-                _ => todo!(),
             }
         }
 
@@ -225,33 +209,195 @@ impl UVIndex {
     }
 }
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
 pub enum ProjectionKind {
     None,
     OrthographicXZ,
 }
 
-pub struct ObjFile {
-    object: Object,
+/// Affine-independent state shared by all `ObjFile`s built from the same source mesh.
+/// `pre_vertices`/`pre_normals` are kept so that switching the base volume only needs to
+/// clone them, apply the new affine, and rebuild the per-affine `XYZIndex`. Cacheable
+/// across base volume switches for `ProjectionKind::None`; `OrthographicXZ` constructs
+/// a private base inline since its projection reads post-affine vertex positions.
+struct ObjFileBase {
+    pre_vertices: Vec<Vertex>,
+    pre_normals: Vec<Vertex>,
+    tex_vertices: Vec<TVertex>,
+    triangles: Vec<Triangle>,
     has_inverted_uv_tris: bool,
-    uv_index: UVIndex,
-    xyz_index: XYZIndex,
-    projection_dimensions: Option<(usize, usize)>, // Some((width, height)) for orthographic projections
+    uv_index: Arc<UVIndex>,
+    projection_dimensions: Option<(usize, usize)>,
 }
-impl ObjFile {
-    pub fn new(mut object: Object, transform: &Option<AffineTransform>, projection: ProjectionKind) -> Self {
-        let num_tris = object.geometry.get(0).map(|g| g.shapes.len()).unwrap_or(0);
+
+impl ObjFileBase {
+    /// Build a cacheable base for `ProjectionKind::None`. UV rescale + uv_index +
+    /// inversion check are all UV-only so the result is independent of any later affine.
+    fn new_none(object: Object) -> Self {
+        let t_extract = Instant::now();
+        let (pre_vertices, pre_normals, mut tex_vertices, triangles) = extract_compact(object);
         log::info!(
-            "ObjFile::new tris={} vertices={} normals={} tex_vertices={}",
-            num_tris,
-            object.vertices.len(),
-            object.normals.len(),
-            object.tex_vertices.len()
+            "ObjFileBase::new_none extract took {:?} (tris={}, verts={}, tex={})",
+            t_extract.elapsed(),
+            triangles.len(),
+            pre_vertices.len(),
+            tex_vertices.len()
         );
 
+        let t_proj = Instant::now();
+        let min_u = tex_vertices.iter().map(|v| v.u).fold(f64::INFINITY, f64::min);
+        let max_u = tex_vertices.iter().map(|v| v.u).fold(f64::NEG_INFINITY, f64::max);
+        let du = max_u - min_u;
+        let min_v = tex_vertices.iter().map(|v| v.v).fold(f64::INFINITY, f64::min);
+        let max_v = tex_vertices.iter().map(|v| v.v).fold(f64::NEG_INFINITY, f64::max);
+        let dv = max_v - min_v;
+        tex_vertices.iter_mut().for_each(|tex| {
+            tex.u = (tex.u - min_u) / du;
+            tex.v = (tex.v - min_v) / dv;
+        });
+        log::info!("ObjFileBase::new_none uv_rescale took {:?}", t_proj.elapsed());
+
+        let t_inv = Instant::now();
+        let has_inverted_uv_tris = compute_has_inverted_uv_tris(&tex_vertices, &triangles);
+        log::info!("ObjFileBase::new_none inversion_check took {:?}", t_inv.elapsed());
+
+        let target_cell_num = 100.;
+        let num_tris = triangles.len() as f64;
+
+        let t_uv = Instant::now();
+        let n = sqrt(num_tris / target_cell_num) as usize;
+        let uv_index = Arc::new(UVIndex::new(&tex_vertices, &triangles, n, n));
+        log::info!("ObjFileBase::new_none uv_index took {:?}", t_uv.elapsed());
+
+        Self {
+            pre_vertices,
+            pre_normals,
+            tex_vertices,
+            triangles,
+            has_inverted_uv_tris,
+            uv_index,
+            projection_dimensions: None,
+        }
+    }
+}
+
+pub struct ObjFile {
+    base: Arc<ObjFileBase>,
+    vertices: Vec<Vertex>, // post-affine
+    normals: Vec<Vertex>,  // post-affine
+    xyz_index: XYZIndex,
+}
+impl ObjFile {
+    pub fn new(object: Object, transform: &Option<AffineTransform>, projection: ProjectionKind) -> Self {
+        match projection {
+            ProjectionKind::None => {
+                let base = Arc::new(ObjFileBase::new_none(object));
+                Self::from_base(&base, transform)
+            }
+            ProjectionKind::OrthographicXZ => Self::new_orthographic(object, transform),
+        }
+    }
+
+    /// Build an ObjFile from a (typically cached) affine-independent base. Clones the
+    /// pre-affine vertex/normal arrays, applies the affine in-place, then builds xyz_index.
+    /// `tex_vertices` and `triangles` stay shared with the base via `Arc`.
+    fn from_base(base: &Arc<ObjFileBase>, transform: &Option<AffineTransform>) -> Self {
+        let t_clone = Instant::now();
+        let mut vertices = base.pre_vertices.clone();
+        let mut normals = base.pre_normals.clone();
+        log::info!("ObjFile::from_base v/n clone took {:?}", t_clone.elapsed());
+
         let t_affine = Instant::now();
+        Self::apply_affine(&mut vertices, &mut normals, transform);
+        log::info!("ObjFile::from_base affine took {:?}", t_affine.elapsed());
+
+        let t_xyz = Instant::now();
+        let target_cell_num = 100.;
+        let num_tris = base.triangles.len() as f64;
+        let n = pow(num_tris / target_cell_num, 1. / 3.) as usize;
+        let xyz_index = XYZIndex::new(&vertices, &base.triangles, n);
+        log::info!("ObjFile::from_base xyz_index took {:?}", t_xyz.elapsed());
+
+        Self {
+            base: Arc::clone(base),
+            vertices,
+            normals,
+            xyz_index,
+        }
+    }
+
+    /// Non-cacheable construction for OrthographicXZ. The projection reads post-affine
+    /// vertices so the base is not reusable across affines — built once and wrapped in an
+    /// Arc only for layout uniformity.
+    fn new_orthographic(object: Object, transform: &Option<AffineTransform>) -> Self {
+        let t_extract = Instant::now();
+        let (mut vertices, mut normals, mut tex_vertices, triangles) = extract_compact(object);
+        log::info!("ObjFile::new_orthographic extract took {:?}", t_extract.elapsed());
+
+        let t_affine = Instant::now();
+        Self::apply_affine(&mut vertices, &mut normals, transform);
+        log::info!("ObjFile::new_orthographic affine took {:?}", t_affine.elapsed());
+
+        let t_proj = Instant::now();
+        normals.iter_mut().for_each(|n| {
+            n.x = 0.0;
+            n.y = 1.0;
+            n.z = 0.0;
+        });
+        let min_x = vertices.iter().map(|v| v.x).fold(f64::INFINITY, f64::min);
+        let max_x = vertices.iter().map(|v| v.x).fold(f64::NEG_INFINITY, f64::max);
+        let dx = max_x - min_x;
+        let min_z = vertices.iter().map(|v| v.z).fold(f64::INFINITY, f64::min);
+        let max_z = vertices.iter().map(|v| v.z).fold(f64::NEG_INFINITY, f64::max);
+        let dz = max_z - min_z;
+        for (idx, tex) in tex_vertices.iter_mut().enumerate() {
+            let v = vertices[idx];
+            tex.u = (v.x - min_x) / dx;
+            tex.v = (v.z - min_z) / dz;
+        }
+        let projection_dimensions = Some((dx.ceil() as usize, dz.ceil() as usize));
+        log::info!("ObjFile::new_orthographic projection took {:?}", t_proj.elapsed());
+
+        let t_inv = Instant::now();
+        let has_inverted_uv_tris = compute_has_inverted_uv_tris(&tex_vertices, &triangles);
+        log::info!("ObjFile::new_orthographic inversion_check took {:?}", t_inv.elapsed());
+
+        let target_cell_num = 100.;
+        let num_tris = triangles.len() as f64;
+
+        let t_uv = Instant::now();
+        let n = sqrt(num_tris / target_cell_num) as usize;
+        let uv_index = Arc::new(UVIndex::new(&tex_vertices, &triangles, n, n));
+        log::info!("ObjFile::new_orthographic uv_index took {:?}", t_uv.elapsed());
+
+        let t_xyz = Instant::now();
+        let n = pow(num_tris / target_cell_num, 1. / 3.) as usize;
+        let xyz_index = XYZIndex::new(&vertices, &triangles, n);
+        log::info!("ObjFile::new_orthographic xyz_index took {:?}", t_xyz.elapsed());
+
+        // pre_* fields are unused for orthographic (no caching) but populated for layout
+        // uniformity. The cost is one extra clone — only paid on the one-shot ortho path.
+        let base = Arc::new(ObjFileBase {
+            pre_vertices: vertices.clone(),
+            pre_normals: normals.clone(),
+            tex_vertices,
+            triangles,
+            has_inverted_uv_tris,
+            uv_index,
+            projection_dimensions,
+        });
+
+        Self {
+            base,
+            vertices,
+            normals,
+            xyz_index,
+        }
+    }
+
+    fn apply_affine(vertices: &mut [Vertex], normals: &mut [Vertex], transform: &Option<AffineTransform>) {
         if let Some(AffineTransform { matrix: affine }) = transform {
-            object.vertices.iter_mut().for_each(|v| {
+            vertices.iter_mut().for_each(|v| {
                 let x = affine[0][0] * v.x + affine[0][1] * v.y + affine[0][2] * v.z + affine[0][3];
                 let y = affine[1][0] * v.x + affine[1][1] * v.y + affine[1][2] * v.z + affine[1][3];
                 let z = affine[2][0] * v.x + affine[2][1] * v.y + affine[2][2] * v.z + affine[2][3];
@@ -259,7 +405,7 @@ impl ObjFile {
                 v.y = y;
                 v.z = z;
             });
-            object.normals.iter_mut().for_each(|n| {
+            normals.iter_mut().for_each(|n| {
                 let nx = affine[0][0] * n.x + affine[0][1] * n.y + affine[0][2] * n.z;
                 let ny = affine[1][0] * n.x + affine[1][1] * n.y + affine[1][2] * n.z;
                 let nz = affine[2][0] * n.x + affine[2][1] * n.y + affine[2][2] * n.z;
@@ -270,118 +416,62 @@ impl ObjFile {
                 n.z = nz / norm;
             });
         }
-        log::info!("ObjFile::new affine took {:?}", t_affine.elapsed());
+    }
+}
 
-        let t_proj = Instant::now();
-        let projection_dimensions = if projection == ProjectionKind::OrthographicXZ {
-            object.normals.iter_mut().for_each(|n| {
-                n.x = 0.0;
-                n.y = 1.0;
-                n.z = 0.0;
+/// Consume a wavefront_obj `Object` and produce the compact representation we actually
+/// use. Drops `groups`/`smoothing_groups` per shape (always empty in our files), drops
+/// non-triangle primitives, and packs VTN indices into a 36-byte `Triangle` (vs ~176 B
+/// for `wavefront_obj::Shape`). The original `Object` is consumed and freed at the end.
+fn extract_compact(object: Object) -> (Vec<Vertex>, Vec<Vertex>, Vec<TVertex>, Vec<Triangle>) {
+    let Object { vertices, normals, tex_vertices, geometry, .. } = object;
+    let shapes = geometry.into_iter().next().map(|g| g.shapes).unwrap_or_default();
+    let mut triangles = Vec::with_capacity(shapes.len());
+    for s in shapes {
+        if let Primitive::Triangle(i1, i2, i3) = s.primitive {
+            triangles.push(Triangle {
+                v: [i1.0 as u32, i2.0 as u32, i3.0 as u32],
+                t: [
+                    i1.1.unwrap_or(0) as u32,
+                    i2.1.unwrap_or(0) as u32,
+                    i3.1.unwrap_or(0) as u32,
+                ],
+                n: [
+                    i1.2.unwrap_or(0) as u32,
+                    i2.2.unwrap_or(0) as u32,
+                    i3.2.unwrap_or(0) as u32,
+                ],
             });
-
-            let vert_clone = object.vertices.clone();
-            let min_x = vert_clone.iter().map(|v| v.x).fold(f64::INFINITY, f64::min);
-            let max_x = vert_clone.iter().map(|v| v.x).fold(f64::NEG_INFINITY, f64::max);
-
-            let dx = max_x - min_x;
-
-            let min_z = vert_clone.iter().map(|v| v.z).fold(f64::INFINITY, f64::min);
-            let max_z = vert_clone.iter().map(|v| v.z).fold(f64::NEG_INFINITY, f64::max);
-            let dz = max_z - min_z;
-
-            object.tex_vertices.iter_mut().enumerate().for_each(|(idx, tex)| {
-                // replace the existing uv by an orthographic projection into the xz plane
-                let v = vert_clone[idx];
-                let x = v.x;
-                let z = v.z;
-
-                tex.u = (x - min_x) / dx;
-                tex.v = (z - min_z) / dz;
-            });
-
-            Some((dx.ceil() as usize, dz.ceil() as usize))
-        } else {
-            // rescale tex to 0..1
-            let min_u = object.tex_vertices.iter().map(|v| v.u).fold(f64::INFINITY, f64::min);
-            let max_u = object
-                .tex_vertices
-                .iter()
-                .map(|v| v.u)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let du = max_u - min_u;
-            let min_v = object.tex_vertices.iter().map(|v| v.v).fold(f64::INFINITY, f64::min);
-            let max_v = object
-                .tex_vertices
-                .iter()
-                .map(|v| v.v)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let dv = max_v - min_v;
-            object.tex_vertices.iter_mut().for_each(|tex| {
-                tex.u = (tex.u - min_u) / du;
-                tex.v = (tex.v - min_v) / dv;
-            });
-
-            None
-        };
-        log::info!("ObjFile::new projection_or_uv_rescale took {:?}", t_proj.elapsed());
-
-        let t_inv = Instant::now();
-        let has_inverted_uv_tris = Self::has_inverted_uv_tris(&object);
-        log::info!("ObjFile::new inversion_check took {:?}", t_inv.elapsed());
-
-        let target_cell_num = 100.;
-        let num_tris = object.geometry[0].shapes.len() as f64;
-
-        let t_uv = Instant::now();
-        let n = sqrt(num_tris / target_cell_num) as usize;
-        let uv_index = UVIndex::new(&object, n, n);
-        log::info!("ObjFile::new uv_index took {:?}", t_uv.elapsed());
-
-        let t_xyz = Instant::now();
-        let n = pow(num_tris / target_cell_num, 1. / 3.) as usize;
-        let xyz_index = XYZIndex::new(&object, n);
-        log::info!("ObjFile::new xyz_index took {:?}", t_xyz.elapsed());
-
-        Self {
-            object,
-            has_inverted_uv_tris,
-            uv_index,
-            xyz_index,
-            projection_dimensions,
         }
     }
-    fn has_inverted_uv_tris(obj: &Object) -> bool {
-        for s in obj.geometry[0].shapes.iter().skip(1) {
-            match s.primitive {
-                Primitive::Triangle(i1, i2, i3) => {
-                    let v1 = &obj.tex_vertices[i1.1.unwrap()];
-                    let v2 = &obj.tex_vertices[i2.1.unwrap()];
-                    let v3 = &obj.tex_vertices[i3.1.unwrap()];
+    (vertices, normals, tex_vertices, triangles)
+}
 
-                    let u1 = (v1.u * 100000.) as i32;
-                    let v1 = (v1.v * 100000.) as i32;
+fn compute_has_inverted_uv_tris(tex_vertices: &[TVertex], triangles: &[Triangle]) -> bool {
+    for tri in triangles.iter().skip(1) {
+        let v1 = &tex_vertices[tri.t[0] as usize];
+        let v2 = &tex_vertices[tri.t[1] as usize];
+        let v3 = &tex_vertices[tri.t[2] as usize];
 
-                    let u2 = (v2.u * 100000.) as i32;
-                    let v2 = (v2.v * 100000.) as i32;
+        let u1 = (v1.u * 100000.) as i32;
+        let v1 = (v1.v * 100000.) as i32;
 
-                    let u3 = (v3.u * 100000.) as i32;
-                    let v3 = (v3.v * 100000.) as i32;
+        let u2 = (v2.u * 100000.) as i32;
+        let v2 = (v2.v * 100000.) as i32;
 
-                    let u = (u1 + u2 + u3) / 3;
-                    let v = (v1 + v2 + v3) / 3;
+        let u3 = (v3.u * 100000.) as i32;
+        let v3 = (v3.v * 100000.) as i32;
 
-                    let w0 = orient2d(u2, v2, u3, v3, u, v);
-                    let w1 = orient2d(u3, v3, u1, v1, u, v);
-                    let w2 = orient2d(u1, v1, u2, v2, u, v);
+        let u = (u1 + u2 + u3) / 3;
+        let v = (v1 + v2 + v3) / 3;
 
-                    return w0 >= 0 && w1 >= 0 && w2 >= 0;
-                }
-                _ => (),
-            }
-        }
-        false
+        let w0 = orient2d(u2, v2, u3, v3, u, v);
+        let w1 = orient2d(u3, v3, u1, v1, u, v);
+        let w2 = orient2d(u1, v1, u2, v2, u, v);
+
+        return w0 >= 0 && w1 >= 0 && w2 >= 0;
     }
+    false
 }
 
 #[derive(Clone)]
@@ -401,10 +491,37 @@ impl ObjVolume {
         projection: ProjectionKind,
     ) -> Self {
         let t_total = Instant::now();
-        let obj_file = Arc::new(Self::load_obj(obj_file_path, transform, projection));
+        let obj_file = Self::load_obj(obj_file_path, transform, projection);
+        let result = Self::from_obj_file(obj_file, base_volume, width, height);
+        log::info!("ObjVolume::load_from_obj total took {:?}", t_total.elapsed());
+        result
+    }
 
-        // Use projection dimensions for orthographic projections to maintain 1:1 scale
-        let (final_width, final_height) = if let Some((proj_width, proj_height)) = obj_file.projection_dimensions {
+    /// Produce a new `ObjVolume` sharing this one's `Arc<ObjFileBase>` (parsed mesh + UV
+    /// index + inversion check + tex vertices) but with a fresh affine applied to a clone
+    /// of the pre-affine vertices/normals, and a fresh `XYZIndex` built against them.
+    /// Used to switch the base volume under an obj segment (Ctrl+1/2/3) without re-parsing
+    /// the obj file. Only valid for `ProjectionKind::None` bases — orthographic projections
+    /// embed post-affine positions into their UVs and must go through `load_from_obj`.
+    pub fn with_base(
+        &self,
+        base_volume: Volume,
+        width: usize,
+        height: usize,
+        transform: &Option<AffineTransform>,
+    ) -> Self {
+        let t_total = Instant::now();
+        let obj_file = ObjFile::from_base(&self.obj.base, transform);
+        let result = Self::from_obj_file(obj_file, base_volume, width, height);
+        log::info!("ObjVolume::with_base total took {:?}", t_total.elapsed());
+        result
+    }
+
+    /// Wrap an already-built ObjFile in an ObjVolume, picking the right final width/height
+    /// (orthographic projections override the requested dims with the projected extents).
+    pub fn from_obj_file(obj_file: ObjFile, base_volume: Volume, width: usize, height: usize) -> Self {
+        let obj_file = Arc::new(obj_file);
+        let (final_width, final_height) = if let Some((proj_width, proj_height)) = obj_file.base.projection_dimensions {
             if proj_width != width || proj_height != height {
                 println!(
                     "Note: Adjusting dimensions from {}x{} to {}x{} to maintain 1:1 scale for orthographic projection",
@@ -415,10 +532,7 @@ impl ObjVolume {
         } else {
             (width, height)
         };
-
-        let result = Self::new(obj_file, base_volume, final_width, final_height);
-        log::info!("ObjVolume::load_from_obj total took {:?}", t_total.elapsed());
-        result
+        Self::new(obj_file, base_volume, final_width, final_height)
     }
     pub fn new(obj: Arc<ObjFile>, base_volume: Volume, width: usize, height: usize) -> Self {
         Self {
@@ -430,11 +544,16 @@ impl ObjVolume {
     }
 
     pub fn load_obj(file_path: &str, transform: &Option<AffineTransform>, projection: ProjectionKind) -> ObjFile {
-        log::info!("ObjVolume::load_obj path={}", file_path);
+        let object = Self::parse_object(file_path);
+        ObjFile::new(object, transform, projection)
+    }
+
+    fn parse_object(file_path: &str) -> Object {
+        log::info!("ObjVolume::parse_object path={}", file_path);
         let t_read = Instant::now();
         let obj_file = std::fs::read_to_string(file_path).unwrap();
         log::info!(
-            "ObjVolume::load_obj read took {:?} ({} bytes)",
+            "ObjVolume::parse_object read took {:?} ({} bytes)",
             t_read.elapsed(),
             obj_file.len()
         );
@@ -452,25 +571,14 @@ impl ObjVolume {
             .chain(faces.into_iter())
             .collect::<Vec<_>>()
             .join("\n");
-        log::info!("ObjVolume::load_obj partition took {:?}", t_part.elapsed());
+        log::info!("ObjVolume::parse_object partition took {:?}", t_part.elapsed());
 
         let t_parse = Instant::now();
         let obj_set = obj::parse(obj_file).unwrap();
-        log::info!("ObjVolume::load_obj parse took {:?}", t_parse.elapsed());
+        log::info!("ObjVolume::parse_object parse took {:?}", t_parse.elapsed());
 
         let mut objects = obj_set.objects;
-        /* println!("Loaded obj file with {} objects", objects.len());
-        for o in objects.iter() {
-            println!(
-                "Object: {}, geometries: {} vertices: {}",
-                o.name,
-                o.geometry.len(),
-                o.vertices.len()
-            );
-        } */
-
-        let object = objects.remove(0);
-        ObjFile::new(object, transform, projection)
+        objects.remove(0)
     }
 
     pub fn width(&self) -> usize {
@@ -487,66 +595,61 @@ impl ObjVolume {
         let ut = u as f64 / self.width() as f64;
         let vt = self.v(v as f64 / self.height() as f64);
 
-        let obj = &self.obj.object;
-        for i in self.obj.uv_index.in_bounds(ut, ut, vt, vt) {
-            let s = &obj.geometry[0].shapes[i];
-            match s.primitive {
-                Primitive::Triangle(i1, i2, i3) => {
-                    let v1 = &obj.tex_vertices[i1.1.unwrap()];
-                    let v2 = &obj.tex_vertices[i2.1.unwrap()];
-                    let v3 = &obj.tex_vertices[i3.1.unwrap()];
+        let obj = &self.obj;
+        for i in obj.base.uv_index.in_bounds(ut, ut, vt, vt) {
+            let tri = &obj.base.triangles[i];
+            let v1 = &obj.base.tex_vertices[tri.t[0] as usize];
+            let v2 = &obj.base.tex_vertices[tri.t[1] as usize];
+            let v3 = &obj.base.tex_vertices[tri.t[2] as usize];
 
-                    let u1 = (v1.u * self.width() as f64) as i32;
-                    let v1 = (self.v(v1.v) * self.height() as f64) as i32;
+            let u1 = (v1.u * self.width() as f64) as i32;
+            let v1 = (self.v(v1.v) * self.height() as f64) as i32;
 
-                    let u2 = (v2.u * self.width() as f64) as i32;
-                    let v2 = (self.v(v2.v) * self.height() as f64) as i32;
+            let u2 = (v2.u * self.width() as f64) as i32;
+            let v2 = (self.v(v2.v) * self.height() as f64) as i32;
 
-                    let u3 = (v3.u * self.width() as f64) as i32;
-                    let v3 = (self.v(v3.v) * self.height() as f64) as i32;
+            let u3 = (v3.u * self.width() as f64) as i32;
+            let v3 = (self.v(v3.v) * self.height() as f64) as i32;
 
-                    let min_u_t = u1.min(u2).min(u3);
-                    let max_u_t = u1.max(u2).max(u3);
+            let min_u_t = u1.min(u2).min(u3);
+            let max_u_t = u1.max(u2).max(u3);
 
-                    let min_v_t = v1.min(v2).min(v3);
-                    let max_v_t = v1.max(v2).max(v3);
+            let min_v_t = v1.min(v2).min(v3);
+            let max_v_t = v1.max(v2).max(v3);
 
-                    // broad pre-check against triangle bounding box
-                    if min_u_t <= u && u <= max_u_t && min_v_t <= v && v <= max_v_t {
-                        let w0 = orient2d(u2, v2, u3, v3, u, v);
-                        let w1 = orient2d(u3, v3, u1, v1, u, v);
-                        let w2 = orient2d(u1, v1, u2, v2, u, v);
+            // broad pre-check against triangle bounding box
+            if min_u_t <= u && u <= max_u_t && min_v_t <= v && v <= max_v_t {
+                let w0 = orient2d(u2, v2, u3, v3, u, v);
+                let w1 = orient2d(u3, v3, u1, v1, u, v);
+                let w2 = orient2d(u1, v1, u2, v2, u, v);
 
-                        if w0 >= 0 && w1 >= 0 && w2 >= 0 {
-                            let xyz1 = &obj.vertices[i1.0];
-                            let xyz2 = &obj.vertices[i2.0];
-                            let xyz3 = &obj.vertices[i3.0];
+                if w0 >= 0 && w1 >= 0 && w2 >= 0 {
+                    let xyz1 = &obj.vertices[tri.v[0] as usize];
+                    let xyz2 = &obj.vertices[tri.v[1] as usize];
+                    let xyz3 = &obj.vertices[tri.v[2] as usize];
 
-                            // barymetric interpolation
-                            let invwsum = 1. / (w0 + w1 + w2) as f64;
-                            let x = (w0 as f64 * xyz1.x + w1 as f64 * xyz2.x + w2 as f64 * xyz3.x) * invwsum;
-                            let y = (w0 as f64 * xyz1.y + w1 as f64 * xyz2.y + w2 as f64 * xyz3.y) * invwsum;
-                            let z = (w0 as f64 * xyz1.z + w1 as f64 * xyz2.z + w2 as f64 * xyz3.z) * invwsum;
+                    // barymetric interpolation
+                    let invwsum = 1. / (w0 + w1 + w2) as f64;
+                    let x = (w0 as f64 * xyz1.x + w1 as f64 * xyz2.x + w2 as f64 * xyz3.x) * invwsum;
+                    let y = (w0 as f64 * xyz1.y + w1 as f64 * xyz2.y + w2 as f64 * xyz3.y) * invwsum;
+                    let z = (w0 as f64 * xyz1.z + w1 as f64 * xyz2.z + w2 as f64 * xyz3.z) * invwsum;
 
-                            let (nx, ny, nz) = if coord[2] == 0 {
-                                (0.0, 0.0, 0.0)
-                            } else {
-                                let nxyz1 = &obj.normals[i1.2.unwrap()];
-                                let nxyz2 = &obj.normals[i2.2.unwrap()];
-                                let nxyz3 = &obj.normals[i3.2.unwrap()];
+                    let (nx, ny, nz) = if coord[2] == 0 {
+                        (0.0, 0.0, 0.0)
+                    } else {
+                        let nxyz1 = &obj.normals[tri.n[0] as usize];
+                        let nxyz2 = &obj.normals[tri.n[1] as usize];
+                        let nxyz3 = &obj.normals[tri.n[2] as usize];
 
-                                let nx = (w0 as f64 * nxyz1.x + w1 as f64 * nxyz2.x + w2 as f64 * nxyz3.x) * invwsum;
-                                let ny = (w0 as f64 * nxyz1.y + w1 as f64 * nxyz2.y + w2 as f64 * nxyz3.y) * invwsum;
-                                let nz = (w0 as f64 * nxyz1.z + w1 as f64 * nxyz2.z + w2 as f64 * nxyz3.z) * invwsum;
+                        let nx = (w0 as f64 * nxyz1.x + w1 as f64 * nxyz2.x + w2 as f64 * nxyz3.x) * invwsum;
+                        let ny = (w0 as f64 * nxyz1.y + w1 as f64 * nxyz2.y + w2 as f64 * nxyz3.y) * invwsum;
+                        let nz = (w0 as f64 * nxyz1.z + w1 as f64 * nxyz2.z + w2 as f64 * nxyz3.z) * invwsum;
 
-                                (nx, ny, nz)
-                            };
+                        (nx, ny, nz)
+                    };
 
-                            return [(x + w * nx) as i32, (y + w * ny) as i32, (z + w * nz) as i32];
-                        }
-                    }
+                    return [(x + w * nx) as i32, (y + w * ny) as i32, (z + w * nz) as i32];
                 }
-                _ => todo!(),
             }
         }
 
@@ -554,7 +657,7 @@ impl ObjVolume {
     }
 
     fn v(&self, v: f64) -> f64 {
-        if self.obj.has_inverted_uv_tris {
+        if self.obj.base.has_inverted_uv_tris {
             v
         } else {
             1.0 - v
@@ -760,7 +863,7 @@ impl PaintVolume for ObjVolume {
         let min_v_vt = self.v(min_v as f64 / self.height() as f64);
         let max_v_vt = self.v(max_v as f64 / self.height() as f64);
 
-        let (min_v_vt, max_v_vt) = if self.obj.has_inverted_uv_tris {
+        let (min_v_vt, max_v_vt) = if self.obj.base.has_inverted_uv_tris {
             (min_v_vt, max_v_vt)
         } else {
             (max_v_vt, min_v_vt)
@@ -772,15 +875,14 @@ impl PaintVolume for ObjVolume {
         );
         println!("min_u: {}, max_u: {}, min_v: {}, max_v: {}", min_u, max_u, min_v, max_v); */
 
-        let obj = &self.obj.object;
-        //for s in obj.geometry[0].shapes.iter() {
-        for i in self.obj.uv_index.in_bounds(min_u_vt, max_u_vt, min_v_vt, max_v_vt) {
-            let s = &obj.geometry[0].shapes[i];
-            match s.primitive {
-                Primitive::Triangle(i1, i2, i3) => {
-                    let vert1 = &obj.tex_vertices[i1.1.unwrap()];
-                    let vert2 = &obj.tex_vertices[i2.1.unwrap()];
-                    let vert3 = &obj.tex_vertices[i3.1.unwrap()];
+        let obj = &self.obj;
+        for i in obj.base.uv_index.in_bounds(min_u_vt, max_u_vt, min_v_vt, max_v_vt) {
+            let tri = &obj.base.triangles[i];
+            {
+                {
+                    let vert1 = &obj.base.tex_vertices[tri.t[0] as usize];
+                    let vert2 = &obj.base.tex_vertices[tri.t[1] as usize];
+                    let vert3 = &obj.base.tex_vertices[tri.t[2] as usize];
 
                     let min_tri_u_t = vert1.u.min(vert2.u).min(vert3.u);
                     let max_tri_u_t = vert1.u.max(vert2.u).max(vert3.u);
@@ -886,9 +988,9 @@ impl PaintVolume for ObjVolume {
                                         && v >= 0
                                         && v < height as i32 * paint_zoom as i32
                                     {
-                                        let xyz1 = &obj.vertices[i1.0];
-                                        let xyz2 = &obj.vertices[i2.0];
-                                        let xyz3 = &obj.vertices[i3.0];
+                                        let xyz1 = &obj.vertices[tri.v[0] as usize];
+                                        let xyz2 = &obj.vertices[tri.v[1] as usize];
+                                        let xyz3 = &obj.vertices[tri.v[2] as usize];
 
                                         // barymetric interpolation
                                         let invwsum = 1. / (w0 + w1 + w2) as f64;
@@ -902,9 +1004,9 @@ impl PaintVolume for ObjVolume {
                                         let (nx, ny, nz) = if xyz[2] == 0 && !composite {
                                             (0.0, 0.0, 0.0)
                                         } else {
-                                            let nxyz1 = &obj.normals[i1.2.unwrap()];
-                                            let nxyz2 = &obj.normals[i2.2.unwrap()];
-                                            let nxyz3 = &obj.normals[i3.2.unwrap()];
+                                            let nxyz1 = &obj.normals[tri.n[0] as usize];
+                                            let nxyz2 = &obj.normals[tri.n[1] as usize];
+                                            let nxyz3 = &obj.normals[tri.n[2] as usize];
 
                                             let nx = (w0 as f64 * nxyz1.x + w1 as f64 * nxyz2.x + w2 as f64 * nxyz3.x)
                                                 * invwsum;
@@ -1001,7 +1103,6 @@ impl PaintVolume for ObjVolume {
                         }
                     }
                 }
-                _ => todo!(),
             }
         }
     }
@@ -1076,14 +1177,14 @@ impl SurfaceVolume for ObjVolume {
         mins[plane_coord] = w as f64;
         maxs[plane_coord] = w as f64;
 
-        let obj = &self.obj.object;
-        for i in self.obj.xyz_index.in_bounds(mins, maxs) {
-            let s = &obj.geometry[0].shapes[i];
-            match s.primitive {
-                Primitive::Triangle(i1, i2, i3) => {
-                    let v1 = &obj.vertices[i1.0];
-                    let v2 = &obj.vertices[i2.0];
-                    let v3 = &obj.vertices[i3.0];
+        let obj = &self.obj;
+        for i in obj.xyz_index.in_bounds(mins, maxs) {
+            let tri = &obj.base.triangles[i];
+            {
+                {
+                    let v1 = &obj.vertices[tri.v[0] as usize];
+                    let v2 = &obj.vertices[tri.v[1] as usize];
+                    let v3 = &obj.vertices[tri.v[2] as usize];
 
                     let minx = v1.x.min(v2.x).min(v3.x);
                     let maxx = v1.x.max(v2.x).max(v3.x);
@@ -1140,9 +1241,9 @@ impl SurfaceVolume for ObjVolume {
                         if points.len() == 2 {
                             let should_highlight = {
                                 if highlight_uv_section.is_some() {
-                                    let v1t = &obj.tex_vertices[i1.1.unwrap()];
-                                    let v2t = &obj.tex_vertices[i2.1.unwrap()];
-                                    let v3t = &obj.tex_vertices[i3.1.unwrap()];
+                                    let v1t = &obj.base.tex_vertices[tri.t[0] as usize];
+                                    let v2t = &obj.base.tex_vertices[tri.t[1] as usize];
+                                    let v3t = &obj.base.tex_vertices[tri.t[2] as usize];
 
                                     let min_u_t = v1t.u.min(v2t.u).min(v3t.u);
                                     let max_u_t = v1t.u.max(v2t.u).max(v3t.u);
@@ -1183,7 +1284,6 @@ impl SurfaceVolume for ObjVolume {
                         }
                     }
                 }
-                _ => todo!(),
             }
         }
     }

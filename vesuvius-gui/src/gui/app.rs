@@ -43,6 +43,8 @@ pub struct SegmentMode {
     #[serde(skip)]
     surface_volume: Arc<dyn SurfaceVolume>,
     #[serde(skip)]
+    obj_volume: Option<Arc<ObjVolume>>,
+    #[serde(skip)]
     uv_pane: VolumePane,
     #[serde(skip)]
     convert_to_world_coords: Box<dyn Fn([i32; 3]) -> [i32; 3]>,
@@ -67,6 +69,7 @@ impl Default for SegmentMode {
             ranges: [0..=1000, 0..=1000, -40..=40],
             world: EmptyVolume {}.into_volume(),
             surface_volume: Arc::new(EmptyVolume {}),
+            obj_volume: None,
             uv_pane: VolumePane::new(PaneType::UV, true),
             convert_to_world_coords: Box::new(|x| x),
             segment_id: None,
@@ -387,6 +390,7 @@ impl TemplateApp {
             segment.ranges = [0..=width, 0..=height, -40..=40];
             segment.world = Volume::from_ref(ppm.clone());
             //segment.surface_volume = ppm;
+            segment.obj_volume = None;
             segment.convert_to_world_coords = Box::new(move |coord| ppm2.convert_to_world_coords(coord));
 
             if let Some((sample_id, segment_id)) = atlas_metadata {
@@ -417,7 +421,20 @@ impl TemplateApp {
             let scaled_width = (width as f64 * scale) as usize;
             let scaled_height = (height as f64 * scale) as usize;
 
-            let obj_volume = ObjVolume::load_from_obj(&segment_file, base, scaled_width, scaled_height, &transform_owned, projection);
+            let obj_volume = match (is_reload, projection, segment.obj_volume.as_ref()) {
+                (true, ProjectionKind::None, Some(prev)) => {
+                    log::info!("ObjVolume::with_base reusing parsed mesh for {}", segment_file);
+                    prev.with_base(base, scaled_width, scaled_height, &transform_owned)
+                }
+                _ => ObjVolume::load_from_obj(
+                    segment_file,
+                    base,
+                    scaled_width,
+                    scaled_height,
+                    &transform_owned,
+                    projection,
+                ),
+            };
             let width = obj_volume.width() as i32;
             let height = obj_volume.height() as i32;
 
@@ -441,7 +458,8 @@ impl TemplateApp {
             segment.height = height as usize;
             segment.ranges = [0..=width, 0..=height, -40..=40];
             segment.world = Volume::from_ref(volume.clone());
-            segment.surface_volume = volume;
+            segment.surface_volume = volume.clone();
+            segment.obj_volume = Some(volume);
             segment.convert_to_world_coords = Box::new(move |coords| obj2.convert_to_volume_coords(coords));
 
             if let Some((sample_id, segment_id)) = atlas_metadata {
