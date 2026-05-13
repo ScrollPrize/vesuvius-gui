@@ -151,53 +151,108 @@ trait Downloader: Sync + Send + Debug {
     fn download(&self, from_url: &str, to_path: &str);
 }
 
+const SIMPLE_DOWNLOADER_WORKERS: usize = 16;
+
+/// Per-download log messages are at `info` level but gated by `VESUVIUS_LOG_DOWNLOADS` so
+/// they don't spam at the workspace's default `RUST_LOG=info`. Set the env var to any
+/// value to opt in; the check is memoized at first use.
+fn download_logging_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VESUVIUS_LOG_DOWNLOADS").is_ok())
+}
+
 #[derive(Debug)]
 struct SimpleDownloader {
-    channel: std::sync::mpsc::Sender<(String, String)>,
+    channel: std::sync::mpsc::SyncSender<(String, String)>,
+    ongoing: Arc<Mutex<HashSet<String>>>,
 }
 impl SimpleDownloader {
     fn new() -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
-        std::thread::spawn(move || {
-            let mut ongoing: HashSet<String> = HashSet::default();
-            let downloading = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            for (from, to) in rx {
-                if ongoing.contains(&from.to_string()) {
-                    continue;
-                }
-                if downloading.load(Ordering::Relaxed) > 10 {
-                    continue;
-                }
+        // Rendezvous channel: a send only succeeds when a worker is parked in recv().
+        // Effective in-flight cap is exactly SIMPLE_DOWNLOADER_WORKERS — no buffer = no
+        // buffer bloat of stale chunks from a viewport the user has already left behind.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, String)>(0);
+        let rx = Arc::new(Mutex::new(rx));
 
-                ongoing.insert(from.clone());
-                downloading.fetch_add(1, Ordering::Acquire);
-                log::debug!("Starting download from {} to {}", from, to);
-                let inner_counter = downloading.clone();
-                ehttp::fetch(Request::get(&from), move |result| {
-                    log::debug!("Downloaded from {} to {}", from, to);
-                    let response = result.unwrap();
-                    inner_counter.fetch_sub(1, Ordering::Acquire);
-                    if response.status == 200 {
-                        let data = response.bytes.to_vec();
-                        std::fs::create_dir_all(std::path::Path::new(&to).parent().unwrap()).unwrap();
-                        let tmp_file = format!("{}.tmp", to);
-                        std::fs::write(&tmp_file, &data).unwrap();
-                        std::fs::rename(tmp_file, to).unwrap();
-                    } else if response.status == 404 {
-                        // expected for sparse zarrs — missing chunks are normal
-                        log::debug!("Missing chunk (404) at {}", from);
-                    } else {
-                        log::warn!("Failed to download from {}, status {}", from, response.status);
+        let client = Client::builder()
+            .pool_max_idle_per_host(SIMPLE_DOWNLOADER_WORKERS)
+            .pool_idle_timeout(Some(std::time::Duration::from_secs(60)))
+            .http2_adaptive_window(true)
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+            .timeout(Some(std::time::Duration::from_secs(60)))
+            .build()
+            .expect("failed to build reqwest client for SimpleDownloader");
+
+        let ongoing: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::default()));
+
+        for _ in 0..SIMPLE_DOWNLOADER_WORKERS {
+            let rx = rx.clone();
+            let client = client.clone();
+            let ongoing = ongoing.clone();
+            std::thread::spawn(move || loop {
+                let (from, to) = {
+                    let lock = rx.lock().unwrap();
+                    match lock.recv() {
+                        Ok(v) => v,
+                        Err(_) => return,
                     }
-                });
-            }
-        });
-        Self { channel: tx }
+                };
+                if download_logging_enabled() {
+                    log::info!("Starting download from {} to {}", from, to);
+                }
+                match client.get(&from).send() {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.as_u16() == 200 {
+                            match response.bytes() {
+                                Ok(bytes) => {
+                                    if download_logging_enabled() {
+                                        log::info!("Downloaded from {} to {}", from, to);
+                                    }
+                                    if let Some(parent) = std::path::Path::new(&to).parent() {
+                                        if let Err(e) = std::fs::create_dir_all(parent) {
+                                            log::warn!("Failed to create parent dir for {}: {}", to, e);
+                                        }
+                                    }
+                                    let tmp_file = format!("{}.tmp", to);
+                                    if let Err(e) = std::fs::write(&tmp_file, bytes.as_ref()) {
+                                        log::warn!("Failed to write {}: {}", tmp_file, e);
+                                    } else if let Err(e) = std::fs::rename(&tmp_file, &to) {
+                                        log::warn!("Failed to rename {} -> {}: {}", tmp_file, to, e);
+                                    }
+                                }
+                                Err(e) => log::warn!("Failed to read body from {}: {}", from, e),
+                            }
+                        } else if status.as_u16() == 404 {
+                            // expected for sparse zarrs — missing chunks are normal
+                            if download_logging_enabled() {
+                                log::info!("Missing chunk (404) at {}", from);
+                            }
+                        } else {
+                            log::warn!("Failed to download from {}, status {}", from, status.as_u16());
+                        }
+                    }
+                    Err(e) => log::warn!("Request error for {}: {}", from, e),
+                }
+                ongoing.lock().unwrap().remove(&from);
+            });
+        }
+
+        Self { channel: tx, ongoing }
     }
 }
 impl Downloader for SimpleDownloader {
     fn download(&self, from_url: &str, to_path: &str) {
-        self.channel.send((from_url.to_string(), to_path.to_string())).unwrap();
+        let from = from_url.to_string();
+        let to = to_path.to_string();
+        if !self.ongoing.lock().unwrap().insert(from.clone()) {
+            return;
+        }
+        // On Full (all workers busy), clear the ongoing entry so paint can re-emit later.
+        if self.channel.try_send((from.clone(), to)).is_err() {
+            self.ongoing.lock().unwrap().remove(&from);
+        }
     }
 }
 
