@@ -2,6 +2,7 @@ use super::{Image, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
 use crate::volume::{AffineTransform, CompositingMode, VoxelPaintVolume};
 use libm::{pow, sqrt};
 use std::sync::Arc;
+use std::time::Instant;
 use wavefront_obj::obj::{self, Object, Primitive, Vertex};
 
 // TODO: create a single AABB index for both XYZ and UV index
@@ -239,6 +240,16 @@ pub struct ObjFile {
 }
 impl ObjFile {
     pub fn new(mut object: Object, transform: &Option<AffineTransform>, projection: ProjectionKind) -> Self {
+        let num_tris = object.geometry.get(0).map(|g| g.shapes.len()).unwrap_or(0);
+        log::info!(
+            "ObjFile::new tris={} vertices={} normals={} tex_vertices={}",
+            num_tris,
+            object.vertices.len(),
+            object.normals.len(),
+            object.tex_vertices.len()
+        );
+
+        let t_affine = Instant::now();
         if let Some(AffineTransform { matrix: affine }) = transform {
             object.vertices.iter_mut().for_each(|v| {
                 let x = affine[0][0] * v.x + affine[0][1] * v.y + affine[0][2] * v.z + affine[0][3];
@@ -259,7 +270,9 @@ impl ObjFile {
                 n.z = nz / norm;
             });
         }
+        log::info!("ObjFile::new affine took {:?}", t_affine.elapsed());
 
+        let t_proj = Instant::now();
         let projection_dimensions = if projection == ProjectionKind::OrthographicXZ {
             object.normals.iter_mut().for_each(|n| {
                 n.x = 0.0;
@@ -311,15 +324,24 @@ impl ObjFile {
 
             None
         };
+        log::info!("ObjFile::new projection_or_uv_rescale took {:?}", t_proj.elapsed());
 
+        let t_inv = Instant::now();
         let has_inverted_uv_tris = Self::has_inverted_uv_tris(object.clone());
+        log::info!("ObjFile::new inversion_check took {:?}", t_inv.elapsed());
+
         let target_cell_num = 100.;
         let num_tris = object.geometry[0].shapes.len() as f64;
+
+        let t_uv = Instant::now();
         let n = sqrt(num_tris / target_cell_num) as usize;
         let uv_index = UVIndex::new(&object, n, n);
+        log::info!("ObjFile::new uv_index took {:?}", t_uv.elapsed());
 
+        let t_xyz = Instant::now();
         let n = pow(num_tris / target_cell_num, 1. / 3.) as usize;
         let xyz_index = XYZIndex::new(&object, n);
+        log::info!("ObjFile::new xyz_index took {:?}", t_xyz.elapsed());
 
         Self {
             object,
@@ -378,6 +400,7 @@ impl ObjVolume {
         transform: &Option<AffineTransform>,
         projection: ProjectionKind,
     ) -> Self {
+        let t_total = Instant::now();
         let obj_file = Arc::new(Self::load_obj(obj_file_path, transform, projection));
 
         // Use projection dimensions for orthographic projections to maintain 1:1 scale
@@ -393,7 +416,9 @@ impl ObjVolume {
             (width, height)
         };
 
-        Self::new(obj_file, base_volume, final_width, final_height)
+        let result = Self::new(obj_file, base_volume, final_width, final_height);
+        log::info!("ObjVolume::load_from_obj total took {:?}", t_total.elapsed());
+        result
     }
     pub fn new(obj: Arc<ObjFile>, base_volume: Volume, width: usize, height: usize) -> Self {
         Self {
@@ -405,7 +430,16 @@ impl ObjVolume {
     }
 
     pub fn load_obj(file_path: &str, transform: &Option<AffineTransform>, projection: ProjectionKind) -> ObjFile {
+        log::info!("ObjVolume::load_obj path={}", file_path);
+        let t_read = Instant::now();
         let obj_file = std::fs::read_to_string(file_path).unwrap();
+        log::info!(
+            "ObjVolume::load_obj read took {:?} ({} bytes)",
+            t_read.elapsed(),
+            obj_file.len()
+        );
+
+        let t_part = Instant::now();
         // filter out opacity definitions that wavefront_obj does not cope well with
         let (not_faces, faces): (Vec<_>, Vec<_>) = obj_file
             .lines()
@@ -418,8 +452,11 @@ impl ObjVolume {
             .chain(faces.into_iter())
             .collect::<Vec<_>>()
             .join("\n");
+        log::info!("ObjVolume::load_obj partition took {:?}", t_part.elapsed());
 
+        let t_parse = Instant::now();
         let obj_set = obj::parse(obj_file).unwrap();
+        log::info!("ObjVolume::load_obj parse took {:?}", t_parse.elapsed());
 
         let mut objects = obj_set.objects;
         /* println!("Loaded obj file with {} objects", objects.len());
