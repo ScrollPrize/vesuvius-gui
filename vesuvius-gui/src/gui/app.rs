@@ -185,7 +185,7 @@ impl Default for TemplateApp {
             drawing_config: Default::default(),
             sync_coordinates: true,
             show_overlay: true,
-            ranges: [0..=20000, 0..=20000, 0..=80000],
+            ranges: [0..=50000, 0..=50000, 0..=100000],
             extra_resolutions: 0,
             segment_mode: None,
             catalog,
