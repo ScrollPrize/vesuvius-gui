@@ -5,7 +5,7 @@ use vesuvius_rs::catalog::Catalog;
 use vesuvius_rs::catalog::Segment;
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
-use vesuvius_zarr::ZarrArray;
+use vesuvius_zarr::{OmeZarrContext, ZarrArray};
 use directories::BaseDirs;
 use egui::CollapsingHeader;
 use egui::Color32;
@@ -56,6 +56,11 @@ pub struct SegmentMode {
     current_base_volume_id: Option<String>,
     #[serde(skip)]
     available_volumes: Vec<String>,
+    /// Last affine transform applied to the segment's mesh (via setup_segment).
+    /// Stored so we can rebuild the obj base in-place (e.g. on overlay toggle)
+    /// without losing the transform.
+    #[serde(skip)]
+    last_transform: Option<AffineTransform>,
 }
 
 impl Default for SegmentMode {
@@ -76,6 +81,7 @@ impl Default for SegmentMode {
             sample_id: None,
             current_base_volume_id: None,
             available_volumes: Vec::new(),
+            last_transform: None,
         }
     }
 }
@@ -97,6 +103,7 @@ pub struct VesuviusConfig {
     pub data_dir: Option<String>,
     pub obj_file: Option<ObjFileConfig>,
     pub overlay_dir: Option<String>,
+    pub overlay_coloring: Option<OverlayColoring>,
     pub volume: Option<NewVolumeReference>,
 }
 
@@ -148,7 +155,13 @@ pub struct TemplateApp {
     #[serde(skip)]
     notification_receiver: Receiver<UINotification>,
     #[serde(skip)]
-    overlay: Option<Box<dyn PaintVolume>>,
+    overlay: Option<Volume>,
+    /// Raw inner overlay (the underlying zarr/ome-zarr `Volume`, before wrapping
+    /// in `OverlayPaintVolume`). Kept so we can rebuild `overlay` with a new
+    /// coloring without re-loading from disk/network.
+    #[serde(skip)]
+    overlay_inner: Option<Volume>,
+    overlay_coloring: OverlayColoring,
     catalog_panel_open: bool,
     layout: GuiLayout,
     #[serde(skip)]
@@ -184,6 +197,8 @@ impl Default for TemplateApp {
             notification_sender,
             notification_receiver,
             overlay: None,
+            overlay_inner: None,
+            overlay_coloring: OverlayColoring::default(),
             catalog_panel_open: true,
             layout: GuiLayout::Grid,
             pending_volume_switch: None,
@@ -335,24 +350,35 @@ impl TemplateApp {
             app.setup_segment(&obj_file, width, height, transform.as_ref(), None, projection, None);
         }
 
+        if let Some(coloring) = config.overlay_coloring {
+            app.overlay_coloring = coloring;
+        }
+
         if let Some(segment_file) = config.overlay_dir {
             if segment_file.contains(".zarr") {
-                app.overlay = Some({
+                let inner: Volume = if segment_file.contains(".ome.zarr") {
                     if segment_file.starts_with("http") {
-                        log::info!("Loading zarr from url: {}", segment_file);
-                        Box::new(
-                            ZarrArray::from_url_to_default_cache_dir(&segment_file)
-                                .into_ctx()
-                                .into_ctx(),
-                        )
-                        // TODO: autodetect or allow to choose whether to use ome-zarr or zarr
-                        /* Box::new(OmeZarrContext::<FourColors>::from_url_to_default_cache_dir(
+                        log::info!("Loading ome-zarr overlay from url: {}", segment_file);
+                        OmeZarrPaintVolume::<GrayScale>::new(OmeZarrContext::from_url_to_default_cache_dir(
                             &segment_file,
-                        )) */
+                        ))
+                        .into_volume()
                     } else {
-                        Box::new(ZarrArray::from_path(&segment_file).into_ctx().into_ctx())
+                        log::info!("Loading ome-zarr overlay from path: {}", segment_file);
+                        OmeZarrPaintVolume::<GrayScale>::new(OmeZarrContext::from_path(&segment_file)).into_volume()
                     }
-                });
+                } else if segment_file.starts_with("http") {
+                    log::info!("Loading zarr overlay from url: {}", segment_file);
+                    ZarrArray::from_url_to_default_cache_dir(&segment_file)
+                        .into_ctx()
+                        .into_ctx()
+                        .into_volume()
+                } else {
+                    log::info!("Loading zarr overlay from path: {}", segment_file);
+                    ZarrArray::from_path(&segment_file).into_ctx().into_ctx().into_volume()
+                };
+                app.overlay = Some(OverlayPaintVolume::new(inner.clone(), app.overlay_coloring).into_volume());
+                app.overlay_inner = Some(inner);
             }
         }
 
@@ -407,6 +433,11 @@ impl TemplateApp {
         } else if segment_file.ends_with(".obj") {
             let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
             let base = self.world.clone();
+            let base = if let (Some(overlay), true) = (self.overlay.as_ref(), self.show_overlay) {
+                OverlayVolume::new(base, overlay.clone(), self.overlay_coloring).into_volume()
+            } else {
+                base
+            };
             let transform_owned = transform.cloned();
             let coord_scale_transform_owned = coord_scale_transform.cloned();
 
@@ -461,6 +492,7 @@ impl TemplateApp {
             segment.surface_volume = volume.clone();
             segment.obj_volume = Some(volume);
             segment.convert_to_world_coords = Box::new(move |coords| obj2.convert_to_volume_coords(coords));
+            segment.last_transform = transform_owned.clone();
 
             if let Some((sample_id, segment_id)) = atlas_metadata {
                 segment.sample_id = Some(sample_id);
@@ -474,6 +506,43 @@ impl TemplateApp {
 
             self.segment_mode = Some(segment)
         }
+    }
+
+    /// Rebuild `self.overlay` from `self.overlay_inner` + current coloring, producing
+    /// a fresh Arc so the tile cache invalidates.
+    fn rebuild_overlay(&mut self) {
+        if let Some(inner) = self.overlay_inner.as_ref() {
+            self.overlay = Some(OverlayPaintVolume::new(inner.clone(), self.overlay_coloring).into_volume());
+        }
+    }
+
+    /// Rebuild the current segment's ObjVolume against the current world + overlay state.
+    /// Used when the user toggles overlay visibility or changes overlay coloring without
+    /// touching the segment file. Uses ObjVolume::with_base which preserves the parsed mesh.
+    fn rebuild_segment_base(&mut self) {
+        let Some(mut segment) = self.segment_mode.take() else {
+            return;
+        };
+        let Some(prev) = segment.obj_volume.as_ref() else {
+            self.segment_mode = Some(segment);
+            return;
+        };
+
+        let base = self.world.clone();
+        let base = if let (Some(overlay), true) = (self.overlay.as_ref(), self.show_overlay) {
+            OverlayVolume::new(base, overlay.clone(), self.overlay_coloring).into_volume()
+        } else {
+            base
+        };
+
+        let obj_volume = prev.with_base(base, segment.width, segment.height, &segment.last_transform);
+        let volume = Arc::new(obj_volume);
+        let obj2 = volume.clone();
+        segment.world = Volume::from_ref(volume.clone());
+        segment.surface_volume = volume.clone();
+        segment.obj_volume = Some(volume);
+        segment.convert_to_world_coords = Box::new(move |coords| obj2.convert_to_volume_coords(coords));
+        self.segment_mode = Some(segment);
     }
 
     fn load_volume(&mut self, volume: &NewVolumeReference) {
@@ -587,6 +656,9 @@ impl TemplateApp {
             ui.end_row();
             sl
         }
+
+        let mut overlay_ui_state_changed = false;
+        let mut overlay_coloring_changed = false;
 
         egui::Grid::new("my_grid")
             .num_columns(2)
@@ -732,7 +804,11 @@ impl TemplateApp {
                 }
 
                 if self.overlay.is_some() {
-                    has_changed = has_changed || cb(ui, "Show overlay ('L')", &mut self.show_overlay).changed();
+                    let show_changed = cb(ui, "Show overlay ('L')", &mut self.show_overlay).changed();
+                    if show_changed {
+                        overlay_ui_state_changed = true;
+                        has_changed = true;
+                    }
                 }
 
                 if self.is_segment_mode() {
@@ -855,6 +931,95 @@ impl TemplateApp {
                 }
             });
 
+        if self.overlay.is_some() {
+            ui.collapsing("Overlay coloring", |ui| {
+                let label = match self.overlay_coloring {
+                    OverlayColoring::FourColors { .. } => "FourColors",
+                    OverlayColoring::Boolean { .. } => "Boolean",
+                    OverlayColoring::Hue { .. } => "Hue",
+                };
+                egui::ComboBox::from_id_salt("OverlayColoringMode")
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        let current_alpha = match self.overlay_coloring {
+                            OverlayColoring::FourColors { alpha }
+                            | OverlayColoring::Boolean { alpha, .. }
+                            | OverlayColoring::Hue { alpha, .. } => alpha,
+                        };
+                        if ui
+                            .selectable_label(
+                                matches!(self.overlay_coloring, OverlayColoring::FourColors { .. }),
+                                "FourColors",
+                            )
+                            .clicked()
+                        {
+                            self.overlay_coloring = OverlayColoring::FourColors { alpha: current_alpha };
+                            overlay_coloring_changed = true;
+                        }
+                        if ui
+                            .selectable_label(
+                                matches!(self.overlay_coloring, OverlayColoring::Boolean { .. }),
+                                "Boolean",
+                            )
+                            .clicked()
+                        {
+                            self.overlay_coloring = OverlayColoring::Boolean {
+                                color: [255, 0, 255],
+                                alpha: current_alpha,
+                            };
+                            overlay_coloring_changed = true;
+                        }
+                        if ui
+                            .selectable_label(matches!(self.overlay_coloring, OverlayColoring::Hue { .. }), "Hue")
+                            .clicked()
+                        {
+                            self.overlay_coloring = OverlayColoring::Hue {
+                                hue_deg: 0.0,
+                                alpha: current_alpha,
+                            };
+                            overlay_coloring_changed = true;
+                        }
+                    });
+                match &mut self.overlay_coloring {
+                    OverlayColoring::FourColors { alpha } => {
+                        if ui.add(egui::Slider::new(alpha, 0.0..=1.0).text("Alpha")).changed() {
+                            overlay_coloring_changed = true;
+                        }
+                    }
+                    OverlayColoring::Boolean { color, alpha } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Color");
+                            let mut c = egui::Color32::from_rgb(color[0], color[1], color[2]);
+                            if ui.color_edit_button_srgba(&mut c).changed() {
+                                *color = [c.r(), c.g(), c.b()];
+                                overlay_coloring_changed = true;
+                            }
+                        });
+                        if ui.add(egui::Slider::new(alpha, 0.0..=1.0).text("Alpha")).changed() {
+                            overlay_coloring_changed = true;
+                        }
+                    }
+                    OverlayColoring::Hue { hue_deg, alpha } => {
+                        if ui.add(egui::Slider::new(hue_deg, 0.0..=360.0).text("Hue (deg)")).changed() {
+                            overlay_coloring_changed = true;
+                        }
+                        if ui.add(egui::Slider::new(alpha, 0.0..=1.0).text("Alpha")).changed() {
+                            overlay_coloring_changed = true;
+                        }
+                    }
+                }
+            });
+        }
+
+        if overlay_coloring_changed {
+            self.rebuild_overlay();
+        }
+        if overlay_coloring_changed || overlay_ui_state_changed {
+            if self.is_segment_mode() {
+                self.rebuild_segment_base();
+            }
+        }
+
         ui.collapsing("Filters", |ui| {
             ui.checkbox(&mut self.drawing_config.enable_filters, "Enable ('F')");
             ui.add_enabled_ui(self.drawing_config.enable_filters, |ui| {
@@ -956,6 +1121,7 @@ impl TemplateApp {
             self.catalog_panel(ctx);
         }
 
+        let mut overlay_state_changed = false;
         if !ctx.wants_keyboard_input() {
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::F) {
@@ -963,6 +1129,7 @@ impl TemplateApp {
                 }
                 if self.overlay.is_some() && i.key_pressed(egui::Key::L) {
                     self.show_overlay = !self.show_overlay;
+                    overlay_state_changed = true;
                 }
                 if i.key_pressed(egui::Key::C) {
                     self.catalog_panel_open = !self.catalog_panel_open;
@@ -1052,6 +1219,10 @@ impl TemplateApp {
             });
         }
 
+        if overlay_state_changed && self.is_segment_mode() {
+            self.rebuild_segment_base();
+        }
+
         egui::Window::new("Controls").show(ctx, |ui| {
             self.controls(_frame, ui);
 
@@ -1125,10 +1296,13 @@ impl TemplateApp {
             None
         };
 
+        let overlay = if self.show_overlay { self.overlay.as_ref() } else { None };
+
         pane.render(
             ui,
             &mut self.coord,
             &self.world,
+            overlay,
             self.segment_mode.as_ref().map(|s| s.surface_volume.clone()),
             &mut self.zoom,
             &self.drawing_config,
@@ -1144,6 +1318,7 @@ impl TemplateApp {
                 ui,
                 &mut segment_mode.coord,
                 &segment_mode.world,
+                None,
                 None,
                 &mut self.zoom,
                 &self.drawing_config,
@@ -1172,12 +1347,12 @@ impl TemplateApp {
             });
             ui.separator();
 
-            {
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 let mut clicked = None;
                 self.catalog.scrolls().iter().for_each(|scroll| {
                     egui::CollapsingHeader::new(scroll.label()).show(ui, |ui| {
                         let mut table = TableBuilder::new(ui)
-                            .vscroll(true)
+                            .vscroll(false)
                             .column(Column::auto())
                             .column(Column::remainder().at_least(130.0) /* Column::initial(150.0) */)
                             .column(Column::auto())
@@ -1264,7 +1439,7 @@ impl TemplateApp {
                     for (sample_id, atlas_sample) in samples {
                         egui::CollapsingHeader::new(format!("Atlas: {}", sample_id)).show(ui, |ui| {
                             let mut table = TableBuilder::new(ui)
-                                .vscroll(true)
+                                .vscroll(false)
                                 .column(Column::auto())
                                 .column(Column::remainder().at_least(130.0))
                                 .column(Column::auto())
@@ -1366,7 +1541,7 @@ impl TemplateApp {
                         self.obj_repository.download(&segment, move |segment| {let _ =sender.send(UINotification::ObjDownloadReady(segment.clone()));});
                     }
                 }
-            }
+            });
             //);
         });
     }

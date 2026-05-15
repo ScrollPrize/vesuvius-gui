@@ -34,6 +34,7 @@ struct TileCacheKey {
     segment_outlines_coord: Option<[i32; 3]>,
     extra_resolutions: u32,
     volume_id: usize,
+    overlay_volume_id: usize,
 }
 
 impl TileCacheKey {
@@ -48,8 +49,12 @@ impl TileCacheKey {
         segment_outlines_coord: Option<[i32; 3]>,
         extra_resolutions: u32,
         world: &Volume,
+        overlay: Option<&Volume>,
     ) -> Self {
         let volume_id = Arc::as_ptr(&world.volume) as *const () as usize;
+        let overlay_volume_id = overlay
+            .map(|o| Arc::as_ptr(&o.volume) as *const () as usize)
+            .unwrap_or(0);
 
         let min_level = (32 - ((ZOOM_RES_FACTOR / zoom) as u32).leading_zeros()).max(0);
 
@@ -64,6 +69,7 @@ impl TileCacheKey {
             segment_outlines_coord,
             extra_resolutions,
             volume_id,
+            overlay_volume_id,
         }
     }
 }
@@ -320,6 +326,7 @@ impl VolumePane {
         ui: &mut Ui,
         coord: &mut [i32; 3],
         world: &Volume,
+        overlay: Option<&Volume>,
         surface_volume: Option<Arc<dyn SurfaceVolume>>,
         zoom: &mut f32,
         drawing_config: &DrawingConfig,
@@ -336,6 +343,7 @@ impl VolumePane {
             ui,
             *coord,
             world,
+            overlay,
             *zoom,
             frame_width,
             frame_height,
@@ -476,6 +484,7 @@ impl VolumePane {
         ui: &Ui,
         coord: [i32; 3],
         world: &Volume,
+        overlay: Option<&Volume>,
         zoom: f32,
         frame_width: usize,
         frame_height: usize,
@@ -506,26 +515,27 @@ impl VolumePane {
                     segment_outlines_coord,
                     extra_resolutions,
                     world,
+                    overlay,
                 );
                 (key, *tile_rect)
             })
             .collect::<Vec<_>>();
 
         for (key, _) in keys_and_rects.iter() {
-            self.ensure_tile_async(ui, key.clone(), world);
+            self.ensure_tile_async(ui, key.clone(), world, overlay);
         }
 
         let millis = 50; //if self.pane_type == PaneType::UV { 10 } else { 20 };
         let timeout = std::time::Duration::from_millis(millis);
         let mut ready_tiles = Vec::new();
         for (key, tile_rect) in keys_and_rects {
-            if let Some(texture) = self.get_or_create_tile_async(ui, key, world, timeout) {
+            if let Some(texture) = self.get_or_create_tile_async(ui, key, world, overlay, timeout) {
                 ready_tiles.push((texture, tile_rect));
             }
         }
         ready_tiles
     }
-    fn ensure_tile_async(&self, ui: &Ui, key: TileCacheKey, world: &Volume) {
+    fn ensure_tile_async(&self, ui: &Ui, key: TileCacheKey, world: &Volume, overlay: Option<&Volume>) {
         // Check if tile exists in cache
         let cached_value = ui.memory_mut(|mem| {
             let cache: &mut TileCache = mem.caches.cache::<TileCache>();
@@ -540,7 +550,7 @@ impl VolumePane {
 
         match cached_value {
             None => {
-                let handle = self.create_tile_async(&key, world);
+                let handle = self.create_tile_async(&key, world, overlay);
 
                 set(
                     ui,
@@ -560,6 +570,7 @@ impl VolumePane {
         ui: &Ui,
         key: TileCacheKey,
         world: &Volume,
+        overlay: Option<&Volume>,
         timeout: std::time::Duration,
     ) -> Option<egui::TextureHandle> {
         // Calculate paint_zoom for cache key (same logic as in create_tile)
@@ -595,7 +606,7 @@ impl VolumePane {
 
                 if async_tex.needs_recalculation() {
                     // TTL expired - start recalculation while showing old tile
-                    let new_future = self.create_tile_async(&key, world);
+                    let new_future = self.create_tile_async(&key, world, overlay);
                     set(
                         ui,
                         key.clone(),
@@ -726,7 +737,7 @@ impl VolumePane {
 
             None => {
                 // Start async rendering
-                let handle = self.create_tile_async(&key, world);
+                let handle = self.create_tile_async(&key, world, overlay);
 
                 set(
                     ui,
@@ -742,11 +753,17 @@ impl VolumePane {
         }
     }
 
-    fn create_tile_async(&self, key: &TileCacheKey, world: &Volume) -> Arc<Mutex<CancellableImageFuture>> {
+    fn create_tile_async(
+        &self,
+        key: &TileCacheKey,
+        world: &Volume,
+        overlay: Option<&Volume>,
+    ) -> Arc<Mutex<CancellableImageFuture>> {
         let pane_type = self.pane_type;
         let is_segment_pane = self.is_segment_pane;
         let key_clone = key.clone();
         let shared = world.shared();
+        let overlay_shared = overlay.map(|o| o.shared());
         let is_cancelled = Arc::new(AtomicBool::new(false));
         let is_cancelled_clone = is_cancelled.clone();
 
@@ -756,7 +773,8 @@ impl VolumePane {
             }
 
             let volume_pane = VolumePane::new(pane_type, is_segment_pane);
-            let image = volume_pane.create_tile_sync(&key_clone, shared());
+            let overlay = overlay_shared.map(|c| c());
+            let image = volume_pane.create_tile_sync(&key_clone, shared(), overlay);
             Arc::new(image)
         });
 
@@ -780,7 +798,7 @@ impl VolumePane {
         }))
     }
 
-    fn create_tile_sync(&self, key: &TileCacheKey, world: Volume) -> egui::ColorImage {
+    fn create_tile_sync(&self, key: &TileCacheKey, world: Volume, overlay: Option<Volume>) -> egui::ColorImage {
         let (u_coord, v_coord, d_coord) = self.pane_type.coordinates();
 
         // Use integer paint zoom levels like the original code
@@ -823,6 +841,27 @@ impl VolumePane {
                 &key.drawing_config,
                 &mut image,
             );
+
+            // Orthographic panes apply the overlay as a second paint pass on top
+            // of the base. The segment/UV pane handles overlay inside-out via
+            // OverlayVolume wrapped around the obj base, so skip here.
+            if !self.is_segment_pane {
+                if let Some(overlay) = overlay.as_ref() {
+                    overlay.reset_for_painting();
+                    overlay.paint(
+                        tile_coord,
+                        u_coord,
+                        v_coord,
+                        d_coord,
+                        tile_width,
+                        tile_height,
+                        sfactor,
+                        paint_zoom,
+                        &key.drawing_config,
+                        &mut image,
+                    );
+                }
+            }
         }
 
         to_color_image(image)

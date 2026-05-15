@@ -3,6 +3,7 @@ mod generic;
 mod grid500;
 mod layers;
 mod objvolume;
+mod overlay;
 mod ppmvolume;
 mod transform;
 mod volume64x4;
@@ -15,6 +16,7 @@ pub use grid500::VolumeGrid500Mapped;
 pub use layers::LayersMappedVolume;
 use libm::modf;
 pub use objvolume::{ObjFile, ObjVolume, ProjectionKind};
+pub use overlay::{OverlayColoring, OverlayPaintVolume, OverlayVolume};
 pub use ppmvolume::PPMVolume;
 use std::sync::Arc;
 pub use transform::AffineTransform;
@@ -135,6 +137,14 @@ pub trait VoxelVolume {
         self.get_interpolated_slow(xyz, downsampling)
     }
 
+    fn get_color(&self, xyz: [f64; 3], downsampling: i32) -> Color32 {
+        Color32::from_gray(self.get(xyz, downsampling))
+    }
+
+    fn get_color_interpolated(&self, xyz: [f64; 3], downsampling: i32) -> Color32 {
+        Color32::from_gray(self.get_interpolated(xyz, downsampling))
+    }
+
     fn get_interpolated_slow(&self, xyz: [f64; 3], downsampling: i32) -> u8 {
         let (dx, x0) = modf(xyz[0]);
         let x1 = x0 + 1.0;
@@ -186,6 +196,16 @@ impl Image {
     }
     pub fn set_gray(&mut self, x: usize, y: usize, value: u8) {
         self.set(x, y, Color32::from_gray(value));
+    }
+    pub fn blend(&mut self, x: usize, y: usize, value: Color32, alpha: f32) {
+        let pos = &mut self.data[y * self.width + x];
+        let old = *pos;
+        *pos = Color32::from_rgba_unmultiplied(
+            (old.r() as f32 * (1.0 - alpha) + value.r() as f32 * alpha) as u8,
+            (old.g() as f32 * (1.0 - alpha) + value.g() as f32 * alpha) as u8,
+            (old.b() as f32 * (1.0 - alpha) + value.b() as f32 * alpha) as u8,
+            (old.a() as f32 * (1.0 - alpha) + value.a() as f32 * alpha) as u8,
+        );
     }
 }
 
@@ -288,6 +308,12 @@ impl VoxelVolume for Volume {
     }
     fn get_interpolated(&self, xyz: [f64; 3], downsampling: i32) -> u8 {
         self.volume.get_interpolated(xyz, downsampling)
+    }
+    fn get_color(&self, xyz: [f64; 3], downsampling: i32) -> Color32 {
+        self.volume.get_color(xyz, downsampling)
+    }
+    fn get_color_interpolated(&self, xyz: [f64; 3], downsampling: i32) -> Color32 {
+        self.volume.get_color_interpolated(xyz, downsampling)
     }
     fn reset_for_painting(&self) {
         self.volume.reset_for_painting();

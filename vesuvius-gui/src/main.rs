@@ -6,7 +6,7 @@ use vesuvius_rs::catalog::load_catalog;
 
 use clap::Parser;
 use vesuvius_rs::model::{NewVolumeReference, VolumeReference};
-use vesuvius_rs::volume::{AffineTransform, ProjectionKind};
+use vesuvius_rs::volume::{AffineTransform, OverlayColoring, ProjectionKind};
 
 /// Vesuvius GUI, an app to visualize and explore 3D data of the Vesuvius Challenge (https://scrollprize.org)
 #[derive(Parser, Debug)]
@@ -44,6 +44,13 @@ pub struct Args {
     /// A directory that contains data to overlay. Only zarr arrays are currently supported
     #[clap(short, long)]
     overlay: Option<String>,
+
+    /// Coloring of the overlay volume. Forms:
+    ///   - `four-colors[:ALPHA]`     (default ALPHA=0.4) values 1-4 → red/green/yellow/blue
+    ///   - `boolean:#RRGGBB[:ALPHA]` (default ALPHA=0.4) value 255 → given color
+    ///   - `hue:DEG[:ALPHA]`         (default ALPHA=0.4) value → HSV(DEG, 1, value/255)
+    #[clap(long, value_parser = parse_overlay_coloring)]
+    overlay_coloring: Option<OverlayColoring>,
 
     /// The id of a volume to open, URL to a zarr/ome-zarr volume, or local path to zarr/ome-zarr directory
     #[clap(short, long)]
@@ -132,9 +139,63 @@ impl TryFrom<Args> for VesuviusConfig {
             data_dir: args.data_directory,
             obj_file,
             overlay_dir: args.overlay,
+            overlay_coloring: args.overlay_coloring,
             volume,
         })
     }
+}
+
+fn parse_overlay_coloring(s: &str) -> Result<OverlayColoring, String> {
+    let mut parts = s.split(':');
+    let kind = parts.next().ok_or("empty overlay coloring spec".to_string())?;
+    match kind {
+        "four-colors" => {
+            let alpha = parts.next().map(parse_alpha).transpose()?.unwrap_or(0.4);
+            Ok(OverlayColoring::FourColors { alpha })
+        }
+        "boolean" => {
+            let color_hex = parts.next().ok_or("boolean: needs #RRGGBB color".to_string())?;
+            let color = parse_hex_color(color_hex)?;
+            let alpha = parts.next().map(parse_alpha).transpose()?.unwrap_or(0.4);
+            Ok(OverlayColoring::Boolean { color, alpha })
+        }
+        "hue" => {
+            let hue_deg = parts
+                .next()
+                .ok_or("hue: needs DEG".to_string())?
+                .parse::<f32>()
+                .map_err(|e| format!("invalid hue degrees: {}", e))?;
+            let alpha = parts.next().map(parse_alpha).transpose()?.unwrap_or(0.4);
+            Ok(OverlayColoring::Hue { hue_deg, alpha })
+        }
+        other => Err(format!(
+            "unknown overlay coloring `{}` (expected four-colors / boolean / hue)",
+            other
+        )),
+    }
+}
+
+fn parse_alpha(s: &str) -> Result<f32, String> {
+    s.parse::<f32>()
+        .map_err(|e| format!("invalid alpha `{}`: {}", s, e))
+        .and_then(|a| {
+            if (0.0..=1.0).contains(&a) {
+                Ok(a)
+            } else {
+                Err(format!("alpha must be in [0, 1], got {}", a))
+            }
+        })
+}
+
+fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 {
+        return Err(format!("expected #RRGGBB, got `{}`", s));
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).map_err(|e| e.to_string())?;
+    let g = u8::from_str_radix(&hex[2..4], 16).map_err(|e| e.to_string())?;
+    let b = u8::from_str_radix(&hex[4..6], 16).map_err(|e| e.to_string())?;
+    Ok([r, g, b])
 }
 
 // When compiling natively:

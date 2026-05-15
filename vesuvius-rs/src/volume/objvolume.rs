@@ -1018,19 +1018,28 @@ impl PaintVolume for ObjVolume {
                                             (nx, ny, nz)
                                         };
 
-                                        let value = if !composite {
+                                        if !composite {
                                             let x = x + w_factor * nx;
                                             let y = y + w_factor * ny;
                                             let z = z + w_factor * nz;
 
-                                            if config.trilinear_interpolation {
-                                                volume.get_interpolated(
+                                            let color = if config.trilinear_interpolation {
+                                                volume.get_color_interpolated(
                                                     [x / ffactor, y / ffactor, z / ffactor],
                                                     sfactor as i32,
                                                 )
                                             } else {
-                                                volume.get([x / ffactor, y / ffactor, z / ffactor], sfactor as i32)
-                                            }
+                                                volume.get_color(
+                                                    [x / ffactor, y / ffactor, z / ffactor],
+                                                    sfactor as i32,
+                                                )
+                                            };
+
+                                            buffer.set(
+                                                u as usize / paint_zoom as usize,
+                                                v as usize / paint_zoom as usize,
+                                                color,
+                                            );
                                         } else {
                                             composition.reset();
                                             let start = xyz[2] + composite_direction * composite_layers_in_front;
@@ -1061,14 +1070,13 @@ impl PaintVolume for ObjVolume {
 
                                                 w += step;
                                             }
-                                            composition.result(composite_total_layers as u32)
-                                        };
-
-                                        buffer.set_gray(
-                                            u as usize / paint_zoom as usize,
-                                            v as usize / paint_zoom as usize,
-                                            value,
-                                        );
+                                            let value = composition.result(composite_total_layers as u32);
+                                            buffer.set_gray(
+                                                u as usize / paint_zoom as usize,
+                                                v as usize / paint_zoom as usize,
+                                                value,
+                                            );
+                                        }
 
                                         if draw_outlines {
                                             if (x - real_xyz[0] as f64).abs() < 2.0 {
