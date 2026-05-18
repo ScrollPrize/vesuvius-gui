@@ -1,4 +1,4 @@
-use crate::gui::{FrameBudget, PaneType, VolumePane, FRAME_POLL_BUDGET_MS, UV_PANE_BUDGET_FRACTION};
+use crate::gui::{FrameBudget, PaneType, VolumePane, UV_PANE_BUDGET_FRACTION};
 use directories::BaseDirs;
 use egui::CollapsingHeader;
 use egui::Color32;
@@ -167,6 +167,7 @@ pub struct TemplateApp {
     layout: GuiLayout,
     #[serde(skip)]
     pending_volume_switch: Option<String>,
+    target_fps: u32,
 }
 
 impl Default for TemplateApp {
@@ -203,6 +204,7 @@ impl Default for TemplateApp {
             catalog_panel_open: true,
             layout: GuiLayout::Grid,
             pending_volume_switch: None,
+            target_fps: 20,
         }
     }
 }
@@ -1271,9 +1273,21 @@ impl TemplateApp {
                     1.0 / (_frame.info().cpu_usage.unwrap_or_default() + 1e-6)
                 ));
             });
+
+            ui.horizontal(|ui| {
+                let tooltip = "Caps the wall-clock time spent waiting for tile renders each frame \
+                    (budget = 1s / target FPS).\n\n\
+                    Higher FPS → smaller budget → snappy panning/zooming, but tiles flash blank \
+                    for a few frames before they're ready.\n\
+                    Lower FPS → larger budget → tiles appear immediately without flashing, but the \
+                    UI thread can stutter while waiting on slow tile loads.";
+                ui.label("Target").on_hover_text(tooltip);
+                ui.add(egui::Slider::new(&mut self.target_fps, 1..=60).suffix(" FPS"))
+                    .on_hover_text(tooltip);
+            });
         });
 
-        let frame_target = Duration::from_millis(FRAME_POLL_BUDGET_MS);
+        let frame_target = Duration::from_secs_f64(1.0 / self.target_fps.max(1) as f64);
         let budget = FrameBudget::new(frame_target);
         let segment_mode = self.is_segment_mode();
         let (xs_share, uv_share) = match self.layout {

@@ -2,12 +2,14 @@ use crate::gui::app::{ZOOM_MAX, ZOOM_MIN};
 use egui::cache::FramePublisher;
 use egui::{Color32, ColorImage, PointerButton, Response, Ui, Vec2};
 use fxhash::FxBuildHasher;
+use std::cell::Cell;
 use std::hash::BuildHasher;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use vesuvius_rs::volume::{DrawingConfig, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
 
 const ZOOM_RES_FACTOR: f32 = 1.;
@@ -21,6 +23,85 @@ const TILE_TTL_JITTER_MS: u64 = 500;
 const TILE_TTL_BACKOFF_MULTIPLIER: u64 = 2;
 // Maximum TTL backoff factor
 const TILE_TTL_MAX_BACKOFF: u64 = 16;
+
+// Threshold below which we stop polling for the rest of the frame.
+const MIN_POLL_DURATION: Duration = Duration::from_micros(500);
+// Share of the frame budget reserved for the UV/surface pane when it is visible.
+pub const UV_PANE_BUDGET_FRACTION: f32 = 0.75;
+
+/// Tracks per-frame polling budget for `VolumePane` tile loads.
+///
+/// One instance is constructed at the start of each egui frame and shared across
+/// every pane drawn in that frame. Each tile poll is capped at half of the
+/// pane's remaining time, and once the global remaining time drops below
+/// `MIN_POLL_DURATION` the `poll_disabled` latch trips and all further polling
+/// is skipped for this frame.
+pub struct FrameBudget {
+    frame_deadline: quanta::Instant,
+    pane_deadline: Cell<quanta::Instant>,
+    poll_disabled: Cell<bool>,
+}
+
+impl FrameBudget {
+    pub fn new(target: Duration) -> Self {
+        let frame_deadline = quanta::Instant::now() + target;
+        Self {
+            frame_deadline,
+            pane_deadline: Cell::new(frame_deadline),
+            poll_disabled: Cell::new(false),
+        }
+    }
+
+    /// Allocate this pane's share of the remaining frame budget. Capped by the
+    /// global frame deadline.
+    pub fn begin_pane(&self, allotted: Duration) {
+        let now = quanta::Instant::now();
+        let pane = now + allotted;
+        let cap = if pane < self.frame_deadline {
+            pane
+        } else {
+            self.frame_deadline
+        };
+        self.pane_deadline.set(cap);
+    }
+
+    /// Returns the timeout to use for a single tile poll, or `None` if the
+    /// remaining time is too small. Once `None` is returned because the global
+    /// deadline is past, `poll_disabled` latches so subsequent calls short-circuit.
+    pub fn next_poll_timeout(&self) -> Option<Duration> {
+        if self.poll_disabled.get() {
+            return None;
+        }
+        let now = quanta::Instant::now();
+        if now >= self.frame_deadline {
+            self.poll_disabled.set(true);
+            return None;
+        }
+        let remaining_pane = self.pane_deadline.get().saturating_duration_since(now);
+        if remaining_pane < MIN_POLL_DURATION {
+            return None;
+        }
+        let remaining_global = self.frame_deadline.saturating_duration_since(now);
+        let timeout = (remaining_pane / 2).min(remaining_global);
+        if timeout < MIN_POLL_DURATION {
+            return None;
+        }
+        Some(timeout)
+    }
+
+    /// Cheap check for short non-blocking polls (e.g. the 100µs recalc peek):
+    /// allow only while we are still within the global frame deadline.
+    pub fn polling_allowed(&self) -> bool {
+        if self.poll_disabled.get() {
+            return false;
+        }
+        if quanta::Instant::now() >= self.frame_deadline {
+            self.poll_disabled.set(true);
+            return false;
+        }
+        true
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TileCacheKey {
@@ -334,9 +415,13 @@ impl VolumePane {
         segment_outlines_coord: Option<[i32; 3]>,
         ranges: &[RangeInclusive<i32>; 3],
         cell_size: Vec2,
+        budget: &FrameBudget,
+        pane_share: Duration,
     ) -> bool {
         let frame_width = cell_size.x as usize;
         let frame_height = cell_size.y as usize;
+
+        budget.begin_pane(pane_share);
 
         // Get or create tiles
         let tiles = self.get_or_create_tiles(
@@ -350,6 +435,7 @@ impl VolumePane {
             drawing_config,
             extra_resolutions,
             segment_outlines_coord,
+            budget,
         );
 
         // Allocate space for this pane using the proper egui pattern
@@ -491,6 +577,7 @@ impl VolumePane {
         drawing_config: &DrawingConfig,
         extra_resolutions: u32,
         segment_outlines_coord: Option<[i32; 3]>,
+        budget: &FrameBudget,
     ) -> Vec<(egui::TextureHandle, egui::Rect)> {
         let visible_tiles = self.calculate_visible_tiles(coord, zoom, frame_width, frame_height);
         let paint_zoom = if zoom >= 1.0 {
@@ -525,11 +612,9 @@ impl VolumePane {
             self.ensure_tile_async(ui, key.clone(), world, overlay);
         }
 
-        let millis = 50; //if self.pane_type == PaneType::UV { 10 } else { 20 };
-        let timeout = std::time::Duration::from_millis(millis);
         let mut ready_tiles = Vec::new();
         for (key, tile_rect) in keys_and_rects {
-            if let Some(texture) = self.get_or_create_tile_async(ui, key, world, overlay, timeout) {
+            if let Some(texture) = self.get_or_create_tile_async(ui, key, world, overlay, budget) {
                 ready_tiles.push((texture, tile_rect));
             }
         }
@@ -571,7 +656,7 @@ impl VolumePane {
         key: TileCacheKey,
         world: &Volume,
         overlay: Option<&Volume>,
-        timeout: std::time::Duration,
+        budget: &FrameBudget,
     ) -> Option<egui::TextureHandle> {
         // Calculate paint_zoom for cache key (same logic as in create_tile)
 
@@ -632,9 +717,25 @@ impl VolumePane {
                 content_hash,
                 backoff_factor,
             }) => {
+                // Skip the recalc peek entirely if the frame deadline is gone.
+                if !budget.polling_allowed() {
+                    set(
+                        ui,
+                        key,
+                        AsyncTexture::ReadyRecalculating {
+                            texture: texture.clone(),
+                            future,
+                            cached_at,
+                            content_hash,
+                            backoff_factor,
+                        },
+                    );
+                    ui.ctx().request_repaint();
+                    return Some(texture);
+                }
                 // Poll the recalculation future briefly (non-blocking check)
                 // Use minimal timeout since we don't want to block UI
-                match poll_tile_future(future.clone(), std::time::Duration::from_micros(100)) {
+                match poll_tile_future(future.clone(), Duration::from_micros(100)) {
                     Poll::Ready(new_image) => {
                         // Calculate hash of new image to check if content changed
                         let new_hash = hash_image(new_image.as_ref());
@@ -691,7 +792,14 @@ impl VolumePane {
             }
 
             Some(AsyncTexture::Loading { future, started_at }) => {
-                // Poll until timeout (from function parameter, typically 50ms)
+                // Pull this tile's poll timeout from the frame budget. If the
+                // budget has run out for this frame, skip polling entirely and
+                // try again next frame.
+                let Some(timeout) = budget.next_poll_timeout() else {
+                    set(ui, key, AsyncTexture::Loading { future, started_at });
+                    ui.ctx().request_repaint();
+                    return None;
+                };
                 match poll_tile_future(future.clone(), timeout) {
                     Poll::Ready(image) => {
                         let content_hash = hash_image(image.as_ref());
