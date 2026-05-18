@@ -1,7 +1,6 @@
 use crate::volume::PaintVolume;
 use ecolor::Color32;
 use memmap::MmapOptions;
-use vesuvius_zarr::{ZarrArray, ZarrContext, ZarrContextBase};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -11,6 +10,7 @@ use std::{
         Mutex,
     },
 };
+use vesuvius_zarr::{ZarrArray, ZarrContext, ZarrContextBase};
 
 #[allow(dead_code)]
 struct SparsePointCloud {

@@ -163,7 +163,11 @@ pub struct OverlayVolume {
 
 impl OverlayVolume {
     pub fn new(base: Volume, overlay: Volume, coloring: OverlayColoring) -> Self {
-        Self { base, overlay, coloring }
+        Self {
+            base,
+            overlay,
+            coloring,
+        }
     }
 }
 
@@ -211,10 +215,28 @@ impl PaintVolume for OverlayVolume {
         buffer: &mut Image,
     ) {
         self.base.paint(
-            xyz, u_coord, v_coord, plane_coord, width, height, sfactor, paint_zoom, config, buffer,
+            xyz,
+            u_coord,
+            v_coord,
+            plane_coord,
+            width,
+            height,
+            sfactor,
+            paint_zoom,
+            config,
+            buffer,
         );
         OverlayPaintVolume::new(self.overlay.clone(), self.coloring).paint(
-            xyz, u_coord, v_coord, plane_coord, width, height, sfactor, paint_zoom, config, buffer,
+            xyz,
+            u_coord,
+            v_coord,
+            plane_coord,
+            width,
+            height,
+            sfactor,
+            paint_zoom,
+            config,
+            buffer,
         );
     }
 

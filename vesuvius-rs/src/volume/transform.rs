@@ -64,16 +64,8 @@ impl AffineTransform {
     }
 
     pub fn transform_point(&self, point: [i32; 3]) -> [i32; 3] {
-        let result = self.transform_point_f64([
-            point[0] as f64,
-            point[1] as f64,
-            point[2] as f64,
-        ]);
-        [
-            result[0] as i32,
-            result[1] as i32,
-            result[2] as i32,
-        ]
+        let result = self.transform_point_f64([point[0] as f64, point[1] as f64, point[2] as f64]);
+        [result[0] as i32, result[1] as i32, result[2] as i32]
     }
 
     /// Invert this affine transformation matrix

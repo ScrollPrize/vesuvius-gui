@@ -152,12 +152,22 @@ impl SimpleDownloader {
                                             *state.lock().unwrap() = DownloadState::Done;
                                             let _ = notifier.send((x, y, z, quality));
                                         } else if res.status == 420 {
-                                            log::warn!("delayed tile {}/{}/{} q{}", x, y, z, quality.downsampling_factor);
+                                            log::warn!(
+                                                "delayed tile {}/{}/{} q{}",
+                                                x,
+                                                y,
+                                                z,
+                                                quality.downsampling_factor
+                                            );
                                             *state.lock().unwrap() = DownloadState::Delayed;
                                         } else {
                                             log::warn!(
                                                 "failed to download tile {}/{}/{} q{}: {}",
-                                                x, y, z, quality.downsampling_factor, res.status
+                                                x,
+                                                y,
+                                                z,
+                                                quality.downsampling_factor,
+                                                res.status
                                             );
                                             *state.lock().unwrap() = DownloadState::Failed;
                                         }

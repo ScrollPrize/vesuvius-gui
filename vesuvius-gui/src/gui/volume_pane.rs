@@ -1,5 +1,4 @@
 use crate::gui::app::{ZOOM_MAX, ZOOM_MIN};
-use vesuvius_rs::volume::{DrawingConfig, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
 use egui::cache::FramePublisher;
 use egui::{Color32, ColorImage, PointerButton, Response, Ui, Vec2};
 use fxhash::FxBuildHasher;
@@ -9,6 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use vesuvius_rs::volume::{DrawingConfig, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
 
 const ZOOM_RES_FACTOR: f32 = 1.;
 const TILE_SIZE: usize = 256;

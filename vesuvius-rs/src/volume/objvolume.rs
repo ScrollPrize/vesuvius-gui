@@ -424,7 +424,13 @@ impl ObjFile {
 /// non-triangle primitives, and packs VTN indices into a 36-byte `Triangle` (vs ~176 B
 /// for `wavefront_obj::Shape`). The original `Object` is consumed and freed at the end.
 fn extract_compact(object: Object) -> (Vec<Vertex>, Vec<Vertex>, Vec<TVertex>, Vec<Triangle>) {
-    let Object { vertices, normals, tex_vertices, geometry, .. } = object;
+    let Object {
+        vertices,
+        normals,
+        tex_vertices,
+        geometry,
+        ..
+    } = object;
     let shapes = geometry.into_iter().next().map(|g| g.shapes).unwrap_or_default();
     let mut triangles = Vec::with_capacity(shapes.len());
     for s in shapes {
@@ -1029,10 +1035,8 @@ impl PaintVolume for ObjVolume {
                                                     sfactor as i32,
                                                 )
                                             } else {
-                                                volume.get_color(
-                                                    [x / ffactor, y / ffactor, z / ffactor],
-                                                    sfactor as i32,
-                                                )
+                                                volume
+                                                    .get_color([x / ffactor, y / ffactor, z / ffactor], sfactor as i32)
                                             };
 
                                             buffer.set(

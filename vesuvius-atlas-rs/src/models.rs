@@ -1,7 +1,7 @@
-use vesuvius_rs::remap_config::RemapConfig;
-use vesuvius_rs::volume::AffineTransform;
 use serde::Deserialize;
 use std::collections::HashMap;
+use vesuvius_rs::remap_config::RemapConfig;
+use vesuvius_rs::volume::AffineTransform;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccessRoot {
@@ -261,8 +261,7 @@ fn get_standard_url(data: &[DataEntry], data_type: &str) -> Option<String> {
                             origin.path.trim_start_matches('/')
                         ));
                     }
-                    if let Some(rewritten) =
-                        RemapConfig::get().rewrite_atlas_url(&access_root.usage, &access_root.url)
+                    if let Some(rewritten) = RemapConfig::get().rewrite_atlas_url(&access_root.usage, &access_root.url)
                     {
                         return Some(format!(
                             "{}/{}",
