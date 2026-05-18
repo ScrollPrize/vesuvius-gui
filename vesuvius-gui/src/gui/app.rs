@@ -1,4 +1,4 @@
-use crate::gui::{PaneType, VolumePane};
+use crate::gui::{FrameBudget, PaneType, VolumePane, FRAME_POLL_BUDGET_MS, UV_PANE_BUDGET_FRACTION};
 use directories::BaseDirs;
 use egui::CollapsingHeader;
 use egui::Color32;
@@ -15,6 +15,7 @@ use std::ops::RangeInclusive;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::Duration;
 use vesuvius_atlas_rs::{AtlasMetadata, AtlasSample};
 use vesuvius_rs::catalog::obj_repository::ObjRepository;
 use vesuvius_rs::catalog::Catalog;
@@ -1272,6 +1273,19 @@ impl TemplateApp {
             });
         });
 
+        let frame_target = Duration::from_millis(FRAME_POLL_BUDGET_MS);
+        let budget = FrameBudget::new(frame_target);
+        let segment_mode = self.is_segment_mode();
+        let (xs_share, uv_share) = match self.layout {
+            GuiLayout::Grid if segment_mode => (
+                frame_target.mul_f32((1.0 - UV_PANE_BUDGET_FRACTION) / 3.0),
+                frame_target.mul_f32(UV_PANE_BUDGET_FRACTION),
+            ),
+            GuiLayout::Grid => (frame_target.div_f32(3.0), Duration::ZERO),
+            GuiLayout::XY | GuiLayout::XZ | GuiLayout::YZ => (frame_target, Duration::ZERO),
+            GuiLayout::UV => (Duration::ZERO, frame_target),
+        };
+
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.layout {
                 GuiLayout::Grid => {
@@ -1282,36 +1296,36 @@ impl TemplateApp {
 
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            self.render_pane(ui, cell_size, Self::XY_PANE);
+                            self.render_pane(ui, cell_size, Self::XY_PANE, &budget, xs_share);
 
                             ui.add_space(2.0);
 
-                            self.render_pane(ui, cell_size, Self::XZ_PANE);
+                            self.render_pane(ui, cell_size, Self::XZ_PANE, &budget, xs_share);
                         });
 
                         ui.add_space(2.0);
 
                         ui.horizontal(|ui| {
-                            self.render_pane(ui, cell_size, Self::YZ_PANE);
+                            self.render_pane(ui, cell_size, Self::YZ_PANE, &budget, xs_share);
 
                             ui.add_space(2.0);
 
-                            self.render_uv_pane(ui, cell_size);
+                            self.render_uv_pane(ui, cell_size, &budget, uv_share);
                         });
                     });
                 }
                 GuiLayout::XY => {
-                    self.render_pane(ui, ui.available_size(), Self::XY_PANE);
+                    self.render_pane(ui, ui.available_size(), Self::XY_PANE, &budget, xs_share);
                 }
                 GuiLayout::XZ => {
-                    self.render_pane(ui, ui.available_size(), Self::XZ_PANE);
+                    self.render_pane(ui, ui.available_size(), Self::XZ_PANE, &budget, xs_share);
                 }
                 GuiLayout::YZ => {
-                    self.render_pane(ui, ui.available_size(), Self::YZ_PANE);
+                    self.render_pane(ui, ui.available_size(), Self::YZ_PANE, &budget, xs_share);
                 }
                 GuiLayout::UV => {
                     if self.is_segment_mode() {
-                        self.render_uv_pane(ui, ui.available_size());
+                        self.render_uv_pane(ui, ui.available_size(), &budget, uv_share);
                     } else {
                         ui.label("UV pane is only available in segment mode.");
                     }
@@ -1324,7 +1338,14 @@ impl TemplateApp {
     const XZ_PANE: VolumePane = VolumePane::new(PaneType::XZ, false);
     const YZ_PANE: VolumePane = VolumePane::new(PaneType::YZ, false);
     const UV_PANE: VolumePane = VolumePane::new(PaneType::UV, true);
-    fn render_pane(&mut self, ui: &mut Ui, cell_size: Vec2, pane: VolumePane) {
+    fn render_pane(
+        &mut self,
+        ui: &mut Ui,
+        cell_size: Vec2,
+        pane: VolumePane,
+        budget: &FrameBudget,
+        pane_share: Duration,
+    ) {
         let segment_outlines_coord = if self.is_segment_mode() {
             Some(self.segment_mode.as_ref().unwrap().coord)
         } else {
@@ -1345,9 +1366,11 @@ impl TemplateApp {
             segment_outlines_coord,
             &self.ranges,
             cell_size,
+            budget,
+            pane_share,
         );
     }
-    fn render_uv_pane(&mut self, ui: &mut Ui, cell_size: Vec2) {
+    fn render_uv_pane(&mut self, ui: &mut Ui, cell_size: Vec2, budget: &FrameBudget, pane_share: Duration) {
         if let Some(segment_mode) = self.segment_mode.as_mut() {
             if Self::UV_PANE.render(
                 ui,
@@ -1361,6 +1384,8 @@ impl TemplateApp {
                 None,
                 &segment_mode.ranges,
                 cell_size,
+                budget,
+                pane_share,
             ) {
                 if self.should_sync_coords() {
                     self.sync_coords();
