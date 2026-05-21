@@ -467,38 +467,31 @@ impl UnifiedVolume {
             debug_assert!(run >= 1);
 
             let mmap = unsafe { b.mmap_slice() };
-            // Compute the in-chunk integer coordinate + fractional residue
-            // once at run entry, then carry them forward incrementally.
-            // This removes the per-sample f64→u64 conversion and the
-            // `cx as f64` round-trip the trilerp lattice needs.
+            // Inner-loop position in Q32.32 fixed-point: high 32 bits are
+            // the integer voxel coord, low 32 are the fraction. The
+            // per-sample advance becomes one `add` per axis (vs f64
+            // `add + branch + conditional sub` for the carry) and weight
+            // extraction becomes one shift+mask (vs `(fx * 256.0) as u32`,
+            // which is mulsd + cvttsd2si). dx_q etc. are precomputed once
+            // per chunk-bound run.
             //
-            // For |d| ≤ 1 (unit normals after the caller's optional
-            // ffactor divide) the per-step integer delta is in {-1, 0, 1}.
-            // We branch on fract carry instead of recomputing floor.
-            let mut cx = unsafe { px.to_int_unchecked::<u64>() };
-            let mut cy = unsafe { py.to_int_unchecked::<u64>() };
-            let mut cz = unsafe { pz.to_int_unchecked::<u64>() };
-            let mut fx = px - cx as f64;
-            let mut fy = py - cy as f64;
-            let mut fz = pz - cz as f64;
-
-            // Bail out to per-sample if any direction is too aggressive.
-            // run_length_1d ensured we stay in the chunk, but the
-            // incremental carry only handles single-step crossings.
-            if dx.abs() > 1.0 || dy.abs() > 1.0 || dz.abs() > 1.0 {
-                let v = self.interpolate_u8([px, py, pz], downsampling);
-                if v > acc {
-                    acc = v;
-                }
-                px += dx;
-                py += dy;
-                pz += dz;
-                remaining -= 1;
-                continue;
-            }
+            // The conversion `(px * Q32) as i64` is exact for any position
+            // up to ~2^31 voxels, which is well beyond any realistic
+            // volume. Likewise dx_q for normalized unit-vector directions
+            // stays within ±2^32.
+            const Q32_F: f64 = 4294967296.0; // 2^32
+            let mut posx = unsafe { (px * Q32_F).to_int_unchecked::<i64>() };
+            let mut posy = unsafe { (py * Q32_F).to_int_unchecked::<i64>() };
+            let mut posz = unsafe { (pz * Q32_F).to_int_unchecked::<i64>() };
+            let dx_q = unsafe { (dx * Q32_F).to_int_unchecked::<i64>() };
+            let dy_q = unsafe { (dy * Q32_F).to_int_unchecked::<i64>() };
+            let dz_q = unsafe { (dz * Q32_F).to_int_unchecked::<i64>() };
 
             unsafe {
                 for _ in 0..run {
+                    let cx = (posx >> 32) as u64;
+                    let cy = (posy >> 32) as u64;
+                    let cz = (posz >> 32) as u64;
                     let tx = (cx & 63) as usize;
                     let ty = (cy & 63) as usize;
                     let tz = (cz & 63) as usize;
@@ -511,48 +504,30 @@ impl UnifiedVolume {
                     let p101 = *mmap.get_unchecked(idx + 64 * 64 + 1);
                     let p011 = *mmap.get_unchecked(idx + 64 * 64 + 64);
                     let p111 = *mmap.get_unchecked(idx + 64 * 64 + 65);
+                    // Q0.8 weight = the byte just above the fractional MSB.
+                    let fx_q8 = ((posx >> 24) & 0xFF) as u32;
+                    let fy_q8 = ((posy >> 24) & 0xFF) as u32;
+                    let fz_q8 = ((posz >> 24) & 0xFF) as u32;
                     let v = trilerp_q8(
-                        frac_q8(fx),
-                        frac_q8(fy),
-                        frac_q8(fz),
+                        fx_q8,
+                        fy_q8,
+                        fz_q8,
                         [p000, p100, p010, p110, p001, p101, p011, p111],
                     );
                     if v > acc {
                         acc = v;
                     }
-
-                    // Incremental advance.
-                    fx += dx;
-                    if fx >= 1.0 {
-                        fx -= 1.0;
-                        cx += 1;
-                    } else if fx < 0.0 {
-                        fx += 1.0;
-                        cx = cx.wrapping_sub(1);
-                    }
-                    fy += dy;
-                    if fy >= 1.0 {
-                        fy -= 1.0;
-                        cy += 1;
-                    } else if fy < 0.0 {
-                        fy += 1.0;
-                        cy = cy.wrapping_sub(1);
-                    }
-                    fz += dz;
-                    if fz >= 1.0 {
-                        fz -= 1.0;
-                        cz += 1;
-                    } else if fz < 0.0 {
-                        fz += 1.0;
-                        cz = cz.wrapping_sub(1);
-                    }
+                    posx = posx.wrapping_add(dx_q);
+                    posy = posy.wrapping_add(dy_q);
+                    posz = posz.wrapping_add(dz_q);
                 }
             }
-            // Sync the float trackers back to the canonical state for the
-            // outer loop's chunk-resolution and run-length math.
-            px = cx as f64 + fx;
-            py = cy as f64 + fy;
-            pz = cz as f64 + fz;
+            // Sync back to f64 for the outer loop. i64 < 2^52 → f64 cast is
+            // exact; division by 2^32 is exact (exponent-only).
+            const INV_Q32: f64 = 1.0 / 4294967296.0;
+            px = posx as f64 * INV_Q32;
+            py = posy as f64 * INV_Q32;
+            pz = posz as f64 * INV_Q32;
             remaining -= run;
         }
         acc
