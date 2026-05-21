@@ -259,20 +259,20 @@ impl UnifiedVolume {
                 // check is purely about `cx0 + 1` crossing into the next
                 // coarse chunk.
                 let fast = (cx0 & 63) != 63 && (cy0 & 63) != 63 && (cz0 & 63) != 63;
-                let ps = if fast {
+                let ps: [u8; 8] = if fast {
                     let tx = (cx0 & 63) as usize;
                     let ty = (cy0 & 63) as usize;
                     let tz = (cz0 & 63) as usize;
                     let idx = tz * 64 * 64 + ty * 64 + tx;
                     [
-                        mmap[idx] as f64,
-                        mmap[idx + 1] as f64,
-                        mmap[idx + 64] as f64,
-                        mmap[idx + 65] as f64,
-                        mmap[idx + 64 * 64] as f64,
-                        mmap[idx + 64 * 64 + 1] as f64,
-                        mmap[idx + 64 * 64 + 64] as f64,
-                        mmap[idx + 64 * 64 + 65] as f64,
+                        mmap[idx],
+                        mmap[idx + 1],
+                        mmap[idx + 64],
+                        mmap[idx + 65],
+                        mmap[idx + 64 * 64],
+                        mmap[idx + 64 * 64 + 1],
+                        mmap[idx + 64 * 64 + 64],
+                        mmap[idx + 64 * 64 + 65],
                     ]
                 } else {
                     // +1 corner crosses into a neighboring coarse chunk.
@@ -286,17 +286,17 @@ impl UnifiedVolume {
                     let cy0f = cy0 as f64;
                     let cz0f = cz0 as f64;
                     [
-                        self.get([cx0f, cy0f, cz0f], ds) as f64,
-                        self.get([cx0f + 1.0, cy0f, cz0f], ds) as f64,
-                        self.get([cx0f, cy0f + 1.0, cz0f], ds) as f64,
-                        self.get([cx0f + 1.0, cy0f + 1.0, cz0f], ds) as f64,
-                        self.get([cx0f, cy0f, cz0f + 1.0], ds) as f64,
-                        self.get([cx0f + 1.0, cy0f, cz0f + 1.0], ds) as f64,
-                        self.get([cx0f, cy0f + 1.0, cz0f + 1.0], ds) as f64,
-                        self.get([cx0f + 1.0, cy0f + 1.0, cz0f + 1.0], ds) as f64,
+                        self.get([cx0f, cy0f, cz0f], ds),
+                        self.get([cx0f + 1.0, cy0f, cz0f], ds),
+                        self.get([cx0f, cy0f + 1.0, cz0f], ds),
+                        self.get([cx0f + 1.0, cy0f + 1.0, cz0f], ds),
+                        self.get([cx0f, cy0f, cz0f + 1.0], ds),
+                        self.get([cx0f + 1.0, cy0f, cz0f + 1.0], ds),
+                        self.get([cx0f, cy0f + 1.0, cz0f + 1.0], ds),
+                        self.get([cx0f + 1.0, cy0f + 1.0, cz0f + 1.0], ds),
                     ]
                 };
-                trilerp(cdx, cdy, cdz, ps)
+                trilerp_q8(frac_q8(cdx), frac_q8(cdy), frac_q8(cdz), ps)
             }
             None => 0, // Empty
         };
@@ -503,15 +503,20 @@ impl UnifiedVolume {
                     let ty = (cy & 63) as usize;
                     let tz = (cz & 63) as usize;
                     let idx = tz * 64 * 64 + ty * 64 + tx;
-                    let p000 = *mmap.get_unchecked(idx) as f64;
-                    let p100 = *mmap.get_unchecked(idx + 1) as f64;
-                    let p010 = *mmap.get_unchecked(idx + 64) as f64;
-                    let p110 = *mmap.get_unchecked(idx + 65) as f64;
-                    let p001 = *mmap.get_unchecked(idx + 64 * 64) as f64;
-                    let p101 = *mmap.get_unchecked(idx + 64 * 64 + 1) as f64;
-                    let p011 = *mmap.get_unchecked(idx + 64 * 64 + 64) as f64;
-                    let p111 = *mmap.get_unchecked(idx + 64 * 64 + 65) as f64;
-                    let v = trilerp(fx, fy, fz, [p000, p100, p010, p110, p001, p101, p011, p111]);
+                    let p000 = *mmap.get_unchecked(idx);
+                    let p100 = *mmap.get_unchecked(idx + 1);
+                    let p010 = *mmap.get_unchecked(idx + 64);
+                    let p110 = *mmap.get_unchecked(idx + 65);
+                    let p001 = *mmap.get_unchecked(idx + 64 * 64);
+                    let p101 = *mmap.get_unchecked(idx + 64 * 64 + 1);
+                    let p011 = *mmap.get_unchecked(idx + 64 * 64 + 64);
+                    let p111 = *mmap.get_unchecked(idx + 64 * 64 + 65);
+                    let v = trilerp_q8(
+                        frac_q8(fx),
+                        frac_q8(fy),
+                        frac_q8(fz),
+                        [p000, p100, p010, p110, p001, p101, p011, p111],
+                    );
                     if v > acc {
                         acc = v;
                     }
@@ -716,32 +721,51 @@ fn sample_boundary_1axis(
 
     // Re-order into the canonical (p000, p100, p010, p110, p001, p101, p011, p111).
     // Above we built ordered groups per axis; map back here.
-    let p = if bx {
-        [h0 as f64, n0 as f64, h1 as f64, n1 as f64, h2 as f64, n2 as f64, h3 as f64, n3 as f64]
+    let p: [u8; 8] = if bx {
+        [h0, n0, h1, n1, h2, n2, h3, n3]
     } else if by {
-        [h0 as f64, h1 as f64, n0 as f64, n1 as f64, h2 as f64, h3 as f64, n2 as f64, n3 as f64]
+        [h0, h1, n0, n1, h2, h3, n2, n3]
     } else {
-        [h0 as f64, h1 as f64, h2 as f64, h3 as f64, n0 as f64, n1 as f64, n2 as f64, n3 as f64]
+        [h0, h1, h2, h3, n0, n1, n2, n3]
     };
 
     let fx = px - txu as f64;
     let fy = py - tyu as f64;
     let fz = pz - tzu as f64;
-    trilerp(fx, fy, fz, p)
+    trilerp_q8(frac_q8(fx), frac_q8(fy), frac_q8(fz), p)
 }
 
-/// Trilinear blend of 8 corner samples ordered (p000, p100, p010, p110,
-/// p001, p101, p011, p111) where bits encode (z, y, x) offsets of 0/1.
+/// Trilinear blend of 8 u8 corner samples ordered (p000, p100, p010, p110,
+/// p001, p101, p011, p111), where bits encode (z, y, x) offsets of 0/1.
+///
+/// Weights are Q0.8 (`0..=256` represents `0..=1.0`). Output is u8 with
+/// truncate-toward-zero semantics — matches the previous f64 `c as u8` for
+/// non-negative blends, which is everything we get from a u8 corner field.
+///
+/// All intermediates fit in u32: the deepest nest is
+/// `c0 * (256 - fz) + c1 * fz ≤ 65280 * 256 * 256 = 0xFF000000`, which is
+/// just under `2^32`.
 #[inline]
-fn trilerp(dx: f64, dy: f64, dz: f64, p: [f64; 8]) -> u8 {
-    let c00 = p[0] * (1.0 - dx) + p[1] * dx;
-    let c10 = p[2] * (1.0 - dx) + p[3] * dx;
-    let c01 = p[4] * (1.0 - dx) + p[5] * dx;
-    let c11 = p[6] * (1.0 - dx) + p[7] * dx;
-    let c0 = c00 * (1.0 - dy) + c10 * dy;
-    let c1 = c01 * (1.0 - dy) + c11 * dy;
-    let c = c0 * (1.0 - dz) + c1 * dz;
-    c as u8
+fn trilerp_q8(fx: u32, fy: u32, fz: u32, p: [u8; 8]) -> u8 {
+    let nfx = 256 - fx;
+    let nfy = 256 - fy;
+    let nfz = 256 - fz;
+    let c00 = (p[0] as u32) * nfx + (p[1] as u32) * fx;
+    let c10 = (p[2] as u32) * nfx + (p[3] as u32) * fx;
+    let c01 = (p[4] as u32) * nfx + (p[5] as u32) * fx;
+    let c11 = (p[6] as u32) * nfx + (p[7] as u32) * fx;
+    let c0 = c00 * nfy + c10 * fy;
+    let c1 = c01 * nfy + c11 * fy;
+    let c = c0 * nfz + c1 * fz;
+    (c >> 24) as u8
+}
+
+/// Convert a fractional `[0, 1)` weight into Q0.8 (`0..=255`). Negative
+/// inputs saturate to 0; inputs ≥ 1.0 saturate to 256 (still valid for
+/// `trilerp_q8`).
+#[inline]
+fn frac_q8(f: f64) -> u32 {
+    (f * 256.0) as u32
 }
 
 /// Map a target-LOD voxel coord to its corresponding voxel coord at `lod_use`.
