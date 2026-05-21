@@ -34,6 +34,7 @@
 
 use super::cache::ChunkCache;
 use super::state::{ChunkKey, ChunkState};
+use crate::volume::composition::{CompositionState, CompositorRef, MaxCompositionState};
 use crate::volume::{DrawingConfig, Image, PaintVolume, VolumeCons, VoxelPaintVolume, VoxelVolume};
 use ecolor::Color32;
 use libm::modf;
@@ -183,6 +184,11 @@ impl VoxelVolume for UnifiedVolume {
     /// each chunk. Boundary samples (4.7% at random directions) use an
     /// inline 2-chunk path; 2- and 3-axis chunk corners (~0.07% / 0.0004%)
     /// fall back to `interpolate_u8`.
+    ///
+    /// The unswitch on `CompositorRef` is what buys per-sample
+    /// monomorphization: each arm calls a separate instantiation of the
+    /// generic `composite_along_normal_inner` so `state.update(v)` folds
+    /// into the inner loop with zero virtual dispatch.
     fn composite_along_normal(
         &self,
         base: [f64; 3],
@@ -190,7 +196,38 @@ impl VoxelVolume for UnifiedVolume {
         w_lo: f64,
         w_hi: f64,
         downsampling: i32,
-        sink: &mut dyn FnMut(u8) -> bool,
+        compositor: &mut CompositorRef<'_>,
+    ) {
+        match compositor {
+            CompositorRef::Max(s) => self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| {
+                s.update(v)
+            }),
+            CompositorRef::Alpha(s) => self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| {
+                s.update(v)
+            }),
+            CompositorRef::HeightMap(s) => {
+                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| s.update(v))
+            }
+            CompositorRef::None(s) => self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| {
+                s.update(v)
+            }),
+        }
+    }
+}
+
+impl UnifiedVolume {
+    /// The Q32.32 + Q0.8 ray walker. Generic over the per-sample sink so
+    /// each `CompositorRef` arm gets its own monomorphization — `sink(v)`
+    /// inlines to the concrete `CompositionState::update` body, no
+    /// virtual dispatch in the hot loop.
+    fn composite_along_normal_inner<F: FnMut(u8) -> bool>(
+        &self,
+        base: [f64; 3],
+        dir: [f64; 3],
+        w_lo: f64,
+        w_hi: f64,
+        downsampling: i32,
+        mut sink: F,
     ) {
         let target_lod = lod_for(downsampling.max(1) as u8);
         let max_lod = self.cache.max_lod();
@@ -501,17 +538,23 @@ impl UnifiedVolume {
 
     /// Convenience wrapper around `composite_along_normal` that returns
     /// the per-sample max along the ray. Kept so the microbench can
-    /// measure the realistic cost (including the sink dispatch) of the
-    /// path that `ObjVolume::paint` uses.
+    /// measure the realistic monomorphized fast-path cost of what
+    /// `ObjVolume::paint` runs in practice.
     pub fn max_along_normal(&self, base: [f64; 3], dir: [f64; 3], w_lo: f64, w_hi: f64, downsampling: i32) -> u8 {
-        let mut acc: u8 = 0;
-        self.composite_along_normal(base, dir, w_lo, w_hi, downsampling, &mut |v| {
-            if v > acc {
-                acc = v;
-            }
-            true
-        });
-        acc
+        let mut state = MaxCompositionState::new();
+        let mut compositor = CompositorRef::Max(&mut state);
+        // Drive the trait override so we exercise the same unswitch +
+        // monomorphized inner-loop path callers reach via Volume.
+        <Self as VoxelVolume>::composite_along_normal(
+            self,
+            base,
+            dir,
+            w_lo,
+            w_hi,
+            downsampling,
+            &mut compositor,
+        );
+        state.result(0)
     }
 }
 

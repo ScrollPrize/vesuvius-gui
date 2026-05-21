@@ -123,8 +123,9 @@ fn main() {
 
     // --- Baseline ---
     let mut best_baseline = Duration::from_secs(u64::MAX);
-    let mut sink: u64 = 0;
+    let mut baseline_per_iter: u64 = 0;
     for it in 0..baseline_iters {
+        let mut sink: u64 = 0;
         let t0 = Instant::now();
         for i in 0..num_rays {
             let [x0, y0, z0] = bases[i];
@@ -158,16 +159,17 @@ fn main() {
         if dt < best_baseline {
             best_baseline = dt;
         }
+        baseline_per_iter = sink;
     }
-    let baseline_sink = sink;
 
     // --- Fast path ---
     let mut best_fast = Duration::from_secs(u64::MAX);
-    sink = 0;
+    let mut fast_per_iter: u64 = 0;
     // Re-acquire the inner UnifiedVolume so we can call the specialized
     // method directly without going through the trait object indirection.
     let unified_fast = UnifiedVolume::new(cache.clone());
     for it in 0..fast_iters {
+        let mut sink: u64 = 0;
         let t0 = Instant::now();
         for i in 0..num_rays {
             let [x0, y0, z0] = bases[i];
@@ -190,10 +192,11 @@ fn main() {
         if dt < best_fast {
             best_fast = dt;
         }
+        fast_per_iter = sink;
     }
 
-    println!("baseline_sink={} fast_sink={}", baseline_sink, sink);
-    if sink != baseline_sink {
+    println!("baseline_sink={} fast_sink={}", baseline_per_iter, fast_per_iter);
+    if fast_per_iter != baseline_per_iter {
         eprintln!("WARN: sinks differ — output not equivalent");
     }
     println!(

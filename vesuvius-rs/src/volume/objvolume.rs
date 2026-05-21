@@ -1,4 +1,7 @@
 use super::{Image, PaintVolume, SurfaceVolume, Volume, VoxelVolume};
+use crate::volume::composition::{
+    AlphaCompositionState, AlphaHeightMapCompositionState, Compositor, MaxCompositionState, NoCompositionState,
+};
 use crate::volume::{AffineTransform, CompositingMode, VoxelPaintVolume};
 use libm::{pow, sqrt};
 use std::sync::Arc;
@@ -675,135 +678,6 @@ fn orient2d(u1: i32, v1: i32, u2: i32, v2: i32, u3: i32, v3: i32) -> i32 {
     (u2 - u1) * (v3 - v1) - (v2 - v1) * (u3 - u1)
 }
 
-trait CompositionState {
-    fn update(&mut self, a: u8) -> bool;
-    fn result(&self, num_layers: u32) -> u8;
-    fn reset(&mut self);
-}
-struct MaxCompositionState {
-    value: u8,
-}
-impl MaxCompositionState {
-    fn new() -> Self {
-        Self { value: 0 }
-    }
-}
-impl CompositionState for MaxCompositionState {
-    fn update(&mut self, a: u8) -> bool {
-        self.value = self.value.max(a);
-        true
-    }
-    fn result(&self, _num_layers: u32) -> u8 {
-        self.value
-    }
-    fn reset(&mut self) {
-        self.value = 0;
-    }
-}
-struct NoCompositionState;
-impl CompositionState for NoCompositionState {
-    fn update(&mut self, _a: u8) -> bool {
-        false
-    }
-    fn result(&self, _num_layers: u32) -> u8 {
-        0
-    }
-    fn reset(&mut self) {}
-}
-
-struct AlphaCompositionState {
-    min: f32,
-    max: f32,
-    alpha_cutoff: f32,
-    opacity: f32,
-    value: f32,
-    alpha: f32,
-}
-impl AlphaCompositionState {
-    fn new(min: f32, max: f32, alpha_cutoff: f32, opacity: f32) -> Self {
-        Self {
-            min,
-            max,
-            alpha_cutoff,
-            opacity: opacity,
-            value: 0.0,
-            alpha: 0.0,
-        }
-    }
-}
-impl CompositionState for AlphaCompositionState {
-    fn update(&mut self, a: u8) -> bool {
-        let value = ((a as f32 / 255.0 - self.min) / (self.max - self.min)).clamp(0.0, 1.0);
-
-        if value == 0.0 {
-            // speed through empty area
-            return true;
-        }
-
-        let weight = (1.0 - self.alpha) * (value * self.opacity).min(1.0);
-        self.value += weight * value;
-        self.alpha += weight;
-
-        return self.alpha < self.alpha_cutoff;
-    }
-    fn result(&self, _num_layers: u32) -> u8 {
-        (self.value * 255.0).clamp(0.0, 255.0) as u8
-    }
-    fn reset(&mut self) {
-        self.value = 0.0;
-        self.alpha = 0.0;
-    }
-}
-
-struct AlphaHeightMapCompositionState {
-    min: f32,
-    max: f32,
-    alpha_cutoff: f32,
-    opacity: f32,
-    alpha: f32,
-    depth: f32,
-    weighted_depth: f32,
-}
-impl AlphaHeightMapCompositionState {
-    fn new(min: f32, max: f32, alpha_cutoff: f32, opacity: f32) -> Self {
-        Self {
-            min,
-            max,
-            alpha_cutoff,
-            opacity: opacity,
-            alpha: 0.0,
-            depth: 0.0,
-            weighted_depth: 0.0,
-        }
-    }
-}
-impl CompositionState for AlphaHeightMapCompositionState {
-    fn update(&mut self, a: u8) -> bool {
-        let value = ((a as f32 / 255.0 - self.min) / (self.max - self.min)).clamp(0.0, 1.0);
-
-        if value == 0.0 {
-            // speed through empty area
-            self.depth += 1.0;
-            return true;
-        }
-
-        let weight = (1.0 - self.alpha) * (value * self.opacity).min(1.0);
-        self.alpha += weight;
-        self.weighted_depth += weight * self.depth;
-        self.depth += 1.0;
-
-        return self.alpha < self.alpha_cutoff;
-    }
-    fn result(&self, num_layers: u32) -> u8 {
-        //((1.0 - self.weighted_depth * 4.0 / self.alpha / num_layers as f32) * 255.0).clamp(0.0, 255.0) as u8
-        (255.0 - self.weighted_depth / self.alpha * 255.0 / num_layers as f32).clamp(0.0, 255.0) as u8
-    }
-    fn reset(&mut self) {
-        self.depth = 0.0;
-        self.weighted_depth = 0.0;
-        self.alpha = 0.0;
-    }
-}
 
 impl PaintVolume for ObjVolume {
     fn paint(
@@ -828,21 +702,21 @@ impl PaintVolume for ObjVolume {
         let composite_layers_in_front = config.compositing.layers_in_front as i32;
         let composite_layers_behind = config.compositing.layers_behind as i32;
         let composite_total_layers = composite_layers_in_front + composite_layers_behind + 1; // +1 for the current layer
-        let mut composition: Box<dyn CompositionState> = match config.compositing.mode {
-            CompositingMode::Max => Box::new(MaxCompositionState::new()),
-            CompositingMode::Alpha => Box::new(AlphaCompositionState::new(
+        let mut composition: Compositor = match config.compositing.mode {
+            CompositingMode::Max => Compositor::Max(MaxCompositionState::new()),
+            CompositingMode::Alpha => Compositor::Alpha(AlphaCompositionState::new(
                 config.compositing.alpha_min as f32 / 255.0,
                 config.compositing.alpha_max as f32 / 255.0,
                 config.compositing.alpha_threshold as f32 / 10000.0,
                 config.compositing.opacity as f32 / 100.0,
             )),
-            CompositingMode::AlphaHeightMap => Box::new(AlphaHeightMapCompositionState::new(
+            CompositingMode::AlphaHeightMap => Compositor::HeightMap(AlphaHeightMapCompositionState::new(
                 config.compositing.alpha_min as f32 / 255.0,
                 config.compositing.alpha_max as f32 / 255.0,
                 config.compositing.alpha_threshold as f32 / 10000.0,
                 config.compositing.opacity as f32 / 100.0,
             )),
-            CompositingMode::None => Box::new(NoCompositionState {}),
+            CompositingMode::None => Compositor::None(NoCompositionState),
         };
         let composite_direction = if config.compositing.reverse_direction { -1 } else { 1 };
 
@@ -1055,8 +929,10 @@ impl PaintVolume for ObjVolume {
                                             if config.trilinear_interpolation {
                                                 // Walk via the backend's composite_along_normal hook.
                                                 // The cache override amortizes the per-sample chunk
-                                                // lookup; other backends fall through to the trait
-                                                // default that just loops get_interpolated.
+                                                // lookup AND monomorphizes the per-sample update via
+                                                // the CompositorRef unswitch; other backends fall
+                                                // through to the trait default that loops
+                                                // `get_interpolated`.
                                                 let inv_f = 1.0 / ffactor;
                                                 let base = [
                                                     (x + start as f64 * nx) * inv_f,
@@ -1068,15 +944,17 @@ impl PaintVolume for ObjVolume {
                                                     step as f64 * ny * inv_f,
                                                     step as f64 * nz * inv_f,
                                                 ];
+                                                let mut compositor = composition.as_ref_mut();
                                                 volume.composite_along_normal(
                                                     base,
                                                     dir,
                                                     0.0,
                                                     n_samples as f64,
                                                     sfactor as i32,
-                                                    &mut |v| composition.update(v),
+                                                    &mut compositor,
                                                 );
                                             } else {
+                                                let mut compositor = composition.as_ref_mut();
                                                 let mut w = start;
                                                 while w != end {
                                                     let w_factor = w as f64;
@@ -1085,7 +963,7 @@ impl PaintVolume for ObjVolume {
                                                     let z = z + w_factor * nz;
                                                     let new_value = volume
                                                         .get([x / ffactor, y / ffactor, z / ffactor], sfactor as i32);
-                                                    if !composition.update(new_value) {
+                                                    if !compositor.update(new_value) {
                                                         break;
                                                     }
                                                     w += step;

@@ -1,3 +1,4 @@
+pub mod composition;
 mod empty;
 mod generic;
 mod grid500;
@@ -8,6 +9,11 @@ mod ppmvolume;
 mod transform;
 mod volume64x4;
 mod zarr_paint;
+
+pub use composition::{
+    AlphaCompositionState, AlphaHeightMapCompositionState, CompositionState, Compositor, CompositorRef,
+    MaxCompositionState, NoCompositionState,
+};
 
 use ecolor::Color32;
 pub use empty::EmptyVolume;
@@ -174,9 +180,14 @@ pub trait VoxelVolume {
     }
 
     /// Walk integer-step trilinear samples along `base + w * dir` for
-    /// `w in w_lo, w_lo+1, …, w_hi-1`, feeding each sample to `sink`.
-    /// `sink` returning `false` stops the walk early (lets alpha
-    /// compositing bail once it hits saturation).
+    /// `w in w_lo, w_lo+1, …, w_hi-1`, feeding each sample to the typed
+    /// compositor. `update` returning `false` stops the walk early
+    /// (lets alpha compositing bail once it hits saturation).
+    ///
+    /// `CompositorRef` is an enum over the concrete state types: the
+    /// cache override matches once at the top of the call and dispatches
+    /// to a monomorphized inner loop per arm, so the per-sample update
+    /// folds into the trilerp body without any virtual call.
     ///
     /// The default impl is the same per-sample loop the call site used to
     /// inline. Backends that resolve to a chunked cache override this to
@@ -188,14 +199,14 @@ pub trait VoxelVolume {
         w_lo: f64,
         w_hi: f64,
         downsampling: i32,
-        sink: &mut dyn FnMut(u8) -> bool,
+        compositor: &mut CompositorRef<'_>,
     ) {
         let n = (w_hi - w_lo) as i32;
         for k in 0..n {
             let w = w_lo + k as f64;
             let p = [base[0] + w * dir[0], base[1] + w * dir[1], base[2] + w * dir[2]];
             let v = self.get_interpolated(p, downsampling);
-            if !sink(v) {
+            if !compositor.update(v) {
                 return;
             }
         }
@@ -356,9 +367,9 @@ impl VoxelVolume for Volume {
         w_lo: f64,
         w_hi: f64,
         downsampling: i32,
-        sink: &mut dyn FnMut(u8) -> bool,
+        compositor: &mut CompositorRef<'_>,
     ) {
         self.volume
-            .composite_along_normal(base, dir, w_lo, w_hi, downsampling, sink);
+            .composite_along_normal(base, dir, w_lo, w_hi, downsampling, compositor);
     }
 }
