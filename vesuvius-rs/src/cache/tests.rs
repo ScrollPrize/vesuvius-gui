@@ -980,6 +980,94 @@ fn get_interpolated_walks_lod_pyramid_when_target_missing() {
 }
 
 #[test]
+fn max_along_normal_matches_naive_baseline() {
+    use crate::cache::UnifiedVolume;
+    use crate::volume::VoxelVolume;
+
+    let root = tmp_root("composite-fast");
+    let backfiller = Arc::new(SyntheticBackfiller::new(
+        "composite-fast",
+        [256, 256, 256],
+        0,
+        |x, y, z, _| {
+            // Hashy but deterministic per-voxel byte. Spans 0..=255 with
+            // some structure so trilinear samples aren't degenerate.
+            let mut h: u64 = 0xcbf29ce484222325;
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            h ^= y as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            h ^= z as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            (h >> 24) as u8
+        },
+    ));
+    let cache = ChunkCache::new(&root, backfiller);
+
+    // Pre-warm all the chunks the rays below touch.
+    for cz in 0..4 {
+        for cy in 0..4 {
+            for cx in 0..4 {
+                cache.wait_for(ChunkKey::new(0, cx, cy, cz), Duration::from_secs(5));
+            }
+        }
+    }
+
+    let vol = UnifiedVolume::new(cache);
+
+    fn naive_max(vol: &UnifiedVolume, base: [f64; 3], dir: [f64; 3], w_lo: f64, w_hi: f64) -> u8 {
+        let n = (w_hi - w_lo) as i32;
+        let mut acc = 0u8;
+        for k in 0..n {
+            let w = w_lo + k as f64;
+            let xyz = [base[0] + w * dir[0], base[1] + w * dir[1], base[2] + w * dir[2]];
+            let v = vol.get_interpolated(xyz, 1);
+            if v > acc {
+                acc = v;
+            }
+        }
+        acc
+    }
+
+    // A grid of starting points that includes chunk boundaries (every 64),
+    // and a mix of normal directions that exercise:
+    //   - the all-inside-one-chunk fast path
+    //   - chunk crossings mid-run
+    //   - boundary-on-entry (floor(p) lands on row 63)
+    //   - axis-aligned rays where d = 0 on two axes
+    let cases: &[([f64; 3], [f64; 3])] = &[
+        // Pure +X.
+        ([100.2, 50.3, 30.4], [1.0, 0.0, 0.0]),
+        // Mostly +X but crosses Y chunk boundary mid-ray.
+        ([100.2, 63.4, 30.4], [0.7, 0.7, 0.1]),
+        // Diagonal that crosses several chunk boundaries.
+        ([60.0, 60.0, 60.0], [0.577, 0.577, 0.577]),
+        // Boundary-on-entry: floor(px) lands on row 63 of the chunk.
+        ([63.5, 50.0, 50.0], [0.5, 0.5, 0.0]),
+        // Negative-direction crossings.
+        ([100.0, 100.0, 100.0], [-0.8, -0.4, -0.2]),
+        // Mixed: small steps so the run is long.
+        ([80.0, 80.0, 80.0], [0.1, 0.05, -0.07]),
+    ];
+
+    for (i, (base, dir)) in cases.iter().enumerate() {
+        // Normalize so each direction is a real unit vector.
+        let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        let dir = [dir[0] / l, dir[1] / l, dir[2] / l];
+        for &w_lo in &[-12.0_f64, -6.0, 0.0, 5.0] {
+            let w_hi = w_lo + 25.0;
+            let expected = naive_max(&vol, *base, dir, w_lo, w_hi);
+            let got = vol.max_along_normal(*base, dir, w_lo, w_hi, 1);
+            assert_eq!(
+                got, expected,
+                "case {}: base={:?} dir={:?} w in [{}, {})",
+                i, base, dir, w_lo, w_hi
+            );
+        }
+    }
+}
+
+#[test]
 fn second_open_picks_up_disk_cache() {
     let root = tmp_root("persist");
     let key = ChunkKey::new(0, 0, 0, 0);

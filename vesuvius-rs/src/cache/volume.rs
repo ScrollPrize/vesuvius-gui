@@ -310,6 +310,292 @@ impl UnifiedVolume {
         b.chosen = Some((lod_use, state));
         result
     }
+
+    /// Specialized walker for the surface compositing inner loop in
+    /// `ObjVolume::paint`: take trilinear samples at integer `w` offsets
+    /// along the ray `base + w * dir` for `w in w_lo..w_hi` and return the
+    /// per-component max. Amortizes the per-sample chunk lookup that
+    /// `get_interpolated` redoes from scratch each call.
+    ///
+    /// `downsampling` follows the usual convention — caller passes
+    /// `1 << target_lod`, base/dir are already in target-LOD voxel coords.
+    ///
+    /// This is the "max" composition variant; alpha/heightmap variants
+    /// can be layered on once the shape stabilizes.
+    pub fn max_along_normal(&self, base: [f64; 3], dir: [f64; 3], w_lo: f64, w_hi: f64, downsampling: i32) -> u8 {
+        let target_lod = lod_for(downsampling.max(1) as u8);
+        let max_lod = self.cache.max_lod();
+        let n_total = (w_hi - w_lo) as i32;
+        if n_total <= 0 {
+            return 0;
+        }
+
+        let dx = dir[0];
+        let dy = dir[1];
+        let dz = dir[2];
+
+        // Pre-step the position so each iteration is `pos += d` instead of
+        // `base + w * d`. Drift over a few dozen steps is well below voxel
+        // size for unit normals.
+        let mut px = base[0] + w_lo * dx;
+        let mut py = base[1] + w_lo * dy;
+        let mut pz = base[2] + w_lo * dz;
+
+        let mut acc: u8 = 0;
+        let mut remaining = n_total as usize;
+
+        // Outer: bind a chunk, walk the run of samples that stay inside it.
+        // The "stay inside" predicate is the original fast-path condition:
+        // the +1 trilinear corner must not cross chunk boundaries, i.e.
+        // `floor(p) & 63 != 63` on every axis. When the predicate fails
+        // (entry already on a boundary, or non-zero LOD shift), we fall
+        // back to a single `interpolate_u8` call for that sample.
+        while remaining > 0 {
+            if px < 0.0 || py < 0.0 || pz < 0.0 {
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if v > acc {
+                    acc = v;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+            let txu = px as u64;
+            let tyu = py as u64;
+            let tzu = pz as u64;
+            let target_cx = (txu / 64) as u32;
+            let target_cy = (tyu / 64) as u32;
+            let target_cz = (tzu / 64) as u32;
+
+            // Take a single slow sample whenever entry sits on a chunk
+            // boundary in any axis (the +1 corner would cross into a
+            // neighbor and the in-chunk index math would silently read
+            // the wrong voxel). `interpolate_u8` handles this case
+            // correctly via its per-corner fallback.
+            let boundary_on_entry = (txu & 63) == 63 || (tyu & 63) == 63 || (tzu & 63) == 63;
+            if boundary_on_entry {
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if v > acc {
+                    acc = v;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+
+            let bound = resolve_chunk(&self.cache, target_lod, max_lod, target_cx, target_cy, target_cz);
+            let Some(b) = bound else {
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            };
+
+            // For chunks the cache resolved at a coarser LOD, the
+            // interpolation lattice is in lod_use coords — give up on the
+            // run-length optimization and use the existing method.
+            if b.shift != 0 {
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if v > acc {
+                    acc = v;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+
+            // How many forward integer steps stay inside the in-chunk
+            // safe float range `[cx*64, cx*64 + 63)` on every axis. The
+            // outer loop re-resolves once any axis crosses out.
+            let lo_x = (target_cx as f64) * 64.0;
+            let lo_y = (target_cy as f64) * 64.0;
+            let lo_z = (target_cz as f64) * 64.0;
+            let hi_x = lo_x + 63.0;
+            let hi_y = lo_y + 63.0;
+            let hi_z = lo_z + 63.0;
+            let kx = run_length_1d(px, dx, lo_x, hi_x);
+            let ky = run_length_1d(py, dy, lo_y, hi_y);
+            let kz = run_length_1d(pz, dz, lo_z, hi_z);
+            let run = kx.min(ky).min(kz).min(remaining);
+            debug_assert!(run >= 1);
+
+            let mmap = unsafe { b.mmap_slice() };
+            // Compute the in-chunk integer coordinate + fractional residue
+            // once at run entry, then carry them forward incrementally.
+            // This removes the per-sample f64→u64 conversion and the
+            // `cx as f64` round-trip the trilerp lattice needs.
+            //
+            // For |d| ≤ 1 (unit normals after the caller's optional
+            // ffactor divide) the per-step integer delta is in {-1, 0, 1}.
+            // We branch on fract carry instead of recomputing floor.
+            let mut cx = unsafe { px.to_int_unchecked::<u64>() };
+            let mut cy = unsafe { py.to_int_unchecked::<u64>() };
+            let mut cz = unsafe { pz.to_int_unchecked::<u64>() };
+            let mut fx = px - cx as f64;
+            let mut fy = py - cy as f64;
+            let mut fz = pz - cz as f64;
+
+            // Bail out to per-sample if any direction is too aggressive.
+            // run_length_1d ensured we stay in the chunk, but the
+            // incremental carry only handles single-step crossings.
+            if dx.abs() > 1.0 || dy.abs() > 1.0 || dz.abs() > 1.0 {
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if v > acc {
+                    acc = v;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+
+            unsafe {
+                for _ in 0..run {
+                    let tx = (cx & 63) as usize;
+                    let ty = (cy & 63) as usize;
+                    let tz = (cz & 63) as usize;
+                    let idx = tz * 64 * 64 + ty * 64 + tx;
+                    let p000 = *mmap.get_unchecked(idx) as f64;
+                    let p100 = *mmap.get_unchecked(idx + 1) as f64;
+                    let p010 = *mmap.get_unchecked(idx + 64) as f64;
+                    let p110 = *mmap.get_unchecked(idx + 65) as f64;
+                    let p001 = *mmap.get_unchecked(idx + 64 * 64) as f64;
+                    let p101 = *mmap.get_unchecked(idx + 64 * 64 + 1) as f64;
+                    let p011 = *mmap.get_unchecked(idx + 64 * 64 + 64) as f64;
+                    let p111 = *mmap.get_unchecked(idx + 64 * 64 + 65) as f64;
+                    let v = trilerp(fx, fy, fz, [p000, p100, p010, p110, p001, p101, p011, p111]);
+                    if v > acc {
+                        acc = v;
+                    }
+
+                    // Incremental advance.
+                    fx += dx;
+                    if fx >= 1.0 {
+                        fx -= 1.0;
+                        cx += 1;
+                    } else if fx < 0.0 {
+                        fx += 1.0;
+                        cx = cx.wrapping_sub(1);
+                    }
+                    fy += dy;
+                    if fy >= 1.0 {
+                        fy -= 1.0;
+                        cy += 1;
+                    } else if fy < 0.0 {
+                        fy += 1.0;
+                        cy = cy.wrapping_sub(1);
+                    }
+                    fz += dz;
+                    if fz >= 1.0 {
+                        fz -= 1.0;
+                        cz += 1;
+                    } else if fz < 0.0 {
+                        fz += 1.0;
+                        cz = cz.wrapping_sub(1);
+                    }
+                }
+            }
+            // Sync the float trackers back to the canonical state for the
+            // outer loop's chunk-resolution and run-length math.
+            px = cx as f64 + fx;
+            py = cy as f64 + fy;
+            pz = cz as f64 + fz;
+            remaining -= run;
+        }
+        acc
+    }
+}
+
+/// How many integer-step advances `p, p+d, p+2d, …` stay strictly inside
+/// `[lo, hi)`, counting the initial sample (which the caller has confirmed
+/// is inside the range — i.e. `lo <= p < hi`).
+///
+/// For the in-chunk fast path: `lo = cx*64`, `hi = cx*64 + 63` (NOT 64 — the
+/// `+1` corner of the trilerp must stay inside the chunk).
+#[inline]
+fn run_length_1d(p: f64, d: f64, lo: f64, hi: f64) -> usize {
+    if d > 0.0 {
+        // Stop one step before crossing `hi`. The largest k with
+        // `p + k*d < hi` is `floor((hi - p - eps) / d)`. We use the
+        // half-open `< hi` semantics directly with `floor`, taking care
+        // that an exact landing on `hi` does NOT count.
+        let q = (hi - p) / d;
+        // `q` ≥ 0 since p < hi and d > 0 (caller guarantees boundary safety).
+        let k = if q.fract() == 0.0 { q - 1.0 } else { q.floor() };
+        if k < 0.0 {
+            1
+        } else {
+            (k as usize).saturating_add(1)
+        }
+    } else if d < 0.0 {
+        // Symmetric: stop one step before crossing `lo`. Largest k with
+        // `p + k*d >= lo` is `floor((lo - p) / d)` (d<0 flips inequality).
+        let q = (lo - p) / d;
+        let k = q.floor();
+        if k < 0.0 {
+            1
+        } else {
+            (k as usize).saturating_add(1)
+        }
+    } else {
+        usize::MAX
+    }
+}
+
+/// One target-chunk → LOD-use binding cached across multiple samples on the
+/// same ray. Holds an `Arc<ChunkState>` so the mmap stays alive; the raw
+/// pointer + length pair lets the inner loop materialize `&[u8]` without
+/// re-deref'ing the `Arc` per sample.
+struct BoundChunk {
+    /// `lod_use - target_lod`. Zero in the common case (target chunk
+    /// resident at the requested LOD); positive when a coarser parent was
+    /// used as a fallback. The run-length optimization only runs when
+    /// `shift == 0` — coarser-LOD parents would require lattice math in
+    /// `lod_use` coordinates, which the outer loop just defers to
+    /// `interpolate_u8` one sample at a time.
+    shift: u8,
+    /// Owns the mmap that `mmap_ptr` indexes into.
+    _state: Arc<ChunkState>,
+    mmap_ptr: *const u8,
+    mmap_len: usize,
+}
+
+impl BoundChunk {
+    /// Materialize the chunk's bytes as a slice. The borrow is tied to
+    /// `&self`, and `_state` keeps the mmap alive.
+    unsafe fn mmap_slice(&self) -> &[u8] {
+        std::slice::from_raw_parts(self.mmap_ptr, self.mmap_len)
+    }
+}
+
+fn resolve_chunk(cache: &ChunkCache, target_lod: u8, max_lod: u8, cx: u32, cy: u32, cz: u32) -> Option<BoundChunk> {
+    // Same LOD-walk pattern as `interpolate_u8`/`get`: try target → coarsest,
+    // stop at the first terminal state. `Empty` overrides coarser data.
+    let walk_lo = target_lod.min(max_lod);
+    for lod_try in walk_lo..=max_lod {
+        let shift = lod_try - target_lod;
+        let key = ChunkKey::new(lod_try, cx >> shift, cy >> shift, cz >> shift);
+        let s = cache.state_or_fetch(key);
+        if s.is_terminal() {
+            return match s.as_resident() {
+                Some(slice) => {
+                    let mmap_ptr = slice.as_ptr();
+                    let mmap_len = slice.len();
+                    Some(BoundChunk { shift, _state: s, mmap_ptr, mmap_len })
+                }
+                None => None, // Empty
+            };
+        }
+    }
+    None
 }
 
 /// Trilinear blend of 8 corner samples ordered (p000, p100, p010, p110,
