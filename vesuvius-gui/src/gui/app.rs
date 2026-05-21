@@ -20,9 +20,12 @@ use vesuvius_atlas_rs::{AtlasMetadata, AtlasSample};
 use vesuvius_rs::catalog::obj_repository::ObjRepository;
 use vesuvius_rs::catalog::Catalog;
 use vesuvius_rs::catalog::Segment;
+use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
+use vesuvius_rs::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
+use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, UnifiedVolume};
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
-use vesuvius_zarr::{OmeZarrContext, ZarrArray};
+use vesuvius_zarr::{default_cache_dir_for_url, OmeZarrContext, ZarrArray};
 
 pub(crate) const ZOOM_MIN: f32 = 0.01;
 pub(crate) const ZOOM_MAX: f32 = 8.0;
@@ -363,16 +366,25 @@ impl TemplateApp {
         if let Some(segment_file) = config.overlay_dir {
             if segment_file.contains(".zarr") {
                 let inner: Volume = if segment_file.contains(".ome.zarr") {
-                    if segment_file.starts_with("http") {
+                    let (ome, source_key) = if segment_file.starts_with("http") {
                         log::info!("Loading ome-zarr overlay from url: {}", segment_file);
-                        OmeZarrPaintVolume::<GrayScale>::new(OmeZarrContext::from_url_to_default_cache_dir(
-                            &segment_file,
-                        ))
-                        .into_volume()
+                        (
+                            OmeZarrContext::from_url_blocking_to_default_cache_dir(&segment_file),
+                            segment_file.clone(),
+                        )
                     } else {
                         log::info!("Loading ome-zarr overlay from path: {}", segment_file);
-                        OmeZarrPaintVolume::<GrayScale>::new(OmeZarrContext::from_path(&segment_file)).into_volume()
-                    }
+                        (
+                            OmeZarrContext::from_path(&segment_file),
+                            format!("file://{}", segment_file),
+                        )
+                    };
+                    let cache_root = std::path::PathBuf::from(default_cache_dir_for_url(&source_key));
+                    let native: Arc<dyn ChunkBackfiller> =
+                        Arc::new(OmeZarrBackfiller::from_ome("overlay", ome));
+                    let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
+                    let cache = ChunkCache::new(cache_root, backfiller);
+                    UnifiedVolume::new(cache).into_volume()
                 } else if segment_file.starts_with("http") {
                     log::info!("Loading zarr overlay from url: {}", segment_file);
                     ZarrArray::from_url_to_default_cache_dir(&segment_file)
