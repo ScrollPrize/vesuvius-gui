@@ -57,3 +57,4 @@ wavefront_obj   = { version = "11.0" }
 
 [profile.release-with-debug]
 inherits = "release"
+debug = 1

@@ -347,9 +347,13 @@ impl UnifiedVolume {
         // Outer: bind a chunk, walk the run of samples that stay inside it.
         // The "stay inside" predicate is the original fast-path condition:
         // the +1 trilinear corner must not cross chunk boundaries, i.e.
-        // `floor(p) & 63 != 63` on every axis. When the predicate fails
-        // (entry already on a boundary, or non-zero LOD shift), we fall
-        // back to a single `interpolate_u8` call for that sample.
+        // `floor(p) & 63 != 63` on every axis.
+        //
+        // When the predicate fails on exactly **one** axis we inline a
+        // 2-chunk sample (home + one neighbor) so we don't need to walk
+        // through `interpolate_u8`'s full per-corner LOD machinery.
+        // 2- and 3-axis boundary cases are ~64× and ~4000× rarer and
+        // keep the simple `interpolate_u8` fallback.
         while remaining > 0 {
             if px < 0.0 || py < 0.0 || pz < 0.0 {
                 let v = self.interpolate_u8([px, py, pz], downsampling);
@@ -369,24 +373,6 @@ impl UnifiedVolume {
             let target_cy = (tyu / 64) as u32;
             let target_cz = (tzu / 64) as u32;
 
-            // Take a single slow sample whenever entry sits on a chunk
-            // boundary in any axis (the +1 corner would cross into a
-            // neighbor and the in-chunk index math would silently read
-            // the wrong voxel). `interpolate_u8` handles this case
-            // correctly via its per-corner fallback.
-            let boundary_on_entry = (txu & 63) == 63 || (tyu & 63) == 63 || (tzu & 63) == 63;
-            if boundary_on_entry {
-                let v = self.interpolate_u8([px, py, pz], downsampling);
-                if v > acc {
-                    acc = v;
-                }
-                px += dx;
-                py += dy;
-                pz += dz;
-                remaining -= 1;
-                continue;
-            }
-
             let bound = resolve_chunk(&self.cache, target_lod, max_lod, target_cx, target_cy, target_cz);
             let Some(b) = bound else {
                 px += dx;
@@ -401,6 +387,60 @@ impl UnifiedVolume {
             // run-length optimization and use the existing method.
             if b.shift != 0 {
                 let v = self.interpolate_u8([px, py, pz], downsampling);
+                if v > acc {
+                    acc = v;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+
+            // Boundary handling on entry.
+            let bx = (txu & 63) == 63;
+            let by = (tyu & 63) == 63;
+            let bz = (tzu & 63) == 63;
+            let n_boundary = bx as u8 + by as u8 + bz as u8;
+            if n_boundary >= 2 {
+                // 2- or 3-axis: 3 or 7 neighbors. Rare enough that the
+                // generic per-corner fallback is fine.
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if v > acc {
+                    acc = v;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+            if n_boundary == 1 {
+                // Single-axis: bind one neighbor and sample inline.
+                let (nx_c, ny_c, nz_c) = if bx {
+                    (target_cx + 1, target_cy, target_cz)
+                } else if by {
+                    (target_cx, target_cy + 1, target_cz)
+                } else {
+                    (target_cx, target_cy, target_cz + 1)
+                };
+                let neighbor = resolve_chunk(&self.cache, target_lod, max_lod, nx_c, ny_c, nz_c);
+                // shift > 0 on the neighbor (coarser parent) would put the
+                // neighbor's lattice in a different coord space than home's —
+                // safer to defer to interpolate_u8 in that case.
+                let v = match &neighbor {
+                    Some(b_n) if b_n.shift == 0 => {
+                        let home_mmap = unsafe { b.mmap_slice() };
+                        let neigh_mmap = unsafe { b_n.mmap_slice() };
+                        sample_boundary_1axis(home_mmap, Some(neigh_mmap), bx, by, bz, txu, tyu, tzu, px, py, pz)
+                    }
+                    Some(_) => self.interpolate_u8([px, py, pz], downsampling),
+                    None => {
+                        // Empty neighbor: 4 of the 8 corners are zero.
+                        let home_mmap = unsafe { b.mmap_slice() };
+                        sample_boundary_1axis(home_mmap, None, bx, by, bz, txu, tyu, tzu, px, py, pz)
+                    }
+                };
                 if v > acc {
                     acc = v;
                 }
@@ -596,6 +636,98 @@ fn resolve_chunk(cache: &ChunkCache, target_lod: u8, max_lod: u8, cx: u32, cy: u
         }
     }
     None
+}
+
+/// Sample at a position whose `floor()` lands on the +63 row of exactly
+/// **one** chunk axis — the +1 trilerp corner along that axis crosses into
+/// a neighbor chunk. 4 of the 8 corners come from `home`, the other 4 from
+/// `neigh` (or are 0 if `neigh` is None, i.e. an Empty neighbor).
+///
+/// Exactly one of `bx`, `by`, `bz` must be true; the caller asserts this.
+/// The 4 non-crossed corners are safe to read from `home` because the
+/// other two axes' `+1` stay below 64 (their boundary bits are false).
+#[inline]
+fn sample_boundary_1axis(
+    home: &[u8],
+    neigh: Option<&[u8]>,
+    bx: bool,
+    by: bool,
+    bz: bool,
+    txu: u64,
+    tyu: u64,
+    tzu: u64,
+    px: f64,
+    py: f64,
+    pz: f64,
+) -> u8 {
+    debug_assert!((bx as u8 + by as u8 + bz as u8) == 1);
+    let tx = (txu & 63) as usize;
+    let ty = (tyu & 63) as usize;
+    let tz = (tzu & 63) as usize;
+
+    // SAFETY: `tx + (1-bx)`, `ty + (1-by)`, `tz + (1-bz)` are all ≤ 63
+    // for the home reads; the neighbor reads use 0 on the crossed axis.
+    // All indices stay inside their respective 64³ mmap.
+    let (h0, h1, h2, h3, n0, n1, n2, n3) = unsafe {
+        if bx {
+            // Crossed: +x. Home rows at tx=63; neighbor rows at tx=0.
+            let h = tz * 64 * 64 + ty * 64 + 63;
+            let n = tz * 64 * 64 + ty * 64;
+            (
+                *home.get_unchecked(h),                  // p000 home[63, ty, tz]
+                *home.get_unchecked(h + 64),             // p010 home[63, ty+1, tz]
+                *home.get_unchecked(h + 64 * 64),        // p001 home[63, ty, tz+1]
+                *home.get_unchecked(h + 64 * 64 + 64),   // p011 home[63, ty+1, tz+1]
+                neigh.map(|s| *s.get_unchecked(n)).unwrap_or(0),                  // p100
+                neigh.map(|s| *s.get_unchecked(n + 64)).unwrap_or(0),             // p110
+                neigh.map(|s| *s.get_unchecked(n + 64 * 64)).unwrap_or(0),        // p101
+                neigh.map(|s| *s.get_unchecked(n + 64 * 64 + 64)).unwrap_or(0),   // p111
+            )
+        } else if by {
+            // Crossed: +y. Home rows at ty=63; neighbor rows at ty=0.
+            let h = tz * 64 * 64 + 63 * 64 + tx;
+            let n = tz * 64 * 64 + tx;
+            (
+                *home.get_unchecked(h),                  // p000 home[tx, 63, tz]
+                *home.get_unchecked(h + 1),              // p100 home[tx+1, 63, tz]
+                *home.get_unchecked(h + 64 * 64),        // p001 home[tx, 63, tz+1]
+                *home.get_unchecked(h + 64 * 64 + 1),    // p101 home[tx+1, 63, tz+1]
+                neigh.map(|s| *s.get_unchecked(n)).unwrap_or(0),              // p010
+                neigh.map(|s| *s.get_unchecked(n + 1)).unwrap_or(0),          // p110
+                neigh.map(|s| *s.get_unchecked(n + 64 * 64)).unwrap_or(0),    // p011
+                neigh.map(|s| *s.get_unchecked(n + 64 * 64 + 1)).unwrap_or(0),// p111
+            )
+        } else {
+            // Crossed: +z. Home rows at tz=63; neighbor rows at tz=0.
+            let h = 63 * 64 * 64 + ty * 64 + tx;
+            let n = ty * 64 + tx;
+            (
+                *home.get_unchecked(h),                  // p000 home[tx, ty, 63]
+                *home.get_unchecked(h + 1),              // p100 home[tx+1, ty, 63]
+                *home.get_unchecked(h + 64),             // p010 home[tx, ty+1, 63]
+                *home.get_unchecked(h + 65),             // p110 home[tx+1, ty+1, 63]
+                neigh.map(|s| *s.get_unchecked(n)).unwrap_or(0),         // p001
+                neigh.map(|s| *s.get_unchecked(n + 1)).unwrap_or(0),     // p101
+                neigh.map(|s| *s.get_unchecked(n + 64)).unwrap_or(0),    // p011
+                neigh.map(|s| *s.get_unchecked(n + 65)).unwrap_or(0),    // p111
+            )
+        }
+    };
+
+    // Re-order into the canonical (p000, p100, p010, p110, p001, p101, p011, p111).
+    // Above we built ordered groups per axis; map back here.
+    let p = if bx {
+        [h0 as f64, n0 as f64, h1 as f64, n1 as f64, h2 as f64, n2 as f64, h3 as f64, n3 as f64]
+    } else if by {
+        [h0 as f64, h1 as f64, n0 as f64, n1 as f64, h2 as f64, h3 as f64, n2 as f64, n3 as f64]
+    } else {
+        [h0 as f64, h1 as f64, h2 as f64, h3 as f64, n0 as f64, n1 as f64, n2 as f64, n3 as f64]
+    };
+
+    let fx = px - txu as f64;
+    let fy = py - tyu as f64;
+    let fz = pz - tzu as f64;
+    trilerp(fx, fy, fz, p)
 }
 
 /// Trilinear blend of 8 corner samples ordered (p000, p100, p010, p110,

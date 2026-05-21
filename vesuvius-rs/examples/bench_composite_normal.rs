@@ -118,11 +118,13 @@ fn main() {
     let ffactor = 1.0f64;
     let half = layers / 2;
 
+    let baseline_iters: usize = env_usize("BENCH_BASELINE_ITERS", 3);
+    let fast_iters: usize = env_usize("BENCH_FAST_ITERS", 3);
+
     // --- Baseline ---
-    let mut iters = 3;
     let mut best_baseline = Duration::from_secs(u64::MAX);
     let mut sink: u64 = 0;
-    for it in 0..iters {
+    for it in 0..baseline_iters {
         let t0 = Instant::now();
         for i in 0..num_rays {
             let [x0, y0, z0] = bases[i];
@@ -159,14 +161,13 @@ fn main() {
     }
     let baseline_sink = sink;
 
-    // --- Fast path (placeholder same as baseline until implemented) ---
-    iters = 3;
+    // --- Fast path ---
     let mut best_fast = Duration::from_secs(u64::MAX);
     sink = 0;
     // Re-acquire the inner UnifiedVolume so we can call the specialized
     // method directly without going through the trait object indirection.
     let unified_fast = UnifiedVolume::new(cache.clone());
-    for it in 0..iters {
+    for it in 0..fast_iters {
         let t0 = Instant::now();
         for i in 0..num_rays {
             let [x0, y0, z0] = bases[i];
