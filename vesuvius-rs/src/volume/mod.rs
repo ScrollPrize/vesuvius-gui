@@ -172,6 +172,34 @@ pub trait VoxelVolume {
 
         c as u8
     }
+
+    /// Walk integer-step trilinear samples along `base + w * dir` for
+    /// `w in w_lo, w_lo+1, …, w_hi-1`, feeding each sample to `sink`.
+    /// `sink` returning `false` stops the walk early (lets alpha
+    /// compositing bail once it hits saturation).
+    ///
+    /// The default impl is the same per-sample loop the call site used to
+    /// inline. Backends that resolve to a chunked cache override this to
+    /// amortize chunk lookups across the whole walk.
+    fn composite_along_normal(
+        &self,
+        base: [f64; 3],
+        dir: [f64; 3],
+        w_lo: f64,
+        w_hi: f64,
+        downsampling: i32,
+        sink: &mut dyn FnMut(u8) -> bool,
+    ) {
+        let n = (w_hi - w_lo) as i32;
+        for k in 0..n {
+            let w = w_lo + k as f64;
+            let p = [base[0] + w * dir[0], base[1] + w * dir[1], base[2] + w * dir[2]];
+            let v = self.get_interpolated(p, downsampling);
+            if !sink(v) {
+                return;
+            }
+        }
+    }
 }
 
 pub struct Image {
@@ -320,5 +348,17 @@ impl VoxelVolume for Volume {
     }
     fn reset_for_painting(&self) {
         self.volume.reset_for_painting();
+    }
+    fn composite_along_normal(
+        &self,
+        base: [f64; 3],
+        dir: [f64; 3],
+        w_lo: f64,
+        w_hi: f64,
+        downsampling: i32,
+        sink: &mut dyn FnMut(u8) -> bool,
+    ) {
+        self.volume
+            .composite_along_normal(base, dir, w_lo, w_hi, downsampling, sink);
     }
 }

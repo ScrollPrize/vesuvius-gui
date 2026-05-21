@@ -176,6 +176,194 @@ impl VoxelVolume for UnifiedVolume {
     fn get_color_interpolated(&self, xyz: [f64; 3], downsampling: i32) -> Color32 {
         Color32::from_gray(self.interpolate_u8(xyz, downsampling))
     }
+
+    /// Fast-path override of the trait default. Amortizes the per-sample
+    /// chunk lookup that `get_interpolated` redoes from scratch each call,
+    /// then walks the ray as Q32.32 fixed-point with Q0.8 trilerp inside
+    /// each chunk. Boundary samples (4.7% at random directions) use an
+    /// inline 2-chunk path; 2- and 3-axis chunk corners (~0.07% / 0.0004%)
+    /// fall back to `interpolate_u8`.
+    fn composite_along_normal(
+        &self,
+        base: [f64; 3],
+        dir: [f64; 3],
+        w_lo: f64,
+        w_hi: f64,
+        downsampling: i32,
+        sink: &mut dyn FnMut(u8) -> bool,
+    ) {
+        let target_lod = lod_for(downsampling.max(1) as u8);
+        let max_lod = self.cache.max_lod();
+        let n_total = (w_hi - w_lo) as i32;
+        if n_total <= 0 {
+            return;
+        }
+
+        let dx = dir[0];
+        let dy = dir[1];
+        let dz = dir[2];
+
+        let mut px = base[0] + w_lo * dx;
+        let mut py = base[1] + w_lo * dy;
+        let mut pz = base[2] + w_lo * dz;
+
+        let mut remaining = n_total as usize;
+
+        while remaining > 0 {
+            if px < 0.0 || py < 0.0 || pz < 0.0 {
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if !sink(v) {
+                    return;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+            let txu = px as u64;
+            let tyu = py as u64;
+            let tzu = pz as u64;
+            let target_cx = (txu / 64) as u32;
+            let target_cy = (tyu / 64) as u32;
+            let target_cz = (tzu / 64) as u32;
+
+            let bound = resolve_chunk(&self.cache, target_lod, max_lod, target_cx, target_cy, target_cz);
+            let Some(b) = bound else {
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            };
+
+            if b.shift != 0 {
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if !sink(v) {
+                    return;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+
+            let bx = (txu & 63) == 63;
+            let by = (tyu & 63) == 63;
+            let bz = (tzu & 63) == 63;
+            let n_boundary = bx as u8 + by as u8 + bz as u8;
+            if n_boundary >= 2 {
+                let v = self.interpolate_u8([px, py, pz], downsampling);
+                if !sink(v) {
+                    return;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+            if n_boundary == 1 {
+                let (nx_c, ny_c, nz_c) = if bx {
+                    (target_cx + 1, target_cy, target_cz)
+                } else if by {
+                    (target_cx, target_cy + 1, target_cz)
+                } else {
+                    (target_cx, target_cy, target_cz + 1)
+                };
+                let neighbor = resolve_chunk(&self.cache, target_lod, max_lod, nx_c, ny_c, nz_c);
+                let v = match &neighbor {
+                    Some(b_n) if b_n.shift == 0 => {
+                        let home_mmap = unsafe { b.mmap_slice() };
+                        let neigh_mmap = unsafe { b_n.mmap_slice() };
+                        sample_boundary_1axis(home_mmap, Some(neigh_mmap), bx, by, bz, txu, tyu, tzu, px, py, pz)
+                    }
+                    Some(_) => self.interpolate_u8([px, py, pz], downsampling),
+                    None => {
+                        let home_mmap = unsafe { b.mmap_slice() };
+                        sample_boundary_1axis(home_mmap, None, bx, by, bz, txu, tyu, tzu, px, py, pz)
+                    }
+                };
+                if !sink(v) {
+                    return;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
+
+            let lo_x = (target_cx as f64) * 64.0;
+            let lo_y = (target_cy as f64) * 64.0;
+            let lo_z = (target_cz as f64) * 64.0;
+            let hi_x = lo_x + 63.0;
+            let hi_y = lo_y + 63.0;
+            let hi_z = lo_z + 63.0;
+            let kx = run_length_1d(px, dx, lo_x, hi_x);
+            let ky = run_length_1d(py, dy, lo_y, hi_y);
+            let kz = run_length_1d(pz, dz, lo_z, hi_z);
+            let run = kx.min(ky).min(kz).min(remaining);
+            debug_assert!(run >= 1);
+
+            let mmap = unsafe { b.mmap_slice() };
+            const Q32_F: f64 = 4294967296.0; // 2^32
+            let mut posx = unsafe { (px * Q32_F).to_int_unchecked::<i64>() };
+            let mut posy = unsafe { (py * Q32_F).to_int_unchecked::<i64>() };
+            let mut posz = unsafe { (pz * Q32_F).to_int_unchecked::<i64>() };
+            let dx_q = unsafe { (dx * Q32_F).to_int_unchecked::<i64>() };
+            let dy_q = unsafe { (dy * Q32_F).to_int_unchecked::<i64>() };
+            let dz_q = unsafe { (dz * Q32_F).to_int_unchecked::<i64>() };
+
+            let mut stopped = false;
+            let mut consumed = 0usize;
+            unsafe {
+                for _ in 0..run {
+                    let cx = (posx >> 32) as u64;
+                    let cy = (posy >> 32) as u64;
+                    let cz = (posz >> 32) as u64;
+                    let tx = (cx & 63) as usize;
+                    let ty = (cy & 63) as usize;
+                    let tz = (cz & 63) as usize;
+                    let idx = tz * 64 * 64 + ty * 64 + tx;
+                    let p000 = *mmap.get_unchecked(idx);
+                    let p100 = *mmap.get_unchecked(idx + 1);
+                    let p010 = *mmap.get_unchecked(idx + 64);
+                    let p110 = *mmap.get_unchecked(idx + 65);
+                    let p001 = *mmap.get_unchecked(idx + 64 * 64);
+                    let p101 = *mmap.get_unchecked(idx + 64 * 64 + 1);
+                    let p011 = *mmap.get_unchecked(idx + 64 * 64 + 64);
+                    let p111 = *mmap.get_unchecked(idx + 64 * 64 + 65);
+                    let fx_q8 = ((posx >> 24) & 0xFF) as u32;
+                    let fy_q8 = ((posy >> 24) & 0xFF) as u32;
+                    let fz_q8 = ((posz >> 24) & 0xFF) as u32;
+                    let v = trilerp_q8(
+                        fx_q8,
+                        fy_q8,
+                        fz_q8,
+                        [p000, p100, p010, p110, p001, p101, p011, p111],
+                    );
+                    consumed += 1;
+                    if !sink(v) {
+                        stopped = true;
+                        break;
+                    }
+                    posx = posx.wrapping_add(dx_q);
+                    posy = posy.wrapping_add(dy_q);
+                    posz = posz.wrapping_add(dz_q);
+                }
+            }
+            const INV_Q32: f64 = 1.0 / 4294967296.0;
+            px = posx as f64 * INV_Q32;
+            py = posy as f64 * INV_Q32;
+            pz = posz as f64 * INV_Q32;
+            remaining -= consumed;
+            if stopped {
+                return;
+            }
+        }
+    }
 }
 
 impl UnifiedVolume {
@@ -311,225 +499,18 @@ impl UnifiedVolume {
         result
     }
 
-    /// Specialized walker for the surface compositing inner loop in
-    /// `ObjVolume::paint`: take trilinear samples at integer `w` offsets
-    /// along the ray `base + w * dir` for `w in w_lo..w_hi` and return the
-    /// per-component max. Amortizes the per-sample chunk lookup that
-    /// `get_interpolated` redoes from scratch each call.
-    ///
-    /// `downsampling` follows the usual convention — caller passes
-    /// `1 << target_lod`, base/dir are already in target-LOD voxel coords.
-    ///
-    /// This is the "max" composition variant; alpha/heightmap variants
-    /// can be layered on once the shape stabilizes.
+    /// Convenience wrapper around `composite_along_normal` that returns
+    /// the per-sample max along the ray. Kept so the microbench can
+    /// measure the realistic cost (including the sink dispatch) of the
+    /// path that `ObjVolume::paint` uses.
     pub fn max_along_normal(&self, base: [f64; 3], dir: [f64; 3], w_lo: f64, w_hi: f64, downsampling: i32) -> u8 {
-        let target_lod = lod_for(downsampling.max(1) as u8);
-        let max_lod = self.cache.max_lod();
-        let n_total = (w_hi - w_lo) as i32;
-        if n_total <= 0 {
-            return 0;
-        }
-
-        let dx = dir[0];
-        let dy = dir[1];
-        let dz = dir[2];
-
-        // Pre-step the position so each iteration is `pos += d` instead of
-        // `base + w * d`. Drift over a few dozen steps is well below voxel
-        // size for unit normals.
-        let mut px = base[0] + w_lo * dx;
-        let mut py = base[1] + w_lo * dy;
-        let mut pz = base[2] + w_lo * dz;
-
         let mut acc: u8 = 0;
-        let mut remaining = n_total as usize;
-
-        // Outer: bind a chunk, walk the run of samples that stay inside it.
-        // The "stay inside" predicate is the original fast-path condition:
-        // the +1 trilinear corner must not cross chunk boundaries, i.e.
-        // `floor(p) & 63 != 63` on every axis.
-        //
-        // When the predicate fails on exactly **one** axis we inline a
-        // 2-chunk sample (home + one neighbor) so we don't need to walk
-        // through `interpolate_u8`'s full per-corner LOD machinery.
-        // 2- and 3-axis boundary cases are ~64× and ~4000× rarer and
-        // keep the simple `interpolate_u8` fallback.
-        while remaining > 0 {
-            if px < 0.0 || py < 0.0 || pz < 0.0 {
-                let v = self.interpolate_u8([px, py, pz], downsampling);
-                if v > acc {
-                    acc = v;
-                }
-                px += dx;
-                py += dy;
-                pz += dz;
-                remaining -= 1;
-                continue;
+        self.composite_along_normal(base, dir, w_lo, w_hi, downsampling, &mut |v| {
+            if v > acc {
+                acc = v;
             }
-            let txu = px as u64;
-            let tyu = py as u64;
-            let tzu = pz as u64;
-            let target_cx = (txu / 64) as u32;
-            let target_cy = (tyu / 64) as u32;
-            let target_cz = (tzu / 64) as u32;
-
-            let bound = resolve_chunk(&self.cache, target_lod, max_lod, target_cx, target_cy, target_cz);
-            let Some(b) = bound else {
-                px += dx;
-                py += dy;
-                pz += dz;
-                remaining -= 1;
-                continue;
-            };
-
-            // For chunks the cache resolved at a coarser LOD, the
-            // interpolation lattice is in lod_use coords — give up on the
-            // run-length optimization and use the existing method.
-            if b.shift != 0 {
-                let v = self.interpolate_u8([px, py, pz], downsampling);
-                if v > acc {
-                    acc = v;
-                }
-                px += dx;
-                py += dy;
-                pz += dz;
-                remaining -= 1;
-                continue;
-            }
-
-            // Boundary handling on entry.
-            let bx = (txu & 63) == 63;
-            let by = (tyu & 63) == 63;
-            let bz = (tzu & 63) == 63;
-            let n_boundary = bx as u8 + by as u8 + bz as u8;
-            if n_boundary >= 2 {
-                // 2- or 3-axis: 3 or 7 neighbors. Rare enough that the
-                // generic per-corner fallback is fine.
-                let v = self.interpolate_u8([px, py, pz], downsampling);
-                if v > acc {
-                    acc = v;
-                }
-                px += dx;
-                py += dy;
-                pz += dz;
-                remaining -= 1;
-                continue;
-            }
-            if n_boundary == 1 {
-                // Single-axis: bind one neighbor and sample inline.
-                let (nx_c, ny_c, nz_c) = if bx {
-                    (target_cx + 1, target_cy, target_cz)
-                } else if by {
-                    (target_cx, target_cy + 1, target_cz)
-                } else {
-                    (target_cx, target_cy, target_cz + 1)
-                };
-                let neighbor = resolve_chunk(&self.cache, target_lod, max_lod, nx_c, ny_c, nz_c);
-                // shift > 0 on the neighbor (coarser parent) would put the
-                // neighbor's lattice in a different coord space than home's —
-                // safer to defer to interpolate_u8 in that case.
-                let v = match &neighbor {
-                    Some(b_n) if b_n.shift == 0 => {
-                        let home_mmap = unsafe { b.mmap_slice() };
-                        let neigh_mmap = unsafe { b_n.mmap_slice() };
-                        sample_boundary_1axis(home_mmap, Some(neigh_mmap), bx, by, bz, txu, tyu, tzu, px, py, pz)
-                    }
-                    Some(_) => self.interpolate_u8([px, py, pz], downsampling),
-                    None => {
-                        // Empty neighbor: 4 of the 8 corners are zero.
-                        let home_mmap = unsafe { b.mmap_slice() };
-                        sample_boundary_1axis(home_mmap, None, bx, by, bz, txu, tyu, tzu, px, py, pz)
-                    }
-                };
-                if v > acc {
-                    acc = v;
-                }
-                px += dx;
-                py += dy;
-                pz += dz;
-                remaining -= 1;
-                continue;
-            }
-
-            // How many forward integer steps stay inside the in-chunk
-            // safe float range `[cx*64, cx*64 + 63)` on every axis. The
-            // outer loop re-resolves once any axis crosses out.
-            let lo_x = (target_cx as f64) * 64.0;
-            let lo_y = (target_cy as f64) * 64.0;
-            let lo_z = (target_cz as f64) * 64.0;
-            let hi_x = lo_x + 63.0;
-            let hi_y = lo_y + 63.0;
-            let hi_z = lo_z + 63.0;
-            let kx = run_length_1d(px, dx, lo_x, hi_x);
-            let ky = run_length_1d(py, dy, lo_y, hi_y);
-            let kz = run_length_1d(pz, dz, lo_z, hi_z);
-            let run = kx.min(ky).min(kz).min(remaining);
-            debug_assert!(run >= 1);
-
-            let mmap = unsafe { b.mmap_slice() };
-            // Inner-loop position in Q32.32 fixed-point: high 32 bits are
-            // the integer voxel coord, low 32 are the fraction. The
-            // per-sample advance becomes one `add` per axis (vs f64
-            // `add + branch + conditional sub` for the carry) and weight
-            // extraction becomes one shift+mask (vs `(fx * 256.0) as u32`,
-            // which is mulsd + cvttsd2si). dx_q etc. are precomputed once
-            // per chunk-bound run.
-            //
-            // The conversion `(px * Q32) as i64` is exact for any position
-            // up to ~2^31 voxels, which is well beyond any realistic
-            // volume. Likewise dx_q for normalized unit-vector directions
-            // stays within ±2^32.
-            const Q32_F: f64 = 4294967296.0; // 2^32
-            let mut posx = unsafe { (px * Q32_F).to_int_unchecked::<i64>() };
-            let mut posy = unsafe { (py * Q32_F).to_int_unchecked::<i64>() };
-            let mut posz = unsafe { (pz * Q32_F).to_int_unchecked::<i64>() };
-            let dx_q = unsafe { (dx * Q32_F).to_int_unchecked::<i64>() };
-            let dy_q = unsafe { (dy * Q32_F).to_int_unchecked::<i64>() };
-            let dz_q = unsafe { (dz * Q32_F).to_int_unchecked::<i64>() };
-
-            unsafe {
-                for _ in 0..run {
-                    let cx = (posx >> 32) as u64;
-                    let cy = (posy >> 32) as u64;
-                    let cz = (posz >> 32) as u64;
-                    let tx = (cx & 63) as usize;
-                    let ty = (cy & 63) as usize;
-                    let tz = (cz & 63) as usize;
-                    let idx = tz * 64 * 64 + ty * 64 + tx;
-                    let p000 = *mmap.get_unchecked(idx);
-                    let p100 = *mmap.get_unchecked(idx + 1);
-                    let p010 = *mmap.get_unchecked(idx + 64);
-                    let p110 = *mmap.get_unchecked(idx + 65);
-                    let p001 = *mmap.get_unchecked(idx + 64 * 64);
-                    let p101 = *mmap.get_unchecked(idx + 64 * 64 + 1);
-                    let p011 = *mmap.get_unchecked(idx + 64 * 64 + 64);
-                    let p111 = *mmap.get_unchecked(idx + 64 * 64 + 65);
-                    // Q0.8 weight = the byte just above the fractional MSB.
-                    let fx_q8 = ((posx >> 24) & 0xFF) as u32;
-                    let fy_q8 = ((posy >> 24) & 0xFF) as u32;
-                    let fz_q8 = ((posz >> 24) & 0xFF) as u32;
-                    let v = trilerp_q8(
-                        fx_q8,
-                        fy_q8,
-                        fz_q8,
-                        [p000, p100, p010, p110, p001, p101, p011, p111],
-                    );
-                    if v > acc {
-                        acc = v;
-                    }
-                    posx = posx.wrapping_add(dx_q);
-                    posy = posy.wrapping_add(dy_q);
-                    posz = posz.wrapping_add(dz_q);
-                }
-            }
-            // Sync back to f64 for the outer loop. i64 < 2^52 → f64 cast is
-            // exact; division by 2^32 is exact (exponent-only).
-            const INV_Q32: f64 = 1.0 / 4294967296.0;
-            px = posx as f64 * INV_Q32;
-            py = posy as f64 * INV_Q32;
-            pz = posz as f64 * INV_Q32;
-            remaining -= run;
-        }
+            true
+        });
         acc
     }
 }

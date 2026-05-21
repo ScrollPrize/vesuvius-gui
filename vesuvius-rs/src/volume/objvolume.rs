@@ -1050,29 +1050,46 @@ impl PaintVolume for ObjVolume {
                                             let end = xyz[2] - composite_direction * (composite_layers_behind + 1);
 
                                             let step = if start < end { 1 } else { -1 };
+                                            let n_samples = (end - start) / step;
 
-                                            let mut w = start;
-                                            while w != end {
-                                                let w_factor = w as f64;
-
-                                                let x = x + w_factor * nx;
-                                                let y = y + w_factor * ny;
-                                                let z = z + w_factor * nz;
-
-                                                let new_value = if config.trilinear_interpolation {
-                                                    volume.get_interpolated(
-                                                        [x / ffactor, y / ffactor, z / ffactor],
-                                                        sfactor as i32,
-                                                    )
-                                                } else {
-                                                    volume.get([x / ffactor, y / ffactor, z / ffactor], sfactor as i32)
-                                                };
-
-                                                if !composition.update(new_value) {
-                                                    break;
+                                            if config.trilinear_interpolation {
+                                                // Walk via the backend's composite_along_normal hook.
+                                                // The cache override amortizes the per-sample chunk
+                                                // lookup; other backends fall through to the trait
+                                                // default that just loops get_interpolated.
+                                                let inv_f = 1.0 / ffactor;
+                                                let base = [
+                                                    (x + start as f64 * nx) * inv_f,
+                                                    (y + start as f64 * ny) * inv_f,
+                                                    (z + start as f64 * nz) * inv_f,
+                                                ];
+                                                let dir = [
+                                                    step as f64 * nx * inv_f,
+                                                    step as f64 * ny * inv_f,
+                                                    step as f64 * nz * inv_f,
+                                                ];
+                                                volume.composite_along_normal(
+                                                    base,
+                                                    dir,
+                                                    0.0,
+                                                    n_samples as f64,
+                                                    sfactor as i32,
+                                                    &mut |v| composition.update(v),
+                                                );
+                                            } else {
+                                                let mut w = start;
+                                                while w != end {
+                                                    let w_factor = w as f64;
+                                                    let x = x + w_factor * nx;
+                                                    let y = y + w_factor * ny;
+                                                    let z = z + w_factor * nz;
+                                                    let new_value = volume
+                                                        .get([x / ffactor, y / ffactor, z / ffactor], sfactor as i32);
+                                                    if !composition.update(new_value) {
+                                                        break;
+                                                    }
+                                                    w += step;
                                                 }
-
-                                                w += step;
                                             }
                                             let value = composition.result(composite_total_layers as u32);
                                             buffer.set_gray(
