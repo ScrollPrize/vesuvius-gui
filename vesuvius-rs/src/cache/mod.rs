@@ -28,7 +28,7 @@ mod tests;
 
 pub use backfiller::{BackfillError, BackfillPlan, ChunkBackfiller, SourceOutcome, SourcePayload, SourceSpec};
 pub use cache::ChunkCache;
-pub use disk::ShardCoord;
+pub use disk::{ChunkBitState, ChunkStateBits, ShardCoord, ShardSnapshot};
 pub use downloader::{DownloadError, Downloader};
 pub use state::{ChunkKey, ChunkState};
 pub use volume::UnifiedVolume;

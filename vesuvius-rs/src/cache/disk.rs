@@ -32,6 +32,7 @@ use memmap::{Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -42,13 +43,110 @@ pub enum LoadOutcome {
     Missing,
 }
 
+/// Read-only view returned by `DiskStore::peek_shard`. Bundles the shard's
+/// mmap (for sparse-hole-aware voxel reads) with its per-chunk state
+/// bitmap (so the reader can distinguish "resident" from "sparse hole").
+pub struct ShardSnapshot {
+    pub mmap: Arc<Mmap>,
+    pub state_bits: Arc<ChunkStateBits>,
+}
+
 #[derive(Clone)]
 struct LodFile {
     file: Arc<File>,
     mmap: Arc<Mmap>,
+    /// Per-chunk-in-shard 2-bit state map. Mirrors the sidecar's per-chunk
+    /// state, but indexed by `in_shard_chunk_idx` (so volume readers can
+    /// probe it from a cached shard base without consulting the global
+    /// sidecar bitmap or the cache's DashMap). Populated when the shard is
+    /// first opened (`ensure_open`) and updated on every `write_atomic` /
+    /// `mark_empty` transition.
+    state_bits: Arc<ChunkStateBits>,
 }
 
 pub type ShardCoord = (u32, u32, u32);
+
+/// Per-shard chunk-state bitmap. Two bits per chunk, raster order matching
+/// `in_shard_chunk_idx`. Production size: 128³ × 2 bits = 524 288 bytes
+/// (512 KiB) per (lod, shard).
+///
+/// Encoding:
+/// - `00` Unknown    — never observed; reader takes the slow path (LOD climb).
+/// - `01` Dispatched — fetch in flight; reader still climbs, but bulk
+///   dispatchers can read this to skip re-issuing the same fetch.
+/// - `10` Resident   — chunk bytes are present in the mmap at the matching
+///   offset; reader observing this with `Acquire` is guaranteed to see the
+///   full 256 KiB (paired with the `Release` store in `write_atomic`).
+/// - `11` Empty      — chunk is definitively absent; reader returns 0 and
+///   does *not* climb (Empty at a fine LOD overrides coarser data).
+pub struct ChunkStateBits {
+    words: Box<[AtomicU64]>,
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChunkBitState {
+    Unknown = 0b00,
+    Dispatched = 0b01,
+    Resident = 0b10,
+    Empty = 0b11,
+}
+
+const BITS_PER_CHUNK: u32 = 2;
+
+impl ChunkStateBits {
+    fn new(num_chunks: u64) -> Self {
+        let total_bits = num_chunks * BITS_PER_CHUNK as u64;
+        let num_words = ((total_bits + 63) / 64) as usize;
+        let mut words = Vec::with_capacity(num_words);
+        for _ in 0..num_words {
+            words.push(AtomicU64::new(0));
+        }
+        Self { words: words.into_boxed_slice() }
+    }
+
+    #[inline]
+    pub fn load(&self, in_shard_idx: u64) -> ChunkBitState {
+        let bit_pos = in_shard_idx * BITS_PER_CHUNK as u64;
+        let word_idx = (bit_pos / 64) as usize;
+        let shift = (bit_pos % 64) as u32;
+        // SAFETY: word_idx is checked via the `Box<[AtomicU64]>` indexing.
+        // Acquire pairs with the Release store in `store(Resident)` to
+        // guarantee the mmap bytes are visible.
+        let bits = (self.words[word_idx].load(Ordering::Acquire) >> shift) & 0b11;
+        match bits {
+            0b00 => ChunkBitState::Unknown,
+            0b01 => ChunkBitState::Dispatched,
+            0b10 => ChunkBitState::Resident,
+            _ => ChunkBitState::Empty,
+        }
+    }
+
+    /// CAS-loop store of a 2-bit field. Concurrent stores to *different*
+    /// chunks within the same word race on the CAS but each will succeed
+    /// within a few attempts; same-chunk concurrent writes are guarded by
+    /// the cache's per-chunk dispatch claim, so the only contention here is
+    /// across neighboring chunks of the same shard.
+    pub fn store(&self, in_shard_idx: u64, state: ChunkBitState) {
+        let bit_pos = in_shard_idx * BITS_PER_CHUNK as u64;
+        let word_idx = (bit_pos / 64) as usize;
+        let shift = (bit_pos % 64) as u32;
+        let new_bits = (state as u64) << shift;
+        let mask = 0b11u64 << shift;
+        let word = &self.words[word_idx];
+        let mut cur = word.load(Ordering::Relaxed);
+        loop {
+            let next = (cur & !mask) | new_bits;
+            if next == cur {
+                return;
+            }
+            match word.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
 
 struct LodSlot {
     dims: LodDims,
@@ -249,6 +347,11 @@ impl DiskStore {
         let off = r.in_shard_idx * CHUNK_VOXELS as u64;
         pwrite_all(&lf.file, off, bytes)?;
         self.inner.sidecar.set_state(key.lod, r.sidecar_idx, STATE_RESIDENT);
+        // Bitmap store is the *visibility* publish for readers using the
+        // per-shard fast path: `Release` here pairs with `Acquire` in
+        // `ChunkStateBits::load`, ensuring the mmap bytes pwritten above are
+        // observable once a reader sees `Resident`.
+        lf.state_bits.store(r.in_shard_idx, ChunkBitState::Resident);
         self.inner.maybe_wake_sync();
         Ok(())
     }
@@ -270,12 +373,16 @@ impl DiskStore {
         self.inner.shard_chunks_per_axis
     }
 
-    /// Return the shard's mmap if it is currently open, without creating
-    /// or mapping it. Used by the volume's per-render hot slot to fast-path
-    /// reads once any chunk in the shard has been materialized.
-    pub fn peek_shard(&self, lod: u8, shard: ShardCoord) -> Option<Arc<Mmap>> {
+    /// Return the shard's mmap + per-chunk state bitmap if the shard is
+    /// currently open, without creating or mapping it. Used by the volume's
+    /// per-render hot slot to fast-path reads once any chunk in the shard
+    /// has been materialized.
+    pub fn peek_shard(&self, lod: u8, shard: ShardCoord) -> Option<ShardSnapshot> {
         let slot = self.inner.lods.get(lod as usize)?;
-        slot.opened.lock().unwrap().get(&shard).map(|lf| lf.mmap.clone())
+        slot.opened.lock().unwrap().get(&shard).map(|lf| ShardSnapshot {
+            mmap: lf.mmap.clone(),
+            state_bits: lf.state_bits.clone(),
+        })
     }
 
     /// Mark `key` as definitively absent in the sidecar. No bytes are written
@@ -287,9 +394,22 @@ impl DiskStore {
                 format!("chunk {} out of bounds for this LOD", key),
             )
         })?;
+        // Open the shard so subsequent reads can see the Empty bit through
+        // the per-shard bitmap fast path. The shard file is created (sparse)
+        // by `ensure_open`; no bytes are written.
+        let lf = self.inner.ensure_open(key.lod, r.shard)?;
         self.inner.sidecar.set_state(key.lod, r.sidecar_idx, STATE_EMPTY);
+        lf.state_bits.store(r.in_shard_idx, ChunkBitState::Empty);
         self.inner.maybe_wake_sync();
         Ok(())
+    }
+
+    /// Locate `key`'s shard layout: `(shard_coord, in_shard_chunk_idx)`. The
+    /// volume reader uses this to address the shard's mmap and bitmap. Returns
+    /// `None` if the chunk is out of bounds for this LOD.
+    pub fn locate(&self, key: ChunkKey) -> Option<(ShardCoord, u64)> {
+        let r = self.inner.resolve(key)?;
+        Some((r.shard, r.in_shard_idx))
     }
 }
 
@@ -340,12 +460,56 @@ impl DiskStoreInner {
             ));
         }
         let mmap = unsafe { MmapOptions::new().len(total as usize).map(&file)? };
+        let sca = self.shard_chunks_per_axis as u64;
+        let state_bits = Arc::new(ChunkStateBits::new(sca * sca * sca));
+        self.seed_shard_state_bits(lod, shard, &slot.dims, &state_bits);
         let lf = LodFile {
             file: Arc::new(file),
             mmap: Arc::new(mmap),
+            state_bits,
         };
         guard.insert(shard, lf.clone());
         Ok(lf)
+    }
+
+    /// Populate `bits` for the chunks owned by `(lod, shard)` from the
+    /// sidecar's persisted state. Skips chunks outside the LOD extent
+    /// (`linear_index` returns `None`) — they stay as Unknown.
+    fn seed_shard_state_bits(&self, lod: u8, shard: ShardCoord, dims: &LodDims, bits: &ChunkStateBits) {
+        let sca = self.shard_chunks_per_axis;
+        let s = sca as u64;
+        let base_cx = shard.0 * sca;
+        let base_cy = shard.1 * sca;
+        let base_cz = shard.2 * sca;
+        // Clamp the iteration to the LOD's chunk extent so we don't touch
+        // sidecar slots that don't exist for this LOD.
+        let hi_cx = (base_cx + sca).min(dims.nx);
+        let hi_cy = (base_cy + sca).min(dims.ny);
+        let hi_cz = (base_cz + sca).min(dims.nz);
+        if base_cx >= dims.nx || base_cy >= dims.ny || base_cz >= dims.nz {
+            return;
+        }
+        for cz in base_cz..hi_cz {
+            for cy in base_cy..hi_cy {
+                for cx in base_cx..hi_cx {
+                    let sidecar_idx = match dims.linear_index(cx, cy, cz) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let raw = self.sidecar.get_state(lod, sidecar_idx);
+                    let s_bit = match raw {
+                        STATE_RESIDENT => ChunkBitState::Resident,
+                        STATE_EMPTY => ChunkBitState::Empty,
+                        _ => continue,
+                    };
+                    let wx = (cx - base_cx) as u64;
+                    let wy = (cy - base_cy) as u64;
+                    let wz = (cz - base_cz) as u64;
+                    let in_shard_idx = (wz * s + wy) * s + wx;
+                    bits.store(in_shard_idx, s_bit);
+                }
+            }
+        }
     }
 
     fn shard_bytes(&self) -> u64 {
