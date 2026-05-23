@@ -952,6 +952,7 @@ impl PaintVolume for ObjVolume {
                                                     n_samples as f64,
                                                     sfactor as i32,
                                                     &mut compositor,
+                                                    config.compositing.climb_lod,
                                                 );
                                             } else {
                                                 let mut compositor = composition.as_ref_mut();

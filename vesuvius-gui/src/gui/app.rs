@@ -973,6 +973,12 @@ impl TemplateApp {
                                 &mut self.drawing_config.compositing.reverse_direction,
                             );
                         }
+
+                        cb(
+                            ui,
+                            "Climb LOD pyramid",
+                            &mut self.drawing_config.compositing.climb_lod,
+                        );
                     });
                 }
 

@@ -433,13 +433,18 @@ impl DiskStoreInner {
 
     fn ensure_open(&self, lod: u8, shard: ShardCoord) -> std::io::Result<LodFile> {
         let slot = &self.lods[lod as usize];
+        // Fast path: shard already open. Drop the lock immediately so the
+        // happy case never serializes with concurrent first-opens of other
+        // shards.
         if let Some(lf) = slot.opened.lock().unwrap().get(&shard) {
             return Ok(lf.clone());
         }
-        let mut guard = slot.opened.lock().unwrap();
-        if let Some(lf) = guard.get(&shard) {
-            return Ok(lf.clone());
-        }
+        // Cold path: build the file + mmap + seeded bitmap *outside* the
+        // per-LOD `opened` mutex. Seeding walks 128³ sidecar entries per
+        // shard — holding the lock through that serializes every worker
+        // and per-voxel `peek_shard` against the cold opener. Two threads
+        // can race here; the cheaper-loser handles it with the
+        // double-checked insert below.
         let total = self.shard_bytes();
         let path = self.root.join(shard_filename(lod, shard));
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
@@ -468,6 +473,13 @@ impl DiskStoreInner {
             mmap: Arc::new(mmap),
             state_bits,
         };
+        // Re-check under the lock: if another thread opened the same shard
+        // concurrently, drop our work and use theirs to keep the
+        // mmap/bitmap unique per shard.
+        let mut guard = slot.opened.lock().unwrap();
+        if let Some(existing) = guard.get(&shard) {
+            return Ok(existing.clone());
+        }
         guard.insert(shard, lf.clone());
         Ok(lf)
     }
