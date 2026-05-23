@@ -40,12 +40,13 @@
 use super::backfiller::{
     BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, SourceOutcome, SourcePayload, SourceSpec,
 };
-use super::disk::{DiskStore, LoadOutcome};
+use super::disk::{DiskStore, LoadOutcome, ShardCoord};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone, SubmitResult};
 use super::spill::SpillStore;
 use super::state::{ChunkKey, ChunkState};
 use super::MAX_AGE;
 use dashmap::DashMap;
+use memmap::Mmap;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -304,6 +305,22 @@ impl ChunkCache {
 
     pub fn max_lod(&self) -> u8 {
         self.inner.backfiller.max_lod()
+    }
+
+    /// Chunks-per-axis of one shard cube. The volume's per-render hot slot
+    /// derives shard coordinates from `ChunkKey`s using this value.
+    pub fn shard_chunks_per_axis(&self) -> u32 {
+        self.inner.disk.shard_chunks_per_axis()
+    }
+
+    /// Non-creating peek for a shard's mmap. Returns `Some` once at least one
+    /// chunk in the shard has been materialized (the shard file is `set_len`'d
+    /// + mmapped on first write); returns `None` otherwise. Used by the
+    /// volume's hot slot to bypass per-voxel `state_or_fetch` for any voxel in
+    /// a known-open shard — sparse holes give kernel zeros, which match the
+    /// `get()` semantics for non-resident chunks.
+    pub fn peek_shard_mmap(&self, lod: u8, shard: ShardCoord) -> Option<Arc<Mmap>> {
+        self.inner.disk.peek_shard(lod, shard)
     }
 
     pub fn wait_for(&self, key: ChunkKey, timeout: Duration) -> Arc<ChunkState> {

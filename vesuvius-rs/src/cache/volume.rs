@@ -33,11 +33,14 @@
 //!   so do NOT redivide here.
 
 use super::cache::ChunkCache;
+use super::disk::ShardCoord;
 use super::state::{ChunkKey, ChunkState};
+use super::CHUNK_VOXELS;
 use crate::volume::composition::{CompositionState, CompositorRef, MaxCompositionState};
 use crate::volume::{DrawingConfig, Image, PaintVolume, VolumeCons, VoxelPaintVolume, VoxelVolume};
 use ecolor::Color32;
 use libm::modf;
+use memmap::Mmap;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -47,6 +50,11 @@ const OVERLAY_ALPHA: f32 = 0.35;
 
 pub struct UnifiedVolume {
     cache: ChunkCache,
+    /// Side length (in chunks) of one shard cube — cached from
+    /// `ChunkCache::shard_chunks_per_axis` at construction so the per-voxel
+    /// shard-coord derivation is a couple of integer ops with no method
+    /// call. Production value is 128.
+    shard_chunks_per_axis: u32,
     // Per-volume hot slot for the last target chunk touched by `get`. The
     // cached `chosen` may be a coarser-LOD parent when the target chunk
     // wasn't resident on first hit. `paint()` and external callers clear it
@@ -58,14 +66,34 @@ pub struct UnifiedVolume {
 
 #[derive(Default)]
 struct LocalSlot {
+    /// Phase 1 shard-grain fast path. Once any chunk in `(lod, shard)` has
+    /// been materialized the shard file is `set_len`'d + mmapped, and any
+    /// voxel inside the shard can be served by a single `*base.add(off)`
+    /// load — sparse holes read as kernel zeros, matching the legacy `get`
+    /// semantics for non-resident chunks. Carries `_mmap` to keep the mmap
+    /// alive for the lifetime of `base`.
+    shard: Option<ShardSlot>,
+    /// Slow-path chunk-grain slot, used when the shard isn't mmapped yet
+    /// and the LOD-fallback walk lands on a coarser parent. Lets repeat
+    /// samples in the same target chunk skip the pyramid walk while a
+    /// resolved coarser parent is the best we have.
     target_key: Option<ChunkKey>,
     chosen: Option<(u8, Arc<ChunkState>)>,
 }
 
+struct ShardSlot {
+    lod: u8,
+    shard: ShardCoord,
+    base: *const u8,
+    _mmap: Arc<Mmap>,
+}
+
 impl UnifiedVolume {
     pub fn new(cache: ChunkCache) -> Self {
+        let shard_chunks_per_axis = cache.shard_chunks_per_axis();
         Self {
             cache,
+            shard_chunks_per_axis,
             local: RefCell::new(LocalSlot::default()),
         }
     }
@@ -76,8 +104,92 @@ impl UnifiedVolume {
 
     fn drop_hot_slot(&self) {
         let mut b = self.local.borrow_mut();
+        b.shard = None;
         b.target_key = None;
         b.chosen = None;
+    }
+
+    /// Decompose a target-LOD chunk coord into `(shard_coord,
+    /// in_shard_chunk_idx)`. The byte offset of voxel `(vx, vy, vz)` inside
+    /// the shard mmap is then
+    /// `in_shard_chunk_idx * CHUNK_VOXELS + ((vz & 63) * 64 * 64 + (vy & 63) * 64 + (vx & 63))`.
+    #[inline]
+    fn shard_decompose(&self, cx: u32, cy: u32, cz: u32) -> (ShardCoord, u64) {
+        let sca = self.shard_chunks_per_axis;
+        let shard = (cx / sca, cy / sca, cz / sca);
+        let wx = (cx % sca) as u64;
+        let wy = (cy % sca) as u64;
+        let wz = (cz % sca) as u64;
+        let s = sca as u64;
+        let in_shard_idx = (wz * s + wy) * s + wx;
+        (shard, in_shard_idx)
+    }
+
+    /// Try to serve voxel `(vx, vy, vz)` at `target_lod` from the shard hot
+    /// slot. Returns `Some(value)` on a slot hit; `None` if the slot is
+    /// empty or addresses a different shard.
+    #[inline]
+    fn shard_slot_sample(&self, target_lod: u8, vx: u64, vy: u64, vz: u64) -> Option<u8> {
+        let cx = (vx / 64) as u32;
+        let cy = (vy / 64) as u32;
+        let cz = (vz / 64) as u32;
+        let (shard, in_shard_idx) = self.shard_decompose(cx, cy, cz);
+        let b = self.local.borrow();
+        let slot = b.shard.as_ref()?;
+        if slot.lod != target_lod || slot.shard != shard {
+            return None;
+        }
+        let in_chunk = ((vz & 63) as usize) * 64 * 64 + ((vy & 63) as usize) * 64 + (vx & 63) as usize;
+        let off = (in_shard_idx as usize) * CHUNK_VOXELS + in_chunk;
+        // SAFETY: `slot.base` points into `slot._mmap`, which has length
+        // `shard_chunks_per_axis³ * CHUNK_VOXELS`. Both `in_shard_idx` and
+        // `in_chunk` are computed by modular arithmetic so `off` is always
+        // < that length.
+        Some(unsafe { *slot.base.add(off) })
+    }
+
+    /// Borrow the resident chunk's 64³ slice from the shard hot slot, if
+    /// the slot addresses the same `(lod, shard)` that contains
+    /// `(target_cx, target_cy, target_cz)`. The returned slice is tied to
+    /// the slot's `Arc<Mmap>` which is held in the `RefCell`; callers
+    /// must not hold the borrow across slot writes.
+    #[inline]
+    fn shard_slot_chunk_slice(&self, target_lod: u8, target_cx: u32, target_cy: u32, target_cz: u32) -> Option<*const u8> {
+        let (shard, in_shard_idx) = self.shard_decompose(target_cx, target_cy, target_cz);
+        let b = self.local.borrow();
+        let slot = b.shard.as_ref()?;
+        if slot.lod != target_lod || slot.shard != shard {
+            return None;
+        }
+        // SAFETY: in_shard_idx * CHUNK_VOXELS is within the mmap (see
+        // shard_slot_sample).
+        Some(unsafe { slot.base.add((in_shard_idx as usize) * CHUNK_VOXELS) })
+    }
+
+    /// Try to populate the shard hot slot for `(target_lod, shard)` from
+    /// whatever the cache already has resident. First tries the freshly
+    /// resolved `chosen` Arc<ChunkState> when it carries a Resident at
+    /// `target_lod`; otherwise asks the cache for the shard mmap directly
+    /// (Some only if some chunk in the shard has been materialized).
+    fn populate_shard_slot(
+        &self,
+        target_lod: u8,
+        shard: ShardCoord,
+        chosen: Option<(u8, &Arc<ChunkState>)>,
+    ) {
+        let mmap_arc: Option<Arc<Mmap>> = match chosen {
+            Some((lod_use, state)) if lod_use == target_lod => match state.as_ref() {
+                ChunkState::Resident { mmap, .. } => Some(mmap.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mmap_arc = mmap_arc.or_else(|| self.cache.peek_shard_mmap(target_lod, shard));
+        if let Some(mmap) = mmap_arc {
+            let base = mmap.as_ptr();
+            let mut b = self.local.borrow_mut();
+            b.shard = Some(ShardSlot { lod: target_lod, shard, base, _mmap: mmap });
+        }
     }
 }
 
@@ -109,6 +221,14 @@ impl VoxelVolume for UnifiedVolume {
         let target_sx = (xyz[0] as i64).max(0) as u64;
         let target_sy = (xyz[1] as i64).max(0) as u64;
         let target_sz = (xyz[2] as i64).max(0) as u64;
+
+        // Phase 1 fast path: shard slot hit. Any voxel inside an already-
+        // mmapped shard is one `*base.add(off)` away. Sparse holes give us
+        // zero for chunks not yet written, matching the legacy semantics.
+        if let Some(v) = self.shard_slot_sample(target_lod, target_sx, target_sy, target_sz) {
+            return v;
+        }
+
         let key_t = ChunkKey::new(
             target_lod,
             (target_sx / 64) as u32,
@@ -116,9 +236,11 @@ impl VoxelVolume for UnifiedVolume {
             (target_sz / 64) as u32,
         );
 
-        // Hot slot keyed by the target chunk: if we've already resolved this
-        // target chunk (either to itself or to a coarser parent, or as
-        // Empty) this frame, skip the pyramid walk and just sample.
+        // Slow-path chunk slot: if we've already resolved this target chunk
+        // (to itself, a coarser parent, or Empty) this frame, skip the
+        // pyramid walk and sample whatever's bound. Coarser-LOD fallback
+        // lives here — the shard slot above only fires once the target-LOD
+        // shard is mmapped.
         {
             let b = self.local.borrow();
             if b.target_key == Some(key_t) {
@@ -154,8 +276,15 @@ impl VoxelVolume for UnifiedVolume {
             }
         }
 
+        // Best-effort populate the shard slot so the *next* voxel can use the
+        // fast path. We do this regardless of whether `chosen` is terminal:
+        // the cache may have already mmapped the shard via a prior chunk in
+        // it, even when this particular chunk is still Pending.
+        let (target_shard, _) = self.shard_decompose(key_t.x, key_t.y, key_t.z);
+        self.populate_shard_slot(target_lod, target_shard, chosen.as_ref().map(|(l, s)| (*l, s)));
+
         let Some((lod_use, state)) = chosen else {
-            // Nothing terminal yet. Don't poison the hot slot — a later
+            // Nothing terminal yet. Don't poison the chunk slot — a later
             // pixel in this frame might land after the dispatch completes.
             return 0;
         };
@@ -265,7 +394,7 @@ impl UnifiedVolume {
             let target_cy = (tyu / 64) as u32;
             let target_cz = (tzu / 64) as u32;
 
-            let bound = resolve_chunk(&self.cache, target_lod, max_lod, target_cx, target_cy, target_cz);
+            let bound = self.resolve_chunk(target_lod, max_lod, target_cx, target_cy, target_cz);
             let Some(b) = bound else {
                 px += dx;
                 py += dy;
@@ -309,7 +438,7 @@ impl UnifiedVolume {
                 } else {
                     (target_cx, target_cy, target_cz + 1)
                 };
-                let neighbor = resolve_chunk(&self.cache, target_lod, max_lod, nx_c, ny_c, nz_c);
+                let neighbor = self.resolve_chunk(target_lod, max_lod, nx_c, ny_c, nz_c);
                 let v = match &neighbor {
                     Some(b_n) if b_n.shift == 0 => {
                         let home_mmap = unsafe { b.mmap_slice() };
@@ -423,15 +552,53 @@ impl UnifiedVolume {
         let target_sx = (xyz[0] as i64).max(0) as u64;
         let target_sy = (xyz[1] as i64).max(0) as u64;
         let target_sz = (xyz[2] as i64).max(0) as u64;
-        let key_t = ChunkKey::new(
-            target_lod,
-            (target_sx / 64) as u32,
-            (target_sy / 64) as u32,
-            (target_sz / 64) as u32,
-        );
+        let target_cx = (target_sx / 64) as u32;
+        let target_cy = (target_sy / 64) as u32;
+        let target_cz = (target_sz / 64) as u32;
+        let key_t = ChunkKey::new(target_lod, target_cx, target_cy, target_cz);
 
-        // Resolve the LOD to interpolate at: reuse the hot slot if it still
-        // points at our target chunk, otherwise walk the pyramid.
+        // Phase 1 fast path: if the target shard is mmapped, do the trilerp
+        // straight against the shard's bytes (sparse holes give zero corners
+        // which fold naturally into the trilerp). Only the in-chunk fast
+        // case runs here — the +1-crosses-chunk boundary path uses `get`,
+        // which itself fast-paths through the shard slot.
+        if let Some(chunk_ptr) = self.shard_slot_chunk_slice(target_lod, target_cx, target_cy, target_cz) {
+            // `lod_use == target_lod` for the shard slot path.
+            let (fx_frac, cx0_f) = modf(xyz[0]);
+            let (fy_frac, cy0_f) = modf(xyz[1]);
+            let (fz_frac, cz0_f) = modf(xyz[2]);
+            let cx0 = (cx0_f as i64).max(0) as u64;
+            let cy0 = (cy0_f as i64).max(0) as u64;
+            let cz0 = (cz0_f as i64).max(0) as u64;
+            let fast = (cx0 & 63) != 63 && (cy0 & 63) != 63 && (cz0 & 63) != 63;
+            if fast {
+                let tx = (cx0 & 63) as usize;
+                let ty = (cy0 & 63) as usize;
+                let tz = (cz0 & 63) as usize;
+                let idx = tz * 64 * 64 + ty * 64 + tx;
+                // SAFETY: chunk_ptr addresses a 64³ region inside the shard
+                // mmap (see shard_slot_chunk_slice). idx + 65 + 64*65 ≤
+                // CHUNK_VOXELS for any (tx,ty,tz) with each < 63.
+                let ps: [u8; 8] = unsafe {
+                    [
+                        *chunk_ptr.add(idx),
+                        *chunk_ptr.add(idx + 1),
+                        *chunk_ptr.add(idx + 64),
+                        *chunk_ptr.add(idx + 65),
+                        *chunk_ptr.add(idx + 64 * 64),
+                        *chunk_ptr.add(idx + 64 * 64 + 1),
+                        *chunk_ptr.add(idx + 64 * 64 + 64),
+                        *chunk_ptr.add(idx + 64 * 64 + 65),
+                    ]
+                };
+                return trilerp_q8(frac_q8(fx_frac), frac_q8(fy_frac), frac_q8(fz_frac), ps);
+            }
+            // Fall through to the legacy path which handles the +1-corner
+            // crossing into a neighbor chunk via recursive `get` calls.
+        }
+
+        // Resolve the LOD to interpolate at: reuse the chunk slot if it
+        // still points at our target chunk, otherwise walk the pyramid.
         let chosen: Option<(u8, Arc<ChunkState>)> = {
             let b = self.local.borrow();
             if b.target_key == Some(key_t) {
@@ -455,6 +622,10 @@ impl UnifiedVolume {
                         break;
                     }
                 }
+                // Best-effort populate the shard slot now that we may have
+                // a Resident chunk in our hand.
+                let (target_shard, _) = self.shard_decompose(key_t.x, key_t.y, key_t.z);
+                self.populate_shard_slot(target_lod, target_shard, found.as_ref().map(|(l, s)| (*l, s)));
                 match found {
                     Some(c) => c,
                     None => return 0,
@@ -595,9 +766,9 @@ fn run_length_1d(p: f64, d: f64, lo: f64, hi: f64) -> usize {
 }
 
 /// One target-chunk → LOD-use binding cached across multiple samples on the
-/// same ray. Holds an `Arc<ChunkState>` so the mmap stays alive; the raw
-/// pointer + length pair lets the inner loop materialize `&[u8]` without
-/// re-deref'ing the `Arc` per sample.
+/// same ray. Holds an `Arc<Mmap>` so the underlying region stays alive; the
+/// raw pointer + length pair lets the inner loop materialize `&[u8]`
+/// without re-deref'ing the `Arc` per sample.
 struct BoundChunk {
     /// `lod_use - target_lod`. Zero in the common case (target chunk
     /// resident at the requested LOD); positive when a coarser parent was
@@ -607,39 +778,82 @@ struct BoundChunk {
     /// `interpolate_u8` one sample at a time.
     shift: u8,
     /// Owns the mmap that `mmap_ptr` indexes into.
-    _state: Arc<ChunkState>,
+    _mmap: Arc<Mmap>,
     mmap_ptr: *const u8,
     mmap_len: usize,
 }
 
 impl BoundChunk {
     /// Materialize the chunk's bytes as a slice. The borrow is tied to
-    /// `&self`, and `_state` keeps the mmap alive.
+    /// `&self`, and `_mmap` keeps the underlying mapping alive.
     unsafe fn mmap_slice(&self) -> &[u8] {
         std::slice::from_raw_parts(self.mmap_ptr, self.mmap_len)
     }
 }
 
-fn resolve_chunk(cache: &ChunkCache, target_lod: u8, max_lod: u8, cx: u32, cy: u32, cz: u32) -> Option<BoundChunk> {
-    // Same LOD-walk pattern as `interpolate_u8`/`get`: try target → coarsest,
-    // stop at the first terminal state. `Empty` overrides coarser data.
-    let walk_lo = target_lod.min(max_lod);
-    for lod_try in walk_lo..=max_lod {
-        let shift = lod_try - target_lod;
-        let key = ChunkKey::new(lod_try, cx >> shift, cy >> shift, cz >> shift);
-        let s = cache.state_or_fetch(key);
-        if s.is_terminal() {
-            return match s.as_resident() {
-                Some(slice) => {
-                    let mmap_ptr = slice.as_ptr();
-                    let mmap_len = slice.len();
-                    Some(BoundChunk { shift, _state: s, mmap_ptr, mmap_len })
+impl UnifiedVolume {
+    fn resolve_chunk(&self, target_lod: u8, max_lod: u8, cx: u32, cy: u32, cz: u32) -> Option<BoundChunk> {
+        // Phase 1 fast path: shard slot hit means the target-LOD chunk is
+        // addressable directly from the cached mmap base. No DashMap probe.
+        // Sparse holes give zero corners for non-resident chunks, which the
+        // composite inner loop's trilerp folds in naturally.
+        {
+            let (shard, in_shard_idx) = self.shard_decompose(cx, cy, cz);
+            let b = self.local.borrow();
+            if let Some(slot) = &b.shard {
+                if slot.lod == target_lod && slot.shard == shard {
+                    // SAFETY: in_shard_idx * CHUNK_VOXELS is within the
+                    // shard mmap (see shard_slot_sample).
+                    let mmap_ptr = unsafe { slot.base.add((in_shard_idx as usize) * CHUNK_VOXELS) };
+                    return Some(BoundChunk {
+                        shift: 0,
+                        _mmap: slot._mmap.clone(),
+                        mmap_ptr,
+                        mmap_len: CHUNK_VOXELS,
+                    });
                 }
-                None => None, // Empty
-            };
+            }
         }
+
+        // Slow path: walk target → coarsest, stop at the first terminal
+        // state. `Empty` overrides coarser data.
+        let walk_lo = target_lod.min(max_lod);
+        for lod_try in walk_lo..=max_lod {
+            let shift = lod_try - target_lod;
+            let key = ChunkKey::new(lod_try, cx >> shift, cy >> shift, cz >> shift);
+            let s = self.cache.state_or_fetch(key);
+            if s.is_terminal() {
+                return match s.as_ref() {
+                    ChunkState::Resident { mmap, offset } => {
+                        let mmap_ptr = unsafe { mmap.as_ptr().add(*offset) };
+                        let mmap_len = CHUNK_VOXELS;
+                        let mmap_arc = mmap.clone();
+                        // Populate the shard slot for next-voxel hits, but
+                        // only when we resolved at target_lod (slot is
+                        // target-LOD-shard-keyed).
+                        if shift == 0 {
+                            let (shard, _) = self.shard_decompose(cx, cy, cz);
+                            let mut b = self.local.borrow_mut();
+                            let base = mmap_arc.as_ptr();
+                            b.shard = Some(ShardSlot { lod: target_lod, shard, base, _mmap: mmap_arc.clone() });
+                        }
+                        Some(BoundChunk { shift, _mmap: mmap_arc, mmap_ptr, mmap_len })
+                    }
+                    ChunkState::Empty => None,
+                    _ => None,
+                };
+            }
+        }
+        // Even on full miss the shard may be mmapped from a prior frame —
+        // populate the slot so the next voxel can fast-path.
+        let (shard, _) = self.shard_decompose(cx, cy, cz);
+        if let Some(mmap) = self.cache.peek_shard_mmap(target_lod, shard) {
+            let base = mmap.as_ptr();
+            let mut b = self.local.borrow_mut();
+            b.shard = Some(ShardSlot { lod: target_lod, shard, base, _mmap: mmap });
+        }
+        None
     }
-    None
 }
 
 /// Sample at a position whose `floor()` lands on the +63 row of exactly

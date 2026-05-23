@@ -48,7 +48,7 @@ struct LodFile {
     mmap: Arc<Mmap>,
 }
 
-type ShardCoord = (u32, u32, u32);
+pub type ShardCoord = (u32, u32, u32);
 
 struct LodSlot {
     dims: LodDims,
@@ -259,6 +259,23 @@ impl DiskStore {
     /// durability before the periodic sync would fire.
     pub fn flush(&self) {
         do_sync(&self.inner);
+    }
+
+    /// Chunks-per-axis of one shard cube. Volume readers use this to derive
+    /// `(shard_coord, in_shard_chunk_idx)` from a `ChunkKey` so they can
+    /// cache the shard's mmap base in their hot slot. Production value is
+    /// `SHARD_CHUNKS_PER_AXIS = 128`; tests can construct stores with a
+    /// smaller value.
+    pub fn shard_chunks_per_axis(&self) -> u32 {
+        self.inner.shard_chunks_per_axis
+    }
+
+    /// Return the shard's mmap if it is currently open, without creating
+    /// or mapping it. Used by the volume's per-render hot slot to fast-path
+    /// reads once any chunk in the shard has been materialized.
+    pub fn peek_shard(&self, lod: u8, shard: ShardCoord) -> Option<Arc<Mmap>> {
+        let slot = self.inner.lods.get(lod as usize)?;
+        slot.opened.lock().unwrap().get(&shard).map(|lf| lf.mmap.clone())
     }
 
     /// Mark `key` as definitively absent in the sidecar. No bytes are written
