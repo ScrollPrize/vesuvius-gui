@@ -145,9 +145,19 @@ impl Header {
 /// In-memory chunk-state index. Owns one `Vec<AtomicU8>` per LOD plus a
 /// per-LOD counter of transitions since last sync. Files are managed by
 /// `DiskStore`; this struct is just the bookkeeping.
+///
+/// The `access_epochs` column is a parallel `Vec<AtomicU8>` per LOD,
+/// indexed identically to `bitmaps`. Each byte is the cache-wide epoch
+/// (see `epoch.rs`) at which the chunk was last accessed. Initialized to
+/// 0 on a fresh sidecar; the persisted file format hasn't been extended
+/// yet, so on reload everything resets to 0 (TODO: write-back). That's
+/// safe — purge interprets "epoch 0 with current=N" as the oldest
+/// possible chunk, which biases reloaded volumes to be evicted first.
+/// Acceptable as a starting point.
 pub struct Sidecar {
     pub header: Header,
     bitmaps: Vec<Vec<AtomicU8>>,
+    access_epochs: Vec<Vec<AtomicU8>>,
     pending: Vec<AtomicU64>,
 }
 
@@ -164,10 +174,21 @@ impl Sidecar {
                 v
             })
             .collect();
+        let access_epochs = header
+            .lods
+            .iter()
+            .map(|d| {
+                let n = d.count() as usize;
+                let mut v = Vec::with_capacity(n);
+                v.resize_with(n, || AtomicU8::new(0));
+                v
+            })
+            .collect();
         let pending = (0..header.lods.len()).map(|_| AtomicU64::new(0)).collect();
         Self {
             header,
             bitmaps,
+            access_epochs,
             pending,
         }
     }
@@ -192,9 +213,23 @@ impl Sidecar {
             bitmaps.push(atoms);
         }
         let pending = (0..header.lods.len()).map(|_| AtomicU64::new(0)).collect();
+        // TODO: persist + reload access_epochs. For now reset to 0 on
+        // reopen; chunks loaded from a prior session look "oldest" until
+        // they're touched again.
+        let access_epochs = header
+            .lods
+            .iter()
+            .map(|d| {
+                let n = d.count() as usize;
+                let mut v = Vec::with_capacity(n);
+                v.resize_with(n, || AtomicU8::new(0));
+                v
+            })
+            .collect();
         Ok(Some(Self {
             header,
             bitmaps,
+            access_epochs,
             pending,
         }))
     }
@@ -236,6 +271,20 @@ impl Sidecar {
     /// Total transitions across all LODs since the last snapshot.
     pub fn total_pending(&self) -> u64 {
         self.pending.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Read the access epoch tagged on `(lod, idx)`. Returns 0 for slots
+    /// that have never been touched (or were reloaded from an older
+    /// sidecar format).
+    pub fn get_access_epoch(&self, lod: u8, idx: u64) -> u8 {
+        self.access_epochs[lod as usize][idx as usize].load(Ordering::Relaxed)
+    }
+
+    /// Stamp `(lod, idx)` with `epoch`. Called by the cache on transitions
+    /// (the read fast path's `!=` filter ensures this is only called when
+    /// the value would actually change).
+    pub fn set_access_epoch(&self, lod: u8, idx: u64, epoch: u8) {
+        self.access_epochs[lod as usize][idx as usize].store(epoch, Ordering::Relaxed);
     }
 }
 

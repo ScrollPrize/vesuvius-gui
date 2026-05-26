@@ -16,6 +16,8 @@ mod backfiller;
 mod cache;
 mod disk;
 mod downloader;
+pub mod epoch;
+pub mod purge;
 mod sidecar;
 mod spill;
 mod state;

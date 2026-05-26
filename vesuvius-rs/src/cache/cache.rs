@@ -42,6 +42,7 @@ use super::backfiller::{
 };
 use super::disk::{DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone, SubmitResult};
+use super::epoch::{self, EpochState};
 use super::spill::SpillStore;
 use super::state::{ChunkKey, ChunkState};
 use super::{CHUNK_VOXELS, MAX_AGE};
@@ -104,6 +105,10 @@ struct Inner {
     /// compares this against the chunk's stamp; equal means "already
     /// touched this frame, skip the queue mutexes."
     frame: AtomicU64,
+    /// Cache-wide LRU bookkeeping shared across volumes under the same
+    /// unified root. Bumped on chunk fill (write path) and on access
+    /// transitions (read path). See `epoch.rs`.
+    epoch: Arc<EpochState>,
 }
 
 enum SourceState {
@@ -238,6 +243,15 @@ impl ChunkCache {
         let extent = backfiller.voxel_extent();
         let max_lod = backfiller.max_lod();
 
+        // The unified root holds the cache-wide EpochState. Conventionally
+        // it's the parent of the per-volume chunks_root (see `new` →
+        // `cache_dir/unified/<volume_id>`); for callers that construct a
+        // ChunkCache via `new_at` with an unusual layout we fall back to
+        // chunks_root itself, which keeps the state per-volume rather
+        // than cache-wide. That's a degraded mode but still correct.
+        let unified_root = chunks_root.parent().unwrap_or(&chunks_root).to_path_buf();
+        let epoch = epoch::shared_for_unified_root(&unified_root, epoch::DEFAULT_CAP_BYTES);
+
         let inner = Arc::new(Inner {
             map: DashMap::new(),
             dispatching: DashMap::new(),
@@ -250,6 +264,7 @@ impl ChunkCache {
             task_queue,
             downloader,
             frame: AtomicU64::new(1),
+            epoch,
         });
 
         for i in 0..workers.max(1) {
@@ -278,7 +293,27 @@ impl ChunkCache {
     /// is Missing/expired. Pending entries get touched on every call so
     /// the next worker pop sees the freshest in-flight chunks first.
     pub fn state_or_fetch(&self, key: ChunkKey) -> Arc<ChunkState> {
-        self.inner.state_or_fetch(key)
+        let state = self.inner.state_or_fetch(key);
+        if state.as_resident().is_some() {
+            self.touch_access(key);
+        }
+        state
+    }
+
+    /// Bump `key`'s access-epoch tag to the current cache epoch. Cheap
+    /// no-op when the tag already matches (two atomic loads + a compare,
+    /// no histogram update). TODO: the volume hot path uses `peek_shard`
+    /// and never enters here; integrate access tracking at the shard
+    /// level (or at frame boundaries) to cover the inner-loop reads.
+    fn touch_access(&self, key: ChunkKey) {
+        let current = self.inner.epoch.current();
+        let Some(old) = self.inner.disk.get_access_epoch(key) else {
+            return;
+        };
+        if old != current {
+            let now = self.inner.epoch.record_access(old);
+            self.inner.disk.set_access_epoch(key, now);
+        }
     }
 
     /// Cheap state lookup without dispatching a fetch. Returns `None` if no
@@ -1095,16 +1130,26 @@ impl Inner {
     fn primary_state(&self, key: ChunkKey, primary: ExtractedChunk, t0: std::time::Instant) -> Arc<ChunkState> {
         match primary {
             ExtractedChunk::Bytes(bytes) => match self.disk.write_atomic(key, &bytes) {
-                Ok(()) => match self.disk.try_load(key) {
-                    Some((mmap, offset)) => {
-                        log::debug!("[{}] ready ({:?})", key, t0.elapsed());
-                        Arc::new(ChunkState::Resident { mmap, offset })
+                Ok(()) => {
+                    // LRU bookkeeping: record the fill in the cache-wide
+                    // epoch state and stamp the sidecar's access-epoch
+                    // column with the returned epoch byte. This is the
+                    // single chokepoint for both primary and sibling
+                    // chunk writes — see the caller in `run_extract`.
+                    let ep = self.epoch.record_fill(CHUNK_VOXELS as u64);
+                    self.disk.set_access_epoch(key, ep);
+
+                    match self.disk.try_load(key) {
+                        Some((mmap, offset)) => {
+                            log::debug!("[{}] ready ({:?})", key, t0.elapsed());
+                            Arc::new(ChunkState::Resident { mmap, offset })
+                        }
+                        None => {
+                            log::warn!("[{}] write ok but mmap reload failed", key);
+                            cooldown()
+                        }
                     }
-                    None => {
-                        log::warn!("[{}] write ok but mmap reload failed", key);
-                        cooldown()
-                    }
-                },
+                }
                 Err(e) => {
                     log::warn!("[{}] disk write failed: {}", key, e);
                     cooldown()

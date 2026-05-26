@@ -497,6 +497,23 @@ impl DiskStore {
         let r = self.inner.resolve(key)?;
         Some((r.shard, r.in_shard_idx))
     }
+
+    /// Read the access epoch tag for `key` from the sidecar. Returns
+    /// `None` only when the key is out of bounds for its LOD.
+    pub fn get_access_epoch(&self, key: ChunkKey) -> Option<u8> {
+        let r = self.inner.resolve(key)?;
+        Some(self.inner.sidecar.get_access_epoch(key.lod, r.sidecar_idx))
+    }
+
+    /// Stamp `key` with `epoch`. Silently no-ops if the key is out of
+    /// bounds. Does not mark the sidecar pending — access-epoch updates
+    /// are LRU bookkeeping, not residency state; the sync thread picks
+    /// them up alongside the next bitmap flush.
+    pub fn set_access_epoch(&self, key: ChunkKey, epoch: u8) {
+        if let Some(r) = self.inner.resolve(key) {
+            self.inner.sidecar.set_access_epoch(key.lod, r.sidecar_idx, epoch);
+        }
+    }
 }
 
 impl DiskStoreInner {

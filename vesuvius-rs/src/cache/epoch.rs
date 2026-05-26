@@ -1,0 +1,390 @@
+//! Cache-wide LRU bookkeeping for purge planning.
+//!
+//! A single global `EpochState` shared by every per-volume cache instance
+//! lives at `<cache_root>/unified/epoch.idx`. It tracks:
+//!
+//! - `current` — the active u8 epoch. Wraps after 256 advances; purge keeps
+//!   surviving chunks within 255 epochs of `current`, so wrap is safe.
+//! - `bytes_since_advance` — cache-wide bytes written into shard files since
+//!   the last advance. Advancing happens once `bytes_per_epoch` is crossed.
+//! - `bytes_per_epoch` — derived from the configured cache cap so the full
+//!   256-slot range covers ≈1.1× cap (10% headroom).
+//! - `total_chunks` — current resident chunk count (cache-wide).
+//! - `epoch_times[i]` — wall time at which slot `i` was last entered.
+//! - `epoch_chunks[i]` — number of chunks whose `access_epoch == i`. Updated
+//!   on fill, access transition (past the `!=` filter), and evict. Used
+//!   for goal-based purge planning and as the wrap guard at advance time.
+//!
+//! Hot path (per chunk access) does at most: one `current()` load, one
+//! comparison, and on transition two histogram updates. Reads that already
+//! see `access_epoch == current` short-circuit before touching this struct.
+//!
+//! Persistence is a flat little-endian blob; serialization is intentionally
+//! minimal because the file is small (a few KB) and rewritten alongside
+//! the sidecar by the same sync thread.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const EPOCH_SLOTS: usize = 256;
+
+/// Default cache cap used to derive `bytes_per_epoch` when no value is
+/// threaded through from configuration yet. 64 GiB is comfortable for
+/// development on the canonical 200 GB target without making
+/// `bytes_per_epoch` so small that tests trigger advances accidentally.
+pub const DEFAULT_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Headroom factor applied to the configured cache cap when deriving
+/// `bytes_per_epoch`. With a 10% headroom the full 256 slots cover ≈1.1×
+/// cap, so even a cache that runs slightly over its target before purge
+/// fires still has wrap-safe budget.
+const HEADROOM_NUM: u128 = 11;
+const HEADROOM_DEN: u128 = 10;
+
+pub struct EpochState {
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    current: u8,
+    bytes_since_advance: u64,
+    bytes_per_epoch: u64,
+    cap_bytes: u64,
+    total_chunks: u64,
+    epoch_times: [Option<SystemTime>; EPOCH_SLOTS],
+    epoch_chunks: [u32; EPOCH_SLOTS],
+}
+
+impl EpochState {
+    pub fn new(cap_bytes: u64) -> Self {
+        let bytes_per_epoch = derive_bytes_per_epoch(cap_bytes);
+        let mut epoch_times = [None; EPOCH_SLOTS];
+        epoch_times[0] = Some(SystemTime::now());
+        Self {
+            inner: Mutex::new(Inner {
+                current: 0,
+                bytes_since_advance: 0,
+                bytes_per_epoch,
+                cap_bytes,
+                total_chunks: 0,
+                epoch_times,
+                epoch_chunks: [0; EPOCH_SLOTS],
+            }),
+        }
+    }
+
+    pub fn current(&self) -> u8 {
+        self.inner.lock().unwrap().current
+    }
+
+    pub fn total_chunks(&self) -> u64 {
+        self.inner.lock().unwrap().total_chunks
+    }
+
+    pub fn cap_bytes(&self) -> u64 {
+        self.inner.lock().unwrap().cap_bytes
+    }
+
+    pub fn bytes_per_epoch(&self) -> u64 {
+        self.inner.lock().unwrap().bytes_per_epoch
+    }
+
+    /// Snapshot the per-epoch histogram for purge planning / dashboards.
+    pub fn epoch_chunks(&self) -> [u32; EPOCH_SLOTS] {
+        self.inner.lock().unwrap().epoch_chunks
+    }
+
+    /// Snapshot of advance timestamps. `None` for slots that haven't been
+    /// entered since the state was created.
+    pub fn epoch_times(&self) -> [Option<SystemTime>; EPOCH_SLOTS] {
+        self.inner.lock().unwrap().epoch_times
+    }
+
+    /// Account for a newly written chunk: bumps `bytes_since_advance`,
+    /// advances the epoch if the threshold is crossed, then tags the
+    /// chunk with the (post-advance) current epoch and bumps the
+    /// histogram bucket for that epoch. Returns the epoch the chunk
+    /// should be written into the sidecar's access-epoch column.
+    pub fn record_fill(&self, bytes_written: u64) -> u8 {
+        let mut s = self.inner.lock().unwrap();
+        s.bytes_since_advance = s.bytes_since_advance.saturating_add(bytes_written);
+        Self::maybe_advance(&mut s, SystemTime::now());
+        s.total_chunks += 1;
+        let cur = s.current;
+        s.epoch_chunks[cur as usize] = s.epoch_chunks[cur as usize].saturating_add(1);
+        cur
+    }
+
+    /// Account for an access to a chunk currently tagged with `old_epoch`.
+    /// Returns the current epoch; if it differs from `old_epoch`, the
+    /// caller should write it into the access-epoch column.
+    pub fn record_access(&self, old_epoch: u8) -> u8 {
+        let mut s = self.inner.lock().unwrap();
+        let cur = s.current;
+        if old_epoch != cur {
+            let old = s.epoch_chunks[old_epoch as usize];
+            if old > 0 {
+                s.epoch_chunks[old_epoch as usize] = old - 1;
+            }
+            s.epoch_chunks[cur as usize] = s.epoch_chunks[cur as usize].saturating_add(1);
+        }
+        cur
+    }
+
+    /// Account for an evicted chunk whose last-known access epoch was
+    /// `victim_epoch`. Decrements both the histogram bucket and the global
+    /// chunk count.
+    pub fn record_evict(&self, victim_epoch: u8) {
+        let mut s = self.inner.lock().unwrap();
+        let cnt = s.epoch_chunks[victim_epoch as usize];
+        if cnt > 0 {
+            s.epoch_chunks[victim_epoch as usize] = cnt - 1;
+        }
+        if s.total_chunks > 0 {
+            s.total_chunks -= 1;
+        }
+    }
+
+    fn maybe_advance(s: &mut Inner, now: SystemTime) {
+        // Cap iterations at EPOCH_SLOTS: after that many advances we've
+        // wrapped through every slot, so any leftover is just bookkeeping
+        // noise. This also bounds the cost of pathological callers that
+        // pass a huge `bytes_written` to `record_fill`.
+        let mut advances = 0usize;
+        while s.bytes_since_advance >= s.bytes_per_epoch && advances < EPOCH_SLOTS {
+            s.bytes_since_advance -= s.bytes_per_epoch;
+            advances += 1;
+            let next = s.current.wrapping_add(1);
+            if s.epoch_chunks[next as usize] != 0 {
+                // TODO: trigger a synchronous purge here once purge.rs is
+                // wired. In the stub we just shout — the watermark policy
+                // should make this unreachable in practice.
+                log::warn!(
+                    "epoch advance into occupied slot {} ({} chunks); purge needed",
+                    next,
+                    s.epoch_chunks[next as usize]
+                );
+            }
+            s.current = next;
+            s.epoch_times[next as usize] = Some(now);
+        }
+        if advances == EPOCH_SLOTS {
+            // We've already cycled the whole ring; drop the remainder so
+            // the next fill starts from a clean state.
+            s.bytes_since_advance = 0;
+        }
+    }
+
+    /// Persist a snapshot to `path` (atomic temp+rename). Stub format:
+    /// little-endian field-by-field. Versioned via the magic.
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let s = self.inner.lock().unwrap();
+        let mut buf = Vec::with_capacity(EPOCH_BYTES);
+        buf.extend_from_slice(MAGIC);
+        buf.push(s.current);
+        buf.extend_from_slice(&s.bytes_since_advance.to_le_bytes());
+        buf.extend_from_slice(&s.bytes_per_epoch.to_le_bytes());
+        buf.extend_from_slice(&s.cap_bytes.to_le_bytes());
+        buf.extend_from_slice(&s.total_chunks.to_le_bytes());
+        for t in &s.epoch_times {
+            let secs = t
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            buf.extend_from_slice(&secs.to_le_bytes());
+        }
+        for c in &s.epoch_chunks {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+
+        let parent = path.parent().expect("epoch path has parent");
+        std::fs::create_dir_all(parent)?;
+        let tmp = parent.join(format!(
+            "{}.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Load a snapshot from `path`. Returns `Ok(None)` if absent.
+    pub fn load(path: &Path) -> std::io::Result<Option<Self>> {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut buf = Vec::with_capacity(EPOCH_BYTES);
+        f.read_to_end(&mut buf)?;
+        if buf.len() < EPOCH_BYTES || &buf[..MAGIC.len()] != MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad epoch state magic / length",
+            ));
+        }
+        let mut p = MAGIC.len();
+        let current = buf[p];
+        p += 1;
+        let bytes_since_advance = read_u64(&buf, &mut p);
+        let bytes_per_epoch = read_u64(&buf, &mut p);
+        let cap_bytes = read_u64(&buf, &mut p);
+        let total_chunks = read_u64(&buf, &mut p);
+
+        let mut epoch_times = [None; EPOCH_SLOTS];
+        for slot in &mut epoch_times {
+            let secs = read_u64(&buf, &mut p);
+            *slot = if secs == 0 {
+                None
+            } else {
+                Some(UNIX_EPOCH + Duration::from_secs(secs))
+            };
+        }
+        let mut epoch_chunks = [0u32; EPOCH_SLOTS];
+        for slot in &mut epoch_chunks {
+            *slot = read_u32(&buf, &mut p);
+        }
+
+        Ok(Some(Self {
+            inner: Mutex::new(Inner {
+                current,
+                bytes_since_advance,
+                bytes_per_epoch,
+                cap_bytes,
+                total_chunks,
+                epoch_times,
+                epoch_chunks,
+            }),
+        }))
+    }
+}
+
+fn derive_bytes_per_epoch(cap_bytes: u64) -> u64 {
+    let n = (cap_bytes as u128 * HEADROOM_NUM) / (HEADROOM_DEN * EPOCH_SLOTS as u128);
+    n.max(1) as u64
+}
+
+fn read_u64(buf: &[u8], p: &mut usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&buf[*p..*p + 8]);
+    *p += 8;
+    u64::from_le_bytes(a)
+}
+
+fn read_u32(buf: &[u8], p: &mut usize) -> u32 {
+    let mut a = [0u8; 4];
+    a.copy_from_slice(&buf[*p..*p + 4]);
+    *p += 4;
+    u32::from_le_bytes(a)
+}
+
+const MAGIC: &[u8; 8] = b"VCEPO001";
+// magic (8) + current (1) + 4×u64 (32) + 256×u64 (2048) + 256×u32 (1024) = 3113
+const EPOCH_BYTES: usize = 8 + 1 + 8 * 4 + 8 * EPOCH_SLOTS + 4 * EPOCH_SLOTS;
+
+pub fn epoch_state_path(unified_root: &Path) -> PathBuf {
+    unified_root.join("epoch.idx")
+}
+
+/// Process-wide registry of `EpochState` instances keyed by the unified
+/// cache root (`<cache_dir>/unified/`). Every `ChunkCache` whose volume
+/// lives under the same unified root sees the same in-memory state, so
+/// epoch advances, the histogram, and the chunk count are cache-wide.
+///
+/// First call for a given root loads the persisted state if present, or
+/// constructs a fresh one with `cap_bytes`. Subsequent calls return the
+/// existing `Arc` and ignore `cap_bytes` (a running process keeps the
+/// cap it was first given for this root — resize-while-running isn't
+/// supported yet).
+pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<EpochState> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<EpochState>>>> = OnceLock::new();
+    let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = reg.lock().unwrap();
+    if let Some(s) = g.get(unified_root) {
+        return s.clone();
+    }
+    let path = epoch_state_path(unified_root);
+    let state = match EpochState::load(&path) {
+        Ok(Some(s)) => Arc::new(s),
+        Ok(None) => Arc::new(EpochState::new(cap_bytes)),
+        Err(e) => {
+            log::warn!(
+                "epoch state load failed at {}: {}; starting fresh",
+                path.display(),
+                e
+            );
+            Arc::new(EpochState::new(cap_bytes))
+        }
+    };
+    g.insert(unified_root.to_path_buf(), state.clone());
+    state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_per_epoch_is_capx11_div_256() {
+        let cap = 200u64 << 30; // 200 GiB
+        let bpe = derive_bytes_per_epoch(cap);
+        let expected = (cap as u128 * 11 / 10 / 256) as u64;
+        assert_eq!(bpe, expected);
+    }
+
+    #[test]
+    fn record_fill_advances_after_threshold() {
+        let s = EpochState::new(1024); // bytes_per_epoch = 1024*11/10/256 = 44
+        // Drop in chunks larger than one epoch's worth.
+        for _ in 0..10 {
+            s.record_fill(100);
+        }
+        assert!(s.current() > 0, "expected epoch advance after fills");
+        assert_eq!(s.total_chunks(), 10);
+    }
+
+    #[test]
+    fn record_access_moves_histogram_bucket() {
+        let s = EpochState::new(1 << 20);
+        // Plant a chunk in epoch 0.
+        let cur0 = s.record_fill(0);
+        // Force exactly one advance, planting a second chunk in the new
+        // epoch.
+        let bpe = s.bytes_per_epoch();
+        let cur1 = s.record_fill(bpe + 1);
+        assert_ne!(cur0, cur1, "expected one epoch advance");
+        // First chunk is tagged cur0, second is tagged cur1.
+        let h_before = s.epoch_chunks();
+        assert_eq!(h_before[cur0 as usize], 1);
+        assert_eq!(h_before[cur1 as usize], 1);
+        // Access the first chunk; it should move from cur0 to cur1.
+        let observed_cur = s.record_access(cur0);
+        assert_eq!(observed_cur, cur1);
+        let h_after = s.epoch_chunks();
+        assert_eq!(h_after[cur0 as usize], 0);
+        assert_eq!(h_after[cur1 as usize], 2);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("vesuvius-epoch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = epoch_state_path(&dir);
+
+        let s = EpochState::new(1 << 30);
+        s.record_fill(0);
+        s.save(&path).unwrap();
+
+        let back = EpochState::load(&path).unwrap().unwrap();
+        assert_eq!(back.current(), s.current());
+        assert_eq!(back.total_chunks(), s.total_chunks());
+        assert_eq!(back.epoch_chunks(), s.epoch_chunks());
+    }
+}
