@@ -62,10 +62,17 @@ impl EpochState {
     pub fn new(cap_bytes: u64) -> Self {
         let bytes_per_epoch = derive_bytes_per_epoch(cap_bytes);
         let mut epoch_times = [None; EPOCH_SLOTS];
-        epoch_times[0] = Some(SystemTime::now());
+        // Epoch 0 is reserved for "unknown / legacy": chunks loaded from
+        // a sidecar that pre-dates the access-epoch column come in at 0
+        // (the EOF-fallback in `Sidecar::load`). A fresh `EpochState`
+        // therefore starts at `current = 1`, so freshly written chunks
+        // are distinguishable from legacy ones and the modular wrap
+        // guard fires before `current` would overwrite legacy entries.
+        // Cost: one epoch slot is conceptually "reserved" — negligible.
+        epoch_times[1] = Some(SystemTime::now());
         Self {
             inner: Mutex::new(Inner {
-                current: 0,
+                current: 1,
                 bytes_since_advance: 0,
                 bytes_per_epoch,
                 cap_bytes,
@@ -365,6 +372,23 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
 }
 
 #[cfg(test)]
+impl EpochState {
+    /// Test-only: advance `current` by `n` epochs without planting a
+    /// chunk. Used to age existing chunks so a purge test can pick a
+    /// non-trivial threshold. Does not adjust the histogram (no chunks
+    /// move); only `current` and `epoch_times` change.
+    pub fn force_advance(&self, n: u8) {
+        let mut s = self.inner.lock().unwrap();
+        let now = SystemTime::now();
+        for _ in 0..n {
+            let next = s.current.wrapping_add(1);
+            s.current = next;
+            s.epoch_times[next as usize] = Some(now);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -379,11 +403,12 @@ mod tests {
     #[test]
     fn record_fill_advances_after_threshold() {
         let s = EpochState::new(1024); // bytes_per_epoch = 1024*11/10/256 = 44
+        let initial = s.current();
         // Drop in chunks larger than one epoch's worth.
         for _ in 0..10 {
             s.record_fill(100);
         }
-        assert!(s.current() > 0, "expected epoch advance after fills");
+        assert_ne!(s.current(), initial, "expected epoch advance after fills");
         assert_eq!(s.total_chunks(), 10);
     }
 

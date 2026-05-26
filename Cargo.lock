@@ -4069,6 +4069,7 @@ dependencies = [
  "env_logger",
  "fxhash",
  "itertools",
+ "libc",
  "libm",
  "log",
  "lz4-compression",

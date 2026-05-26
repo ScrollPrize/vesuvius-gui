@@ -40,9 +40,11 @@
 use super::backfiller::{
     BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, SourceOutcome, SourcePayload, SourceSpec,
 };
-use super::disk::{DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
+use super::disk::{ChunkBitState, DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone, SubmitResult};
 use super::epoch::{self, EpochState};
+use super::purge::PurgePlan;
+use super::sidecar::STATE_MISSING;
 use super::spill::SpillStore;
 use super::state::{ChunkKey, ChunkState};
 use super::{CHUNK_VOXELS, MAX_AGE};
@@ -327,6 +329,39 @@ impl ChunkCache {
         }
     }
 
+    /// Evict the oldest chunks until at least `target_chunks` have been
+    /// freed (or until no more victims are available). Returns the number
+    /// of chunks actually evicted.
+    ///
+    /// Eviction order per victim, to keep readers safe:
+    ///   1. Remove the in-memory `ChunkState::Resident` entry from the
+    ///      DashMap, so any future lookup re-takes the slow path.
+    ///   2. Demote the per-shard `ChunkStateBits` to Unknown (Release).
+    ///   3. Demote the sidecar's persistent state byte to Missing
+    ///      (Release; bumps the pending counter so the sync thread
+    ///      eventually durably records the eviction).
+    ///   4. Punch the chunk's slot in the shard file
+    ///      (`fallocate(FALLOC_FL_PUNCH_HOLE)`), freeing physical
+    ///      blocks.
+    ///   5. Update the global `EpochState` histogram and total_chunks.
+    ///
+    /// Readers that already passed the bitmap check before step 2 may
+    /// transiently see zeros from the punched mmap; the async pipeline
+    /// tolerates that, and the next paint loop re-dispatches.
+    pub fn purge_to_target(&self, target_chunks: u64) -> u64 {
+        let Some(plan) = PurgePlan::build(&self.inner.epoch, target_chunks) else {
+            return 0;
+        };
+        self.inner.run_purge(plan)
+    }
+
+    /// Access the cache-wide LRU bookkeeping (shared across volumes
+    /// under the same unified root). Useful for stats dashboards and
+    /// integration tests; the cache owns the lifetime.
+    pub fn epoch_state(&self) -> Arc<EpochState> {
+        self.inner.epoch.clone()
+    }
+
     /// Cheap state lookup without dispatching a fetch. Returns `None` if no
     /// entry exists for `key` yet. Useful for LOD-fallback paths that only
     /// want to render whatever is already resident.
@@ -510,6 +545,69 @@ fn pending_state() -> Arc<ChunkState> {
 }
 
 impl Inner {
+    /// Evict all Resident chunks whose access epoch falls into the
+    /// `plan.is_victim` set. See `ChunkCache::purge_to_target` for the
+    /// ordering rationale (bitmap demote first, then punch).
+    fn run_purge(&self, plan: PurgePlan) -> u64 {
+        let sidecar = self.disk.sidecar();
+        let current = self.epoch.current();
+        let mut evicted: u64 = 0;
+
+        for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
+            let lod = lod_idx as u8;
+            let nx = dims.nx as u64;
+            let ny = dims.ny as u64;
+            for idx in 0..dims.count() {
+                if sidecar.get_state(lod, idx) != super::sidecar::STATE_RESIDENT {
+                    continue;
+                }
+                let ae = sidecar.get_access_epoch(lod, idx);
+                if !plan.is_victim(ae, current) {
+                    continue;
+                }
+                // Un-flatten linear idx to (x, y, z); raster order is
+                // `(z * ny + y) * nx + x`.
+                let x = (idx % nx) as u32;
+                let y = ((idx / nx) % ny) as u32;
+                let z = (idx / (nx * ny)) as u32;
+                let key = ChunkKey::new(lod, x, y, z);
+
+                // (1) Drop the in-memory Resident entry so new lookups
+                // take the slow path. Existing Arc holders keep their
+                // ChunkState alive but will read zeros after the punch.
+                self.map.remove(&key);
+
+                // (2) Per-shard bitmap demote. Resident chunks have an
+                // open shard (write_atomic opened it); if for some
+                // reason it's not open we skip and let readers fall
+                // back to the sidecar.
+                if let Some((shard, in_shard_idx)) = self.disk.locate(key) {
+                    if let Some(snap) = self.disk.peek_shard(lod, shard) {
+                        snap.state_bits.store(in_shard_idx, ChunkBitState::Unknown);
+                    }
+                    let _ = (shard, in_shard_idx);
+                }
+
+                // (3) Sidecar demote (Release + bumps pending so the
+                // sync thread flushes this transition).
+                sidecar.set_state(lod, idx, STATE_MISSING);
+
+                // (4) Physical reclaim. Failure here is non-fatal —
+                // the chunk is already logically evicted; the blocks
+                // just stay allocated.
+                if let Err(e) = self.disk.punch_hole(key) {
+                    log::warn!("punch_hole failed for {}: {}", key, e);
+                }
+
+                // (5) Bookkeeping.
+                self.epoch.record_evict(ae);
+                evicted += 1;
+            }
+        }
+
+        evicted
+    }
+
     /// Same semantics as `ChunkCache::state_or_fetch` but callable from
     /// inside cache internals (notably `register_source`'s Chunk-variant
     /// handler, which dispatches a child chunk synchronously without ever

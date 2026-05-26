@@ -34,6 +34,9 @@ wavefront_obj   = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 env_logger = { workspace = true }
 rand = { workspace = true }

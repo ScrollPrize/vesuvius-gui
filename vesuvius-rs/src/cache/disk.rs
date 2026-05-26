@@ -522,6 +522,83 @@ impl DiskStore {
             self.inner.sidecar.set_access_epoch(key.lod, r.sidecar_idx, epoch);
         }
     }
+
+    /// Punch a hole in the matching shard file at `key`'s slot, freeing
+    /// the underlying physical blocks. The shard file's logical size is
+    /// unchanged (sparse file). Returns `Ok(false)` if the shard isn't
+    /// open (nothing to punch — the slot was never written), `Ok(true)`
+    /// if a hole was successfully punched.
+    ///
+    /// IMPORTANT ordering: callers must demote the chunk's state to
+    /// MISSING (sidecar + per-shard ChunkStateBits, with Release) BEFORE
+    /// calling this. Otherwise a concurrent reader observing Resident
+    /// may pass through and read zeros from a chunk it believes is
+    /// valid. Readers that already passed the bitmap check before our
+    /// demote may transiently see zeros — the async pipeline tolerates
+    /// that (next frame re-reads from the now-Missing slot).
+    pub fn punch_hole(&self, key: ChunkKey) -> std::io::Result<bool> {
+        let r = self.inner.resolve(key).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("chunk {} out of bounds for this LOD", key),
+            )
+        })?;
+        let slot = self.inner.lods.get(key.lod as usize).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "lod out of range")
+        })?;
+        let lf = match slot.opened.lock().unwrap().get(&r.shard) {
+            Some(lf) => lf.clone(),
+            None => return Ok(false),
+        };
+        let off = r.in_shard_idx * CHUNK_VOXELS as u64;
+        punch_hole_at(&lf.file, off, CHUNK_VOXELS as u64)?;
+        Ok(true)
+    }
+}
+
+// Hole punching is OS-specific. Linux uses `fallocate(FALLOC_FL_PUNCH_HOLE)`,
+// macOS uses `fcntl(F_PUNCHHOLE, ...)`. Other targets get a no-op fallback:
+// eviction still demotes the bitmap (so reads return Missing) but physical
+// disk space isn't reclaimed.
+
+#[cfg(target_os = "linux")]
+fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // FALLOC_FL_PUNCH_HOLE requires FALLOC_FL_KEEP_SIZE on Linux.
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    let rc = unsafe {
+        libc::fallocate(file.as_raw_fd(), mode, offset as libc::off_t, len as libc::off_t)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // Apple platforms expose hole punching via fcntl(F_PUNCHHOLE) with a
+    // `fpunchhole_t` struct. Same semantics as Linux's PUNCH_HOLE +
+    // KEEP_SIZE: bytes in the range become zeros, file size is unchanged.
+    let arg = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: len as libc::off_t,
+    };
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &arg) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn punch_hole_at(_file: &std::fs::File, _offset: u64, _len: u64) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl DiskStoreInner {

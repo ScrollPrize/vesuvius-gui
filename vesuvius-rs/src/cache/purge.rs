@@ -93,35 +93,11 @@ pub fn plan_from_histogram(
     None
 }
 
-/// Walk a single sidecar + diskstore and apply `plan`. Returns the number
-/// of chunks actually evicted (may be less than `plan.freed_chunks` due to
-/// races with concurrent fills / accesses; that's fine, the next purge
-/// will close the gap).
-///
-/// Stub: bitmap transition + sidecar accounting only. The hole-punch
-/// `fallocate(FALLOC_FL_PUNCH_HOLE)` call is not yet implemented — that
-/// belongs alongside the existing shard accessor in `disk.rs` and will be
-/// added as a follow-up so this skeleton stays small.
-pub fn sweep_sidecar(
-    _sidecar: &super::sidecar::Sidecar,
-    _disk: &super::disk::DiskStore,
-    epoch: &EpochState,
-    plan: &PurgePlan,
-) -> u64 {
-    let _current = epoch.current();
-    let _ = plan;
-    // TODO:
-    // for lod, dims in sidecar.header.lods:
-    //   for idx in 0..dims.count():
-    //     if sidecar.get_state(lod, idx) != STATE_RESIDENT: continue
-    //     let ae = sidecar.get_access_epoch(lod, idx);
-    //     if !plan.is_victim(ae, current): continue
-    //     sidecar.set_state(lod, idx, STATE_MISSING);     // Release
-    //     disk.punch_hole(lod, idx);                       // fallocate
-    //     epoch.record_evict(ae);
-    //     evicted += 1;
-    0
-}
+// The sweep lives on `ChunkCache::purge_to_target` (in `cache.rs`)
+// because it also needs to invalidate `Inner::map` for evicted keys —
+// otherwise readers holding `ChunkState::Resident` Arcs would keep
+// reading zeros from the punched mmap forever. Pure planning stays here
+// so it can be tested without a full cache.
 
 #[cfg(test)]
 mod tests {

@@ -1092,3 +1092,81 @@ fn second_open_picks_up_disk_cache() {
         "disk-cached value should override new backfiller"
     );
 }
+
+#[test]
+fn purge_evicts_oldest_and_preserves_survivors() {
+    use super::disk::ChunkBitState;
+
+    // Four chunks along the X axis at LOD 0; same shard so we exercise
+    // the per-shard bitmap demote alongside the sidecar transition.
+    let root = tmp_root("purge-basic");
+    let backfiller = Arc::new(SyntheticBackfiller::new(
+        "purge-vol",
+        [256, 64, 64],
+        0,
+        |x, y, z, _| ((x as u32 ^ y as u32 ^ z as u32) & 0xff) as u8,
+    ));
+    let cache = ChunkCache::new(&root, backfiller);
+
+    // Fill all four chunks (chunk_x = 0..4, chunk_y/z = 0).
+    let keys: Vec<ChunkKey> = (0..4).map(|cx| ChunkKey::new(0, cx, 0, 0)).collect();
+    for k in &keys {
+        let state = cache.wait_for(*k, Duration::from_secs(2));
+        assert!(state.as_resident().is_some(), "fill failed for {}", k);
+    }
+    let epoch = cache.epoch_state();
+    assert_eq!(epoch.total_chunks(), 4);
+    let initial_epoch = epoch.current();
+    assert!(initial_epoch >= 1, "fresh EpochState starts at current=1");
+    assert_eq!(epoch.epoch_chunks()[initial_epoch as usize], 4);
+
+    // Age the cache by 10 epochs and re-touch the last two chunks,
+    // moving their access_epoch from `initial_epoch` to `initial_epoch + 10`.
+    // The first two stay at `initial_epoch` → they're the oldest.
+    epoch.force_advance(10);
+    for k in &keys[2..] {
+        let state = cache.state_or_fetch(*k);
+        assert!(state.as_resident().is_some());
+    }
+    let new_epoch = epoch.current();
+    assert_eq!(new_epoch, initial_epoch.wrapping_add(10));
+    let hist = epoch.epoch_chunks();
+    assert_eq!(hist[initial_epoch as usize], 2, "two chunks stayed at the old epoch");
+    assert_eq!(hist[new_epoch as usize], 2, "two chunks moved to the current epoch");
+
+    // Purge 2 chunks. Planner should pick a threshold that evicts
+    // exactly the two old ones; the two recently-touched ones survive.
+    let evicted = cache.purge_to_target(2);
+    assert_eq!(evicted, 2, "expected exactly two evictions");
+    assert_eq!(epoch.total_chunks(), 2);
+    let hist = epoch.epoch_chunks();
+    assert_eq!(hist[initial_epoch as usize], 0);
+    assert_eq!(hist[new_epoch as usize], 2);
+
+    // Victims (first two): no longer in the in-memory map, per-shard
+    // bitmap demoted to Unknown.
+    for k in &keys[..2] {
+        assert!(cache.peek(*k).is_none(), "victim {} should be removed from map", k);
+        let (shard, in_shard_idx) = cache.locate(*k).unwrap();
+        let snap = cache.peek_shard(0, shard).unwrap();
+        assert_eq!(
+            snap.state_bits.load(in_shard_idx),
+            ChunkBitState::Unknown,
+            "victim {}'s shard bit should be Unknown",
+            k
+        );
+    }
+    // Survivors: still readable, bytes match what the backfiller would
+    // produce. The backfiller's deterministic checker means we can
+    // verify without re-fetching.
+    for k in &keys[2..] {
+        let state = cache.peek(*k).expect("survivor should still be in map");
+        assert!(state.as_resident().is_some(), "survivor {} should be Resident", k);
+        // Sample a voxel from its 64³ slot.
+        let x = k.x * 64;
+        let y = k.y * 64;
+        let z = k.z * 64;
+        let expected = ((x ^ y ^ z) & 0xff) as u8;
+        assert_eq!(cache.voxel(x, y, z, 0), expected, "survivor {} voxel mismatch", k);
+    }
+}
