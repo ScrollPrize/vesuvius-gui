@@ -232,6 +232,38 @@ pub trait VoxelVolume {
             }
         }
     }
+
+    /// Composite along a ray and return a colored result. Used by paint
+    /// loops that need a colored output (overlays). The default impl runs
+    /// the regular `composite_along_normal` with the caller's compositor
+    /// and wraps the result in `Color32::from_gray`, so backends that
+    /// override the gray fast path also get the colored fast path for
+    /// free. `OverlayVolume` overrides this to run two parallel fast-path
+    /// walks (base + overlay) and blend the results, keeping the cache
+    /// fast path on the base while still painting the overlay tint.
+    fn composite_color_along_normal(
+        &self,
+        base: [f64; 3],
+        dir: [f64; 3],
+        w_lo: f64,
+        w_hi: f64,
+        downsampling: i32,
+        compositor: &mut Compositor,
+        num_layers: u32,
+        climb_lod: bool,
+    ) -> Color32 {
+        compositor.reset();
+        self.composite_along_normal(
+            base,
+            dir,
+            w_lo,
+            w_hi,
+            downsampling,
+            &mut compositor.as_ref_mut(),
+            climb_lod,
+        );
+        Color32::from_gray(compositor.result(num_layers))
+    }
 }
 
 pub struct Image {
@@ -396,5 +428,27 @@ impl VoxelVolume for Volume {
     ) {
         self.volume
             .composite_along_normal(base, dir, w_lo, w_hi, downsampling, compositor, climb_lod);
+    }
+    fn composite_color_along_normal(
+        &self,
+        base: [f64; 3],
+        dir: [f64; 3],
+        w_lo: f64,
+        w_hi: f64,
+        downsampling: i32,
+        compositor: &mut Compositor,
+        num_layers: u32,
+        climb_lod: bool,
+    ) -> Color32 {
+        self.volume.composite_color_along_normal(
+            base,
+            dir,
+            w_lo,
+            w_hi,
+            downsampling,
+            compositor,
+            num_layers,
+            climb_lod,
+        )
     }
 }

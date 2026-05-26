@@ -454,8 +454,13 @@ impl TemplateApp {
         } else if segment_file.ends_with(".obj") {
             let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
             let base = self.world.clone();
-            let base = if let (Some(overlay), true) = (self.overlay.as_ref(), self.show_overlay) {
-                OverlayVolume::new(base, overlay.clone(), self.overlay_coloring).into_volume()
+            // Pass the raw overlay inner here (not the OverlayPaintVolume wrap):
+            // OverlayVolume carries its own coloring + blend, and the raw inner
+            // is what exposes UnifiedVolume's composite_along_normal fast path.
+            // Routing through OverlayPaintVolume would drop the fast path
+            // because that wrapper inherits the trait-default per-sample loop.
+            let base = if let (Some(overlay_inner), true) = (self.overlay_inner.as_ref(), self.show_overlay) {
+                OverlayVolume::new(base, overlay_inner.clone(), self.overlay_coloring).into_volume()
             } else {
                 base
             };
@@ -551,8 +556,10 @@ impl TemplateApp {
         };
 
         let base = self.world.clone();
-        let base = if let (Some(overlay), true) = (self.overlay.as_ref(), self.show_overlay) {
-            OverlayVolume::new(base, overlay.clone(), self.overlay_coloring).into_volume()
+        // See the construction site above: pass overlay_inner so OverlayVolume's
+        // composite walks hit the cache fast path on both base and overlay.
+        let base = if let (Some(overlay_inner), true) = (self.overlay_inner.as_ref(), self.show_overlay) {
+            OverlayVolume::new(base, overlay_inner.clone(), self.overlay_coloring).into_volume()
         } else {
             base
         };

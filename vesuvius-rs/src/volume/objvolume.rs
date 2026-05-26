@@ -963,7 +963,6 @@ impl PaintVolume for ObjVolume {
                                                 color,
                                             );
                                         } else {
-                                            composition.reset();
                                             let start = xyz[2] + composite_direction * composite_layers_in_front;
                                             let end = xyz[2] - composite_direction * (composite_layers_behind + 1);
 
@@ -971,12 +970,12 @@ impl PaintVolume for ObjVolume {
                                             let n_samples = (end - start) / step;
 
                                             if config.trilinear_interpolation {
-                                                // Walk via the backend's composite_along_normal hook.
-                                                // The cache override amortizes the per-sample chunk
-                                                // lookup AND monomorphizes the per-sample update via
-                                                // the CompositorRef unswitch; other backends fall
-                                                // through to the trait default that loops
-                                                // `get_interpolated`.
+                                                // Walk via the backend's composite_color_along_normal
+                                                // hook. The default impl wraps the gray fast path in
+                                                // Color32::from_gray; OverlayVolume overrides it to
+                                                // composite base and overlay separately (both hitting
+                                                // the cache fast path) and blend, so the cache
+                                                // optimizations survive overlay-on rendering.
                                                 let inv_f = 1.0 / ffactor;
                                                 let base = [
                                                     (x + start as f64 * nx) * inv_f,
@@ -988,17 +987,23 @@ impl PaintVolume for ObjVolume {
                                                     step as f64 * ny * inv_f,
                                                     step as f64 * nz * inv_f,
                                                 ];
-                                                let mut compositor = composition.as_ref_mut();
-                                                volume.composite_along_normal(
+                                                let color = volume.composite_color_along_normal(
                                                     base,
                                                     dir,
                                                     0.0,
                                                     n_samples as f64,
                                                     sfactor as i32,
-                                                    &mut compositor,
+                                                    &mut composition,
+                                                    composite_total_layers as u32,
                                                     config.compositing.climb_lod,
                                                 );
+                                                buffer.set(
+                                                    u as usize / paint_zoom as usize,
+                                                    v as usize / paint_zoom as usize,
+                                                    color,
+                                                );
                                             } else {
+                                                composition.reset();
                                                 let mut compositor = composition.as_ref_mut();
                                                 let mut w = start;
                                                 while w != end {
@@ -1013,13 +1018,13 @@ impl PaintVolume for ObjVolume {
                                                     }
                                                     w += step;
                                                 }
+                                                let value = composition.result(composite_total_layers as u32);
+                                                buffer.set_gray(
+                                                    u as usize / paint_zoom as usize,
+                                                    v as usize / paint_zoom as usize,
+                                                    value,
+                                                );
                                             }
-                                            let value = composition.result(composite_total_layers as u32);
-                                            buffer.set_gray(
-                                                u as usize / paint_zoom as usize,
-                                                v as usize / paint_zoom as usize,
-                                                value,
-                                            );
                                         }
 
                                         if draw_outlines {

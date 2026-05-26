@@ -1,3 +1,4 @@
+use super::composition::{Compositor, MaxCompositionState};
 use super::zarr_paint::{ColorScheme, FourColors};
 use super::{DrawingConfig, Image, PaintVolume, Volume, VolumeCons, VoxelPaintVolume, VoxelVolume};
 use ecolor::Color32;
@@ -301,6 +302,59 @@ impl VoxelVolume for OverlayVolume {
         let base_color = self.base.get_color_interpolated(xyz, downsampling);
         let lab = self.overlay.get_interpolated(xyz, downsampling);
         match self.coloring.paint(lab) {
+            Some((c, s)) => apply_blend(base_color, c, s, self.coloring.mode()),
+            None => base_color,
+        }
+    }
+
+    fn touch_aabb(&self, min: [f64; 3], max: [f64; 3], downsampling: i32) {
+        self.base.touch_aabb(min, max, downsampling);
+        self.overlay.touch_aabb(min, max, downsampling);
+    }
+
+    /// Composite the base and the overlay separately, both through the
+    /// cache fast path, then blend the two u8 results into a Color32 via
+    /// `OverlayColoring`. The base walk reuses the caller's compositor so
+    /// the user's selected compositing mode (Max/Alpha/HeightMap) applies
+    /// to brightness as expected. The overlay is a discrete mask volume,
+    /// so the overlay walk uses its own `Max` compositor — the strongest
+    /// label sample along the ray decides the tint.
+    fn composite_color_along_normal(
+        &self,
+        base: [f64; 3],
+        dir: [f64; 3],
+        w_lo: f64,
+        w_hi: f64,
+        downsampling: i32,
+        compositor: &mut Compositor,
+        num_layers: u32,
+        climb_lod: bool,
+    ) -> Color32 {
+        compositor.reset();
+        self.base.composite_along_normal(
+            base,
+            dir,
+            w_lo,
+            w_hi,
+            downsampling,
+            &mut compositor.as_ref_mut(),
+            climb_lod,
+        );
+        let base_color = Color32::from_gray(compositor.result(num_layers));
+
+        let mut overlay_comp = Compositor::Max(MaxCompositionState::new());
+        self.overlay.composite_along_normal(
+            base,
+            dir,
+            w_lo,
+            w_hi,
+            downsampling,
+            &mut overlay_comp.as_ref_mut(),
+            climb_lod,
+        );
+        let overlay_val = overlay_comp.result(num_layers);
+
+        match self.coloring.paint(overlay_val) {
             Some((c, s)) => apply_blend(base_color, c, s, self.coloring.mode()),
             None => base_color,
         }
