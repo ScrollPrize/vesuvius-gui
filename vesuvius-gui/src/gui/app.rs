@@ -1015,10 +1015,11 @@ impl TemplateApp {
                     .selected_text(label)
                     .show_ui(ui, |ui| {
                         let current_alpha = match self.overlay_coloring {
-                            OverlayColoring::FourColors { alpha }
+                            OverlayColoring::FourColors { alpha, .. }
                             | OverlayColoring::Boolean { alpha, .. }
                             | OverlayColoring::Hue { alpha, .. } => alpha,
                         };
+                        let current_mode = self.overlay_coloring.mode();
                         if ui
                             .selectable_label(
                                 matches!(self.overlay_coloring, OverlayColoring::FourColors { .. }),
@@ -1026,7 +1027,10 @@ impl TemplateApp {
                             )
                             .clicked()
                         {
-                            self.overlay_coloring = OverlayColoring::FourColors { alpha: current_alpha };
+                            self.overlay_coloring = OverlayColoring::FourColors {
+                                alpha: current_alpha,
+                                mode: current_mode,
+                            };
                             overlay_coloring_changed = true;
                         }
                         if ui
@@ -1039,6 +1043,7 @@ impl TemplateApp {
                             self.overlay_coloring = OverlayColoring::Boolean {
                                 color: [255, 0, 255],
                                 alpha: current_alpha,
+                                mode: current_mode,
                             };
                             overlay_coloring_changed = true;
                         }
@@ -1049,17 +1054,21 @@ impl TemplateApp {
                             self.overlay_coloring = OverlayColoring::Hue {
                                 hue_deg: 0.0,
                                 alpha: current_alpha,
+                                mode: current_mode,
                             };
                             overlay_coloring_changed = true;
                         }
                     });
                 match &mut self.overlay_coloring {
-                    OverlayColoring::FourColors { alpha } => {
+                    OverlayColoring::FourColors { alpha, mode } => {
                         if ui.add(egui::Slider::new(alpha, 0.0..=1.0).text("Alpha")).changed() {
                             overlay_coloring_changed = true;
                         }
+                        if blend_mode_combo(ui, "OverlayBlendModeFourColors", mode) {
+                            overlay_coloring_changed = true;
+                        }
                     }
-                    OverlayColoring::Boolean { color, alpha } => {
+                    OverlayColoring::Boolean { color, alpha, mode } => {
                         ui.horizontal(|ui| {
                             ui.label("Color");
                             let mut c = egui::Color32::from_rgb(color[0], color[1], color[2]);
@@ -1071,8 +1080,11 @@ impl TemplateApp {
                         if ui.add(egui::Slider::new(alpha, 0.0..=1.0).text("Alpha")).changed() {
                             overlay_coloring_changed = true;
                         }
+                        if blend_mode_combo(ui, "OverlayBlendModeBoolean", mode) {
+                            overlay_coloring_changed = true;
+                        }
                     }
-                    OverlayColoring::Hue { hue_deg, alpha } => {
+                    OverlayColoring::Hue { hue_deg, alpha, mode } => {
                         if ui
                             .add(egui::Slider::new(hue_deg, 0.0..=360.0).text("Hue (deg)"))
                             .changed()
@@ -1080,6 +1092,9 @@ impl TemplateApp {
                             overlay_coloring_changed = true;
                         }
                         if ui.add(egui::Slider::new(alpha, 0.0..=1.0).text("Alpha")).changed() {
+                            overlay_coloring_changed = true;
+                        }
+                        if blend_mode_combo(ui, "OverlayBlendModeHue", mode) {
                             overlay_coloring_changed = true;
                         }
                     }
@@ -1743,4 +1758,29 @@ impl eframe::App for TemplateApp {
 
         self.update_main(ctx, frame);
     }
+}
+
+fn blend_mode_combo(ui: &mut Ui, id: &str, mode: &mut BlendMode) -> bool {
+    let mut changed = false;
+    let label = match *mode {
+        BlendMode::Alpha => "Alpha",
+        BlendMode::Multiply => "Multiply",
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(*mode == BlendMode::Alpha, "Alpha").clicked() {
+                if *mode != BlendMode::Alpha {
+                    *mode = BlendMode::Alpha;
+                    changed = true;
+                }
+            }
+            if ui.selectable_label(*mode == BlendMode::Multiply, "Multiply").clicked() {
+                if *mode != BlendMode::Multiply {
+                    *mode = BlendMode::Multiply;
+                    changed = true;
+                }
+            }
+        });
+    changed
 }

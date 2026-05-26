@@ -22,7 +22,7 @@ pub use grid500::VolumeGrid500Mapped;
 pub use layers::LayersMappedVolume;
 use libm::modf;
 pub use objvolume::{ObjFile, ObjVolume, ProjectionKind};
-pub use overlay::{OverlayColoring, OverlayPaintVolume, OverlayVolume};
+pub use overlay::{BlendMode, OverlayColoring, OverlayPaintVolume, OverlayVolume};
 pub use ppmvolume::PPMVolume;
 use std::sync::Arc;
 pub use transform::AffineTransform;

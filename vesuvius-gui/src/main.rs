@@ -6,7 +6,7 @@ use vesuvius_rs::catalog::load_catalog;
 
 use clap::Parser;
 use vesuvius_rs::model::{NewVolumeReference, VolumeReference};
-use vesuvius_rs::volume::{AffineTransform, OverlayColoring, ProjectionKind};
+use vesuvius_rs::volume::{AffineTransform, BlendMode, OverlayColoring, ProjectionKind};
 
 /// Vesuvius GUI, an app to visualize and explore 3D data of the Vesuvius Challenge (https://scrollprize.org)
 #[derive(Parser, Debug)]
@@ -45,10 +45,11 @@ pub struct Args {
     #[clap(short, long)]
     overlay: Option<String>,
 
-    /// Coloring of the overlay volume. Forms:
-    ///   - `four-colors[:ALPHA]`     (default ALPHA=0.4) values 1-4 → red/green/yellow/blue
-    ///   - `boolean:#RRGGBB[:ALPHA]` (default ALPHA=0.4) value 255 → given color
-    ///   - `hue:DEG[:ALPHA]`         (default ALPHA=0.4) value → HSV(DEG, 1, value/255)
+    /// Coloring of the overlay volume. Forms (trailing `:MODE` is optional, MODE ∈ {alpha, multiply}, default alpha):
+    ///   - `four-colors[:ALPHA[:MODE]]`     (default ALPHA=0.4) values 1-4 → red/green/yellow/blue
+    ///   - `boolean:#RRGGBB[:ALPHA[:MODE]]` (default ALPHA=0.4) value 255 → given color
+    ///   - `hue:DEG[:ALPHA[:MODE]]`         (default ALPHA=0.4) value → HSV(DEG, 1, 1), strength ∝ value
+    /// Multiply mode preserves the grayscale brightness and only shifts the hue.
     #[clap(long, value_parser = parse_overlay_coloring)]
     overlay_coloring: Option<OverlayColoring>,
 
@@ -151,13 +152,15 @@ fn parse_overlay_coloring(s: &str) -> Result<OverlayColoring, String> {
     match kind {
         "four-colors" => {
             let alpha = parts.next().map(parse_alpha).transpose()?.unwrap_or(0.4);
-            Ok(OverlayColoring::FourColors { alpha })
+            let mode = parts.next().map(parse_blend_mode).transpose()?.unwrap_or_default();
+            Ok(OverlayColoring::FourColors { alpha, mode })
         }
         "boolean" => {
             let color_hex = parts.next().ok_or("boolean: needs #RRGGBB color".to_string())?;
             let color = parse_hex_color(color_hex)?;
             let alpha = parts.next().map(parse_alpha).transpose()?.unwrap_or(0.4);
-            Ok(OverlayColoring::Boolean { color, alpha })
+            let mode = parts.next().map(parse_blend_mode).transpose()?.unwrap_or_default();
+            Ok(OverlayColoring::Boolean { color, alpha, mode })
         }
         "hue" => {
             let hue_deg = parts
@@ -166,12 +169,21 @@ fn parse_overlay_coloring(s: &str) -> Result<OverlayColoring, String> {
                 .parse::<f32>()
                 .map_err(|e| format!("invalid hue degrees: {}", e))?;
             let alpha = parts.next().map(parse_alpha).transpose()?.unwrap_or(0.4);
-            Ok(OverlayColoring::Hue { hue_deg, alpha })
+            let mode = parts.next().map(parse_blend_mode).transpose()?.unwrap_or_default();
+            Ok(OverlayColoring::Hue { hue_deg, alpha, mode })
         }
         other => Err(format!(
             "unknown overlay coloring `{}` (expected four-colors / boolean / hue)",
             other
         )),
+    }
+}
+
+fn parse_blend_mode(s: &str) -> Result<BlendMode, String> {
+    match s {
+        "alpha" => Ok(BlendMode::Alpha),
+        "multiply" => Ok(BlendMode::Multiply),
+        other => Err(format!("unknown blend mode `{}` (expected alpha / multiply)", other)),
     }
 }
 
