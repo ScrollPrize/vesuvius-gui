@@ -94,10 +94,12 @@ impl RemapConfig {
         for rule in &self.atlas_url_rewrites {
             let usage_matches = rule.usage.as_deref().is_none_or(|u| u == usage);
             if usage_matches && url.starts_with(&rule.match_url_prefix) {
-                return Some(match &rule.rewrite_to {
+                let rewritten = match &rule.rewrite_to {
                     Some(to) => url.replacen(&rule.match_url_prefix, to, 1),
                     None => url.to_string(),
-                });
+                };
+                log::info!("Atlas URL remap (usage={}): {} -> {}", usage, url, rewritten);
+                return Some(rewritten);
             }
         }
         None

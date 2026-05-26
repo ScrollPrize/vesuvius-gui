@@ -563,7 +563,16 @@ impl TemplateApp {
         let id = volume_ref.id();
         let new_vol = vesuvius_rs::remap_config::RemapConfig::get()
             .volume_override_url(&id)
-            .and_then(|url| NewVolumeReference::from_url(url).ok())
+            .and_then(|url| match NewVolumeReference::from_url(url) {
+                Ok(v) => {
+                    log::info!("Loading volume {} via remap override: {}", id, url);
+                    Some(v)
+                }
+                Err(e) => {
+                    log::warn!("Remap override for volume {} ({}) failed to parse: {}", id, url, e);
+                    None
+                }
+            })
             .unwrap_or_else(|| NewVolumeReference::Volume64x4(volume_ref.owned()));
         self.load_volume(&new_vol);
     }
