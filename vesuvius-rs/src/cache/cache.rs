@@ -322,6 +322,20 @@ impl ChunkCache {
         self.inner.disk.peek_shard(lod, shard)
     }
 
+    /// Open (sparse-mmap + seed bitmap) the shard at `(lod, shard)` if it
+    /// isn't already, returning its snapshot. The volume's shard-based slow
+    /// path calls this on its first miss for a shard so all subsequent
+    /// per-voxel lookups in that shard are bitmap-only.
+    pub fn ensure_shard_open(&self, lod: u8, shard: ShardCoord) -> Option<ShardSnapshot> {
+        match self.inner.disk.ensure_shard_open(lod, shard) {
+            Ok(snap) => snap,
+            Err(e) => {
+                log::warn!("ensure_shard_open failed for lod {} shard {:?}: {}", lod, shard, e);
+                None
+            }
+        }
+    }
+
     /// Look up the shard layout for `key`. Returns `(shard_coord,
     /// in_shard_chunk_idx)` for in-bounds chunks. Used by the volume's hot
     /// slot to avoid replicating shard-coord math from the disk layer.
@@ -501,6 +515,14 @@ impl Inner {
         if self.is_out_of_bounds(key) {
             log::trace!("[{}] out of bounds", key);
             return long_cooldown();
+        }
+        // Claim the chunk's shard bitmap cell as `Dispatched`. This is what
+        // lets the volume's per-voxel slow path tell "fetch in flight" from
+        // "never tried" without ever consulting the DashMap once we've
+        // primed it here — the bitmap is the single source of truth for
+        // per-chunk presence going forward.
+        if let Err(e) = self.disk.mark_dispatched(key) {
+            log::trace!("[{}] mark_dispatched failed: {}", key, e);
         }
 
         let plan = match self.backfiller.plan(key) {

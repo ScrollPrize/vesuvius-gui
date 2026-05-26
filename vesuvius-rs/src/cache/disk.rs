@@ -146,6 +146,30 @@ impl ChunkStateBits {
             }
         }
     }
+
+    /// Conditional store: write `state` only if the current 2-bit field is
+    /// `Unknown`. Returns true if we transitioned, false otherwise. Used to
+    /// claim "needs dispatch" without ever clobbering a Resident/Empty/
+    /// Dispatched cell.
+    pub fn store_if_unknown(&self, in_shard_idx: u64, state: ChunkBitState) -> bool {
+        let bit_pos = in_shard_idx * BITS_PER_CHUNK as u64;
+        let word_idx = (bit_pos / 64) as usize;
+        let shift = (bit_pos % 64) as u32;
+        let new_bits = (state as u64) << shift;
+        let mask = 0b11u64 << shift;
+        let word = &self.words[word_idx];
+        let mut cur = word.load(Ordering::Relaxed);
+        loop {
+            if (cur >> shift) & 0b11 != 0 {
+                return false;
+            }
+            let next = (cur & !mask) | new_bits;
+            match word.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 struct LodSlot {
@@ -383,6 +407,38 @@ impl DiskStore {
             mmap: lf.mmap.clone(),
             state_bits: lf.state_bits.clone(),
         })
+    }
+
+    /// Ensure the shard at `(lod, shard)` is open (sparse mmap + seeded
+    /// bitmap), then return its snapshot. The shard-based volume slow path
+    /// calls this on its first miss for a shard so subsequent per-voxel
+    /// lookups can drive entirely off the bitmap without re-entering the
+    /// DashMap. Returns `Ok(None)` when the LOD index is out of range.
+    pub fn ensure_shard_open(&self, lod: u8, shard: ShardCoord) -> std::io::Result<Option<ShardSnapshot>> {
+        if (lod as usize) >= self.inner.lods.len() {
+            return Ok(None);
+        }
+        let lf = self.inner.ensure_open(lod, shard)?;
+        Ok(Some(ShardSnapshot {
+            mmap: lf.mmap.clone(),
+            state_bits: lf.state_bits.clone(),
+        }))
+    }
+
+    /// Mark `key` as `Dispatched` on its shard bitmap if the cell is still
+    /// `Unknown`. No sidecar write — Dispatched is in-memory only (it's a
+    /// per-process "fetch in flight" claim, not durable state). Returns
+    /// `Ok(false)` when the bit was already non-Unknown (Resident / Empty /
+    /// Dispatched), so callers can skip redundant dispatch work.
+    pub fn mark_dispatched(&self, key: ChunkKey) -> std::io::Result<bool> {
+        let r = self.inner.resolve(key).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("chunk {} out of bounds for this LOD", key),
+            )
+        })?;
+        let lf = self.inner.ensure_open(key.lod, r.shard)?;
+        Ok(lf.state_bits.store_if_unknown(r.in_shard_idx, ChunkBitState::Dispatched))
     }
 
     /// Mark `key` as definitively absent in the sidecar. No bytes are written
