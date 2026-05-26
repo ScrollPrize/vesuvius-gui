@@ -6,8 +6,10 @@
 //! Two kinds of remappings are supported:
 //!
 //! 1. `atlas_url_rewrites` — atlas access roots are normally filtered by `usage`. An
-//!    entry here whitelists access roots whose URL prefix matches, optionally restricted
-//!    to a specific `usage`, and optionally rewrites the URL prefix before use.
+//!    entry here whitelists access roots whose full URL (access root + origin path)
+//!    starts with `match_url_prefix`, optionally restricted to a specific `usage`,
+//!    and optionally rewrites the prefix before use. The remap is checked before the
+//!    `standard` short-circuit, so a matching rule wins over the default URL.
 //! 2. `volume_overrides` — maps a volume id (as returned by `VolumeReference::id()`) to a
 //!    direct OME-zarr URL. When the GUI loads a volume whose id matches, it uses the
 //!    overridden URL instead of the default tile layout.
@@ -86,10 +88,11 @@ impl RemapConfig {
         }
     }
 
-    /// Apply atlas URL rewrite rules. If an access root's `usage` and `url` match a
-    /// configured rule, return the rewritten URL (or the original if the rule has no
-    /// `rewrite_to`). If no rule matches, return `None` — the caller leaves the access
-    /// root out of consideration.
+    /// Apply atlas URL rewrite rules. `url` is the full URL (access root joined with
+    /// origin path) the caller would otherwise use. If `usage` and the URL prefix
+    /// match a configured rule, return the rewritten URL (or the original if the rule
+    /// has no `rewrite_to`). If no rule matches, return `None` — the caller falls back
+    /// to its default URL resolution.
     pub fn rewrite_atlas_url(&self, usage: &str, url: &str) -> Option<String> {
         for rule in &self.atlas_url_rewrites {
             let usage_matches = rule.usage.as_deref().is_none_or(|u| u == usage);

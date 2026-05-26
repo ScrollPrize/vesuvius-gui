@@ -255,17 +255,17 @@ fn get_standard_url(data: &[DataEntry], data_type: &str) -> Option<String> {
         if data_entry.data_type == data_type {
             for origin in &data_entry.origins {
                 for access_root in &origin.access_roots {
+                    let full_url = format!(
+                        "{}/{}",
+                        access_root.url.trim_end_matches('/'),
+                        origin.path.trim_start_matches('/')
+                    );
+                    if let Some(rewritten) = RemapConfig::get().rewrite_atlas_url(&access_root.usage, &full_url) {
+                        return Some(rewritten);
+                    }
                     if access_root.usage == "standard" {
                         return Some(format!(
                             "https://data.aws.ash2txt.org/samples/{}",
-                            origin.path.trim_start_matches('/')
-                        ));
-                    }
-                    if let Some(rewritten) = RemapConfig::get().rewrite_atlas_url(&access_root.usage, &access_root.url)
-                    {
-                        return Some(format!(
-                            "{}/{}",
-                            rewritten.trim_end_matches('/'),
                             origin.path.trim_start_matches('/')
                         ));
                     }
