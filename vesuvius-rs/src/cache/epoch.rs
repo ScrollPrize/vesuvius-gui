@@ -23,10 +23,12 @@
 //! minimal because the file is small (a few KB) and rewritten alongside
 //! the sidecar by the same sync thread.
 
+use super::disk::{punch_hole_at, shard_filename, SHARD_CHUNKS_PER_AXIS};
 use super::purge::{PurgePlan, PurgeTarget};
-use super::sidecar::{Sidecar, STATE_RESIDENT};
+use super::sidecar::{self, Sidecar, STATE_MISSING, STATE_RESIDENT};
 use super::CHUNK_VOXELS;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -87,6 +89,19 @@ const HEADROOM_DEN: u128 = 10;
 pub struct EpochState {
     inner: Mutex<Inner>,
     targets: Mutex<Vec<Weak<dyn PurgeTarget>>>,
+    /// volume_ids already accumulated into the global histogram. Makes
+    /// `add_from_sidecar` idempotent so the registry-time scan and the
+    /// per-volume `ChunkCache::new_with_downloader` seed don't
+    /// double-count when both run for the same volume. Also used by
+    /// the offline sweep to skip volumes currently represented by a
+    /// live `PurgeTarget`.
+    accumulated: Mutex<HashSet<String>>,
+    /// The unified cache root this state belongs to. Set by
+    /// `shared_for_unified_root`; absent for `EpochState`s constructed
+    /// directly (tests). When present, `purge_all_to_target` also runs
+    /// an offline sweep against subdirs not represented by a live
+    /// target.
+    unified_root: OnceLock<PathBuf>,
 }
 
 struct Inner {
@@ -122,6 +137,8 @@ impl EpochState {
                 epoch_chunks: [0; EPOCH_SLOTS],
             }),
             targets: Mutex::new(Vec::new()),
+            accumulated: Mutex::new(HashSet::new()),
+            unified_root: OnceLock::new(),
         }
     }
 
@@ -136,6 +153,13 @@ impl EpochState {
     /// Build a purge plan against the current histogram and dispatch it
     /// to every live registered target. Returns the total chunks
     /// evicted. Used by the watchdog and by tests.
+    ///
+    /// After live targets, also runs an offline sweep against volume
+    /// subdirs under `unified_root` that aren't represented by a live
+    /// target — so volumes the user opened in a previous session but
+    /// not this one still participate in eviction. The offline pass is
+    /// a no-op for `EpochState`s built directly without going through
+    /// the registry (tests, mainly).
     pub fn purge_all_to_target(&self, target_chunks: u64) -> u64 {
         let Some(plan) = PurgePlan::build(self, target_chunks) else {
             return 0;
@@ -148,7 +172,209 @@ impl EpochState {
         for t in live {
             total = total.saturating_add(t.run_purge(plan));
         }
+        if let Some(root) = self.unified_root.get() {
+            total = total.saturating_add(self.purge_offline_volumes(plan, root));
+        }
         total
+    }
+
+    /// Snapshot of volume_ids that have a live `PurgeTarget` registered.
+    /// Used by the offline sweep to skip volumes the live sweep already
+    /// covered. Distinct from `accumulated_volume_ids` (which also
+    /// includes volumes loaded only via the startup `seed_from_disk`
+    /// scan).
+    pub fn live_target_volume_ids(&self) -> HashSet<String> {
+        let mut targets = self.targets.lock().unwrap();
+        targets.retain(|w| w.upgrade().is_some());
+        targets
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .map(|t| t.volume_id())
+            .collect()
+    }
+
+    /// Snapshot of every volume_id seeded into the global histogram.
+    /// Useful for debugging / diagnostics.
+    pub fn accumulated_volume_ids(&self) -> HashSet<String> {
+        self.accumulated.lock().unwrap().clone()
+    }
+
+    /// Sweep every volume subdir under `unified_root` whose volume_id
+    /// is *not* in `accumulated_volume_ids`. For each such volume,
+    /// load its sidecar, evict every Resident chunk matching `plan`,
+    /// punch holes in the shard files, and write the updated sidecar
+    /// back atomically. Decrements the global histogram via
+    /// `record_evict` for every chunk freed.
+    ///
+    /// This is the "no live cache" counterpart to live-target purging:
+    /// without it, volumes the user opened in a previous session would
+    /// inflate the trigger but never get touched, defeating the cap.
+    ///
+    /// Concurrency: snapshots the live set up-front and skips matches.
+    /// If a `ChunkCache` opens one of these volumes between the
+    /// snapshot and the sidecar write, the sidecar write (atomic
+    /// rename) lands either before or after that cache's
+    /// `Sidecar::load`. The post-load eviction race is the same
+    /// transient-zero window the live sweep already tolerates.
+    pub fn purge_offline_volumes(&self, plan: PurgePlan, unified_root: &Path) -> u64 {
+        let live = self.live_target_volume_ids();
+        let entries = match std::fs::read_dir(unified_root) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(e) => {
+                log::warn!(
+                    "offline purge: read_dir {} failed: {}",
+                    unified_root.display(),
+                    e
+                );
+                return 0;
+            }
+        };
+        let current = self.current();
+        let mut total_evicted: u64 = 0;
+        let chunk_bytes = CHUNK_VOXELS as u64;
+        let sca = SHARD_CHUNKS_PER_AXIS;
+        let shard_total = (sca as u64).pow(3) * chunk_bytes;
+
+        for entry in entries.flatten() {
+            let vol_dir = entry.path();
+            if !vol_dir.is_dir() {
+                continue;
+            }
+            let sidecar_path = sidecar::sidecar_path(&vol_dir);
+            let sidecar = match Sidecar::load(&sidecar_path) {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
+                Err(e) => {
+                    log::warn!(
+                        "offline purge: sidecar {} failed: {}",
+                        sidecar_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            if live.contains(&sidecar.header.volume_id) {
+                continue;
+            }
+
+            let mut evicted_here: u64 = 0;
+            let mut open_shards: HashMap<(u8, super::disk::ShardCoord), std::fs::File> =
+                HashMap::new();
+
+            for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
+                let lod = lod_idx as u8;
+                let nx = dims.nx as u64;
+                let ny = dims.ny as u64;
+                for idx in 0..dims.count() {
+                    if sidecar.get_state(lod, idx) != STATE_RESIDENT {
+                        continue;
+                    }
+                    let ae = sidecar.get_access_epoch(lod, idx);
+                    if !plan.is_victim(ae, current) {
+                        continue;
+                    }
+                    let x = (idx % nx) as u32;
+                    let y = ((idx / nx) % ny) as u32;
+                    let z = (idx / (nx * ny)) as u32;
+                    let shard = (x / sca, y / sca, z / sca);
+                    let wx = (x % sca) as u64;
+                    let wy = (y % sca) as u64;
+                    let wz = (z % sca) as u64;
+                    let in_shard_idx = (wz * sca as u64 + wy) * sca as u64 + wx;
+
+                    // Demote sidecar state before touching the file so a
+                    // ChunkCache that races us reads Missing rather than
+                    // Resident-but-zero. write_to below persists this.
+                    sidecar.set_state(lod, idx, STATE_MISSING);
+
+                    let file = match open_shards.entry((lod, shard)) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let path = vol_dir.join(shard_filename(lod, shard));
+                            match OpenOptions::new().read(true).write(true).open(&path) {
+                                Ok(f) => {
+                                    // Defensive: refuse to punch if the
+                                    // file has an unexpected length (a
+                                    // cache made with a different shard
+                                    // size, or truncated state).
+                                    match f.metadata() {
+                                        Ok(m) if m.len() == shard_total => e.insert(f),
+                                        Ok(m) => {
+                                            log::warn!(
+                                                "offline purge: skip shard {} (len {} != expected {})",
+                                                path.display(),
+                                                m.len(),
+                                                shard_total,
+                                            );
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            log::warn!(
+                                                "offline purge: stat {} failed: {}",
+                                                path.display(),
+                                                err
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                    // No shard file means no allocated
+                                    // blocks to reclaim. State demote
+                                    // above is still useful.
+                                    self.record_evict(ae);
+                                    evicted_here += 1;
+                                    continue;
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "offline purge: open {} failed: {}",
+                                        path.display(),
+                                        err
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    let off = in_shard_idx * chunk_bytes;
+                    if let Err(err) = punch_hole_at(file, off, chunk_bytes) {
+                        log::warn!(
+                            "offline purge: punch_hole {:?}/{:?} failed: {}",
+                            shard,
+                            in_shard_idx,
+                            err
+                        );
+                        continue;
+                    }
+                    self.record_evict(ae);
+                    evicted_here += 1;
+                }
+            }
+
+            if evicted_here == 0 {
+                continue;
+            }
+            // Persist the demoted state column. Snapshot reads the
+            // current in-memory bitmaps; write_to does atomic rename.
+            let snap = sidecar.snapshot();
+            if let Err(e) = snap.write_to(&sidecar.header, &sidecar_path) {
+                log::warn!(
+                    "offline purge: sidecar write {} failed: {}",
+                    sidecar_path.display(),
+                    e
+                );
+            }
+            log::info!(
+                "offline purge: volume={} evicted={}",
+                sidecar.header.volume_id,
+                evicted_here
+            );
+            total_evicted += evicted_here;
+        }
+
+        total_evicted
     }
 
     pub fn current(&self) -> u8 {
@@ -218,10 +444,18 @@ impl EpochState {
     /// and `+1` to `total_chunks`. Missing / Empty / Dispatched slots
     /// don't count. Per-LOD layout comes from `sidecar.header.lods`.
     ///
-    /// Note: not idempotent — calling twice for the same sidecar
-    /// double-counts. The registry zeros the histogram on load so the
-    /// persisted snapshot doesn't conflict with per-volume seeds.
+    /// Idempotent per `sidecar.header.volume_id`: the registry's
+    /// `seed_from_disk` scan adds every on-disk volume at startup, and
+    /// the per-volume `ChunkCache::new_with_downloader` also calls in;
+    /// the second call for the same volume is a no-op. New volumes
+    /// (not present at startup) accumulate normally on first call.
     pub fn add_from_sidecar(&self, sidecar: &Sidecar) {
+        {
+            let mut acc = self.accumulated.lock().unwrap();
+            if !acc.insert(sidecar.header.volume_id.clone()) {
+                return;
+            }
+        }
         let mut s = self.inner.lock().unwrap();
         for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
             let lod = lod_idx as u8;
@@ -365,6 +599,8 @@ impl EpochState {
                 epoch_chunks,
             }),
             targets: Mutex::new(Vec::new()),
+            accumulated: Mutex::new(HashSet::new()),
+            unified_root: OnceLock::new(),
         }))
     }
 }
@@ -427,15 +663,19 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
         }
     };
     // The persisted histogram (epoch_chunks + total_chunks) is treated as
-    // advisory only — they get re-accumulated by each ChunkCache's
-    // `add_from_sidecar` call from authoritative per-chunk state. Zero
-    // them here so per-volume seeds don't double-count against the
-    // snapshot.
+    // advisory only — we re-accumulate from authoritative on-disk
+    // sidecars right below. Zero here so the scan starts clean and the
+    // counts reflect every volume in the cache dir, not just the one
+    // being opened right now.
     {
         let mut s = state.inner.lock().unwrap();
         s.epoch_chunks = [0; EPOCH_SLOTS];
         s.total_chunks = 0;
     }
+    // Record the root so `purge_all_to_target` can run the offline
+    // sweep against volume subdirs that don't have a live target.
+    let _ = state.unified_root.set(unified_root.to_path_buf());
+    seed_from_disk(&state, unified_root);
     g.insert(unified_root.to_path_buf(), state.clone());
 
     // Spawn the watchdog daemon thread for this unified root. The
@@ -451,6 +691,60 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
         .expect("spawn epoch watchdog");
 
     state
+}
+
+/// Scan `unified_root` for every per-volume cache subdirectory and
+/// accumulate each one's sidecar into the global histogram. This makes
+/// the global counter cover every volume on disk, not just the ones
+/// opened by the current process — without it, a 5-volume cache that
+/// only opens one volume this session would mis-report total residency
+/// by 80% and let stale volumes hoard disk forever.
+///
+/// Each load is idempotent on `volume_id` (see `add_from_sidecar`), so
+/// the per-volume `ChunkCache::new_with_downloader` call later finds
+/// the volume already accumulated and skips its second pass. Volumes
+/// created mid-session (not on disk at startup) accumulate at that
+/// point.
+fn seed_from_disk(state: &EpochState, unified_root: &Path) {
+    let entries = match std::fs::read_dir(unified_root) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log::warn!(
+                "epoch seed: read_dir {} failed: {}",
+                unified_root.display(),
+                e
+            );
+            return;
+        }
+    };
+    let mut seeded = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let sidecar_path = sidecar::sidecar_path(&path);
+        match Sidecar::load(&sidecar_path) {
+            Ok(Some(s)) => {
+                state.add_from_sidecar(&s);
+                seeded += 1;
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!(
+                "epoch seed: sidecar {} failed to load: {}",
+                sidecar_path.display(),
+                e
+            ),
+        }
+    }
+    if seeded > 0 {
+        log::info!(
+            "epoch seed: accumulated {} volume(s) from {}",
+            seeded,
+            unified_root.display()
+        );
+    }
 }
 
 fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf) {
@@ -615,6 +909,196 @@ mod tests {
                 assert_eq!(h[i], 0, "expected slot {} to be 0", i);
             }
         }
+    }
+
+    #[test]
+    fn add_from_sidecar_is_idempotent_on_volume_id() {
+        use super::super::sidecar::{Header, Sidecar, STATE_RESIDENT};
+        let h = Header::new("v-dedup".into(), [256, 256, 256], 0);
+        let s = Sidecar::empty(h);
+        s.set_state(0, 0, STATE_RESIDENT);
+        s.set_access_epoch(0, 0, 7);
+
+        let e = EpochState::new(1 << 30);
+        e.add_from_sidecar(&s);
+        e.add_from_sidecar(&s); // second call must not double-count
+        assert_eq!(e.total_chunks(), 1);
+        assert_eq!(e.epoch_chunks()[7], 1);
+    }
+
+    #[test]
+    fn seed_from_disk_counts_every_volume_under_unified_root() {
+        use super::super::sidecar::{Header, Sidecar, STATE_RESIDENT};
+        let unified = std::env::temp_dir().join(format!(
+            "vesuvius-epoch-seed-{}-{}",
+            std::process::id(),
+            // randomize within the process to keep parallel test runs disjoint
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&unified).unwrap();
+
+        // Plant two volume directories with sidecars.
+        for (vid, ae, n) in [("vol-a", 3u8, 2usize), ("vol-b", 9u8, 1usize)] {
+            let vol_dir = unified.join(vid);
+            std::fs::create_dir_all(&vol_dir).unwrap();
+            let h = Header::new(vid.into(), [256, 256, 256], 0);
+            let s = Sidecar::empty(h);
+            for idx in 0..n as u64 {
+                s.set_state(0, idx, STATE_RESIDENT);
+                s.set_access_epoch(0, idx, ae);
+            }
+            let snap = s.snapshot();
+            snap.write_to(&s.header, &sidecar::sidecar_path(&vol_dir))
+                .unwrap();
+        }
+
+        // Build EpochState directly and run the scan (avoids the
+        // process-wide registry / watchdog thread used by
+        // shared_for_unified_root).
+        let state = EpochState::new(1 << 30);
+        seed_from_disk(&state, &unified);
+        assert_eq!(state.total_chunks(), 3);
+        let h = state.epoch_chunks();
+        assert_eq!(h[3], 2);
+        assert_eq!(h[9], 1);
+
+        // Calling add_from_sidecar again for an already-seeded volume
+        // (e.g., when its ChunkCache attaches) must not double-count.
+        let h = Header::new("vol-a".into(), [256, 256, 256], 0);
+        let s2 = Sidecar::empty(h);
+        s2.set_state(0, 0, STATE_RESIDENT);
+        s2.set_access_epoch(0, 0, 3);
+        state.add_from_sidecar(&s2);
+        assert_eq!(state.total_chunks(), 3);
+
+        std::fs::remove_dir_all(&unified).ok();
+    }
+
+    #[test]
+    fn offline_sweep_evicts_unopened_volumes_and_demotes_sidecar() {
+        use super::super::purge::PurgePlan;
+        use super::super::sidecar::{Header, Sidecar, STATE_MISSING, STATE_RESIDENT};
+        let unified = std::env::temp_dir().join(format!(
+            "vesuvius-epoch-offline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&unified).unwrap();
+
+        // Plant an unopened volume "vol-stale" with 3 Resident chunks at
+        // epoch 10. No live PurgeTarget is registered, so the offline
+        // sweep should pick it up.
+        let stale_dir = unified.join("vol-stale");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let stale_header = Header::new("vol-stale".into(), [256, 256, 256], 0);
+        let stale = Sidecar::empty(stale_header);
+        for idx in 0..3u64 {
+            stale.set_state(0, idx, STATE_RESIDENT);
+            stale.set_access_epoch(0, idx, 10);
+        }
+        stale
+            .snapshot()
+            .write_to(&stale.header, &sidecar::sidecar_path(&stale_dir))
+            .unwrap();
+
+        // Build EpochState by hand and seed from the disk scan.
+        let state = EpochState::new(1 << 30);
+        state.unified_root.set(unified.clone()).unwrap();
+        seed_from_disk(&state, &unified);
+        assert_eq!(state.total_chunks(), 3);
+
+        // current = 1 → force-advance so chunks at epoch 10 are aged.
+        state.force_advance(200);
+        let cur = state.current();
+        let plan = PurgePlan {
+            age_threshold: 1,
+            target_chunks: 3,
+            freed_chunks: 3,
+        };
+        assert!(plan.is_victim(10, cur));
+
+        let evicted = state.purge_offline_volumes(plan, &unified);
+        assert_eq!(evicted, 3);
+        assert_eq!(state.total_chunks(), 0);
+
+        // Re-load from disk and confirm sidecar was persisted with
+        // demoted states.
+        let after = Sidecar::load(&sidecar::sidecar_path(&stale_dir))
+            .unwrap()
+            .unwrap();
+        for idx in 0..3u64 {
+            assert_eq!(
+                after.get_state(0, idx),
+                STATE_MISSING,
+                "expected chunk {} demoted after offline sweep",
+                idx
+            );
+        }
+
+        std::fs::remove_dir_all(&unified).ok();
+    }
+
+    #[test]
+    fn offline_sweep_skips_volumes_with_live_target() {
+        use super::super::purge::{PurgePlan, PurgeTarget};
+        use super::super::sidecar::{Header, Sidecar, STATE_RESIDENT};
+
+        struct FakeTarget {
+            vid: String,
+        }
+        impl PurgeTarget for FakeTarget {
+            fn volume_id(&self) -> String {
+                self.vid.clone()
+            }
+            fn run_purge(&self, _: PurgePlan) -> u64 {
+                0
+            }
+        }
+
+        let unified = std::env::temp_dir().join(format!(
+            "vesuvius-epoch-offline-skip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&unified).unwrap();
+        let vol_dir = unified.join("vol-live");
+        std::fs::create_dir_all(&vol_dir).unwrap();
+        let h = Header::new("vol-live".into(), [256, 256, 256], 0);
+        let s = Sidecar::empty(h);
+        s.set_state(0, 0, STATE_RESIDENT);
+        s.set_access_epoch(0, 0, 10);
+        s.snapshot()
+            .write_to(&s.header, &sidecar::sidecar_path(&vol_dir))
+            .unwrap();
+
+        let state = EpochState::new(1 << 30);
+        state.unified_root.set(unified.clone()).unwrap();
+        seed_from_disk(&state, &unified);
+
+        let target: Arc<dyn PurgeTarget> = Arc::new(FakeTarget {
+            vid: "vol-live".into(),
+        });
+        state.register_target(Arc::downgrade(&target));
+
+        state.force_advance(200);
+        let plan = PurgePlan {
+            age_threshold: 1,
+            target_chunks: 1,
+            freed_chunks: 1,
+        };
+        // Live target → offline sweep must skip this volume.
+        let evicted = state.purge_offline_volumes(plan, &unified);
+        assert_eq!(evicted, 0);
+        std::fs::remove_dir_all(&unified).ok();
     }
 
     #[test]

@@ -103,6 +103,9 @@ pub fn plan_from_histogram(
 /// `ChunkCache::Inner` implements this; the watchdog holds `Weak`s and
 /// upgrades them on each tick so dropped caches are GC'd naturally.
 pub trait PurgeTarget: Send + Sync {
+    /// Identifier matching `Sidecar::header.volume_id`. Used by the
+    /// offline sweep to skip volumes already covered by a live target.
+    fn volume_id(&self) -> String;
     fn run_purge(&self, plan: PurgePlan) -> u64;
 }
 

@@ -256,13 +256,14 @@ impl ChunkCache {
 
         let disk = DiskStore::new(chunks_root, volume_id, extent, max_lod);
         // Accumulate this volume's residency into the global histogram.
-        // Multiple ChunkCaches sharing the same unified root each add
-        // here; the registry zeroed the histogram on load so per-volume
-        // seeds don't conflict with the persisted snapshot.
-        //
-        // Caveat: if a ChunkCache for the same volume is torn down and
-        // rebuilt within one process, its chunks get double-counted.
-        // No such recycling today; TODO if we add it.
+        // The registry already scanned the unified root at first init
+        // and seeded every volume it found on disk, so for an existing
+        // volume this is a no-op (add_from_sidecar is idempotent on
+        // volume_id). For a volume that's brand-new to the cache dir
+        // (no prior sidecar), the scan didn't see it and this call
+        // does the initial accumulation — which for a fresh volume is
+        // zero residency, but still records the volume_id so future
+        // calls remain idempotent.
         epoch.add_from_sidecar(&disk.sidecar());
 
         let cap_bytes = epoch.cap_bytes();
@@ -584,6 +585,9 @@ fn pending_state() -> Arc<ChunkState> {
 }
 
 impl PurgeTarget for Inner {
+    fn volume_id(&self) -> String {
+        self.disk.sidecar().header.volume_id.clone()
+    }
     fn run_purge(&self, plan: PurgePlan) -> u64 {
         Inner::run_purge(self, plan)
     }

@@ -218,7 +218,7 @@ pub struct DiskStore {
 /// shard — comfortably under per-file sparse ceilings while keeping shard
 /// counts tiny for typical volumes (worst case 80 TiB across ~160 shards
 /// for our largest current volume).
-const SHARD_CHUNKS_PER_AXIS: u32 = 128;
+pub(crate) const SHARD_CHUNKS_PER_AXIS: u32 = 128;
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 const SYNC_COUNT_THRESHOLD: u64 = 256;
@@ -591,7 +591,7 @@ impl DiskStore {
 // disk space isn't reclaimed.
 
 #[cfg(target_os = "linux")]
-fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+pub(crate) fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     // FALLOC_FL_PUNCH_HOLE requires FALLOC_FL_KEEP_SIZE on Linux.
     let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
@@ -606,7 +606,7 @@ fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+pub(crate) fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     // Apple platforms expose hole punching via fcntl(F_PUNCHHOLE) with a
     // `fpunchhole_t` struct. Same semantics as Linux's PUNCH_HOLE +
@@ -626,7 +626,7 @@ fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
-fn punch_hole_at(_file: &std::fs::File, _offset: u64, _len: u64) -> std::io::Result<()> {
+pub(crate) fn punch_hole_at(_file: &std::fs::File, _offset: u64, _len: u64) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -838,7 +838,7 @@ fn do_sync(inner: &DiskStoreInner) {
     }
 }
 
-fn shard_filename(lod: u8, shard: ShardCoord) -> String {
+pub(crate) fn shard_filename(lod: u8, shard: ShardCoord) -> String {
     format!(
         "chunks-L{:02}-X{:03}-Y{:03}-Z{:03}.dat",
         lod, shard.0, shard.1, shard.2
