@@ -197,6 +197,12 @@ impl Sidecar {
     /// doesn't exist; returns `Err` on any other failure (caller decides to
     /// treat as missing or to bail). The returned Sidecar's header must
     /// still be checked for layout-compatibility via `header.matches`.
+    ///
+    /// The access-epoch column is read from trailing bytes after the state
+    /// bitmaps. Old sidecars (written before that column existed) lack
+    /// those trailing bytes — we hit EOF and default every chunk's access
+    /// epoch to 0, which puts them at the front of the eviction queue
+    /// until they're touched. See `epoch.rs` for the LRU semantics.
     pub fn load(path: &Path) -> std::io::Result<Option<Self>> {
         let mut file = match std::fs::File::open(path) {
             Ok(f) => f,
@@ -213,19 +219,56 @@ impl Sidecar {
             bitmaps.push(atoms);
         }
         let pending = (0..header.lods.len()).map(|_| AtomicU64::new(0)).collect();
-        // TODO: persist + reload access_epochs. For now reset to 0 on
-        // reopen; chunks loaded from a prior session look "oldest" until
-        // they're touched again.
-        let access_epochs = header
-            .lods
-            .iter()
-            .map(|d| {
-                let n = d.count() as usize;
-                let mut v = Vec::with_capacity(n);
-                v.resize_with(n, || AtomicU8::new(0));
-                v
-            })
-            .collect();
+
+        // Read trailing bytes for the access-epoch column. EOF (old
+        // format) → fall back to all-zero. Partial → also fall back
+        // (mismatched file means we can't trust the data).
+        //
+        // TODO: when we fall back to all-zero on an old cache, every
+        // chunk lands in epoch 0 and becomes a first-class eviction
+        // candidate together. Nicer would be to infer per-shard epochs
+        // from shard-file mtimes: sort shards by mtime, map oldest →
+        // epoch ≈0 and newest → epoch ≈current, then stamp each chunk
+        // with its shard's bucket. That preserves rough recency
+        // ordering across an upgrade. Needs the shard layout, which
+        // lives in DiskStore — likely a post-load pass driven from
+        // there rather than from inside Sidecar.
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        let expected: usize = header.lods.iter().map(|d| d.count() as usize).sum();
+        let access_epochs: Vec<Vec<AtomicU8>> = if tail.len() == expected {
+            let mut p = 0;
+            header
+                .lods
+                .iter()
+                .map(|d| {
+                    let n = d.count() as usize;
+                    let atoms: Vec<AtomicU8> =
+                        tail[p..p + n].iter().map(|&b| AtomicU8::new(b)).collect();
+                    p += n;
+                    atoms
+                })
+                .collect()
+        } else {
+            if !tail.is_empty() {
+                log::warn!(
+                    "sidecar access-epoch column size mismatch ({} bytes, expected {}); resetting",
+                    tail.len(),
+                    expected
+                );
+            }
+            header
+                .lods
+                .iter()
+                .map(|d| {
+                    let n = d.count() as usize;
+                    let mut v = Vec::with_capacity(n);
+                    v.resize_with(n, || AtomicU8::new(0));
+                    v
+                })
+                .collect()
+        };
+
         Ok(Some(Self {
             header,
             bitmaps,
@@ -249,12 +292,16 @@ impl Sidecar {
         prev
     }
 
-    /// Snapshot the bitmap and the pending counters. The snapshot is taken
-    /// with `Acquire` loads, then the counters are atomically reset to zero
-    /// (returning the prior count). Caller must `fsync` data files for every
-    /// LOD whose returned `pending` is non-zero **before** writing the
-    /// snapshot to disk, so the persisted sidecar is always a strict subset
-    /// of durable bytes.
+    /// Snapshot the bitmap, access-epoch column, and the pending counters.
+    /// The snapshot is taken with `Acquire` loads, then the counters are
+    /// atomically reset to zero (returning the prior count). Caller must
+    /// `fsync` data files for every LOD whose returned `pending` is
+    /// non-zero **before** writing the snapshot to disk, so the persisted
+    /// sidecar is always a strict subset of durable bytes.
+    ///
+    /// The access-epoch column is captured with `Relaxed` loads since
+    /// it's pure LRU bookkeeping — losing the last few accesses on a
+    /// crash just means those chunks look slightly older next session.
     pub fn snapshot(&self) -> Snapshot {
         let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
         for lod in &self.bitmaps {
@@ -264,8 +311,20 @@ impl Sidecar {
             }
             bitmaps.push(bytes);
         }
+        let mut access_epochs = Vec::with_capacity(self.access_epochs.len());
+        for lod in &self.access_epochs {
+            let mut bytes = Vec::with_capacity(lod.len());
+            for a in lod {
+                bytes.push(a.load(Ordering::Relaxed));
+            }
+            access_epochs.push(bytes);
+        }
         let pending: Vec<u64> = self.pending.iter().map(|c| c.swap(0, Ordering::AcqRel)).collect();
-        Snapshot { bitmaps, pending }
+        Snapshot {
+            bitmaps,
+            access_epochs,
+            pending,
+        }
     }
 
     /// Total transitions across all LODs since the last snapshot.
@@ -290,6 +349,7 @@ impl Sidecar {
 
 pub struct Snapshot {
     bitmaps: Vec<Vec<u8>>,
+    access_epochs: Vec<Vec<u8>>,
     /// Per-LOD count of transitions captured in this snapshot. Caller uses
     /// it to decide which data files actually need `fsync` before the
     /// sidecar is renamed into place.
@@ -302,10 +362,19 @@ impl Snapshot {
         std::fs::create_dir_all(parent)?;
         let tmp = parent.join(format!("{}.tmp", dest.file_name().unwrap().to_string_lossy()));
 
-        let mut buf = Vec::with_capacity(4096 + self.bitmaps.iter().map(|b| b.len()).sum::<usize>());
+        let total: usize =
+            self.bitmaps.iter().map(|b| b.len()).sum::<usize>() + self.access_epochs.iter().map(|b| b.len()).sum::<usize>();
+        let mut buf = Vec::with_capacity(4096 + total);
         header.write_to(&mut buf);
         for bm in &self.bitmaps {
             buf.extend_from_slice(bm);
+        }
+        // Access-epoch column trails the state bitmaps. Older binaries
+        // reading this file stop after the bitmaps and ignore the rest;
+        // newer binaries reading old files hit EOF here and default
+        // every access-epoch to 0.
+        for ae in &self.access_epochs {
+            buf.extend_from_slice(ae);
         }
 
         {
@@ -378,6 +447,50 @@ mod tests {
         assert_eq!(loaded.get_state(0, 0), STATE_RESIDENT);
         assert_eq!(loaded.get_state(0, 1), STATE_MISSING);
         assert_eq!(loaded.get_state(0, 3), STATE_EMPTY);
+    }
+
+    #[test]
+    fn sidecar_access_epoch_roundtrip() {
+        // 256³ at LOD 0 = 4*4*4 = 64 slots; plenty of room for several
+        // tagged slots without going out of bounds.
+        let dir = tempdir();
+        let h = Header::new("vol".into(), [256, 256, 256], 1);
+        let s = Sidecar::empty(h);
+        s.set_state(0, 0, STATE_RESIDENT);
+        s.set_access_epoch(0, 0, 42);
+        s.set_state(0, 17, STATE_RESIDENT);
+        s.set_access_epoch(0, 17, 199);
+        s.set_state(1, 0, STATE_RESIDENT);
+        s.set_access_epoch(1, 0, 7);
+        let path = sidecar_path(&dir);
+        s.snapshot().write_to(&s.header, &path).unwrap();
+
+        let loaded = Sidecar::load(&path).unwrap().expect("file should exist");
+        assert_eq!(loaded.get_access_epoch(0, 0), 42);
+        assert_eq!(loaded.get_access_epoch(0, 17), 199);
+        assert_eq!(loaded.get_access_epoch(0, 1), 0);
+        assert_eq!(loaded.get_access_epoch(1, 0), 7);
+    }
+
+    #[test]
+    fn sidecar_old_format_loads_with_zero_access_epochs() {
+        // Simulate an old sidecar file: header + state bitmaps only.
+        let dir = tempdir();
+        let h = Header::new("vol".into(), [128, 128, 64], 0);
+        let mut buf = Vec::new();
+        h.write_to(&mut buf);
+        // One LOD, dims 2*2*1 = 4 slots.
+        buf.extend_from_slice(&[STATE_RESIDENT, STATE_MISSING, STATE_RESIDENT, STATE_EMPTY]);
+        let path = sidecar_path(&dir);
+        std::fs::write(&path, &buf).unwrap();
+
+        let loaded = Sidecar::load(&path).unwrap().expect("file should exist");
+        assert_eq!(loaded.get_state(0, 0), STATE_RESIDENT);
+        assert_eq!(loaded.get_state(0, 2), STATE_RESIDENT);
+        // Access epochs all default to 0 — old format had no column.
+        for i in 0..4 {
+            assert_eq!(loaded.get_access_epoch(0, i), 0);
+        }
     }
 
     fn tempdir() -> PathBuf {

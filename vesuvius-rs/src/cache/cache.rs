@@ -252,10 +252,21 @@ impl ChunkCache {
         let unified_root = chunks_root.parent().unwrap_or(&chunks_root).to_path_buf();
         let epoch = epoch::shared_for_unified_root(&unified_root, epoch::DEFAULT_CAP_BYTES);
 
+        let disk = DiskStore::new(chunks_root, volume_id, extent, max_lod);
+        // Accumulate this volume's residency into the global histogram.
+        // Multiple ChunkCaches sharing the same unified root each add
+        // here; the registry zeroed the histogram on load so per-volume
+        // seeds don't conflict with the persisted snapshot.
+        //
+        // Caveat: if a ChunkCache for the same volume is torn down and
+        // rebuilt within one process, its chunks get double-counted.
+        // No such recycling today; TODO if we add it.
+        epoch.add_from_sidecar(&disk.sidecar());
+
         let inner = Arc::new(Inner {
             map: DashMap::new(),
             dispatching: DashMap::new(),
-            disk: DiskStore::new(chunks_root, volume_id, extent, max_lod),
+            disk,
             spill: SpillStore::new(spill_root),
             backfiller,
             sources: Mutex::new(HashMap::new()),

@@ -505,6 +505,14 @@ impl DiskStore {
         Some(self.inner.sidecar.get_access_epoch(key.lod, r.sidecar_idx))
     }
 
+    /// Expose the underlying `Sidecar` for purge / epoch-seed paths that
+    /// need to iterate per-chunk state. Returns the existing `Arc` clone
+    /// (cheap). The DiskStore retains ownership; callers don't keep
+    /// long-lived references past their seed/purge passes.
+    pub fn sidecar(&self) -> Arc<Sidecar> {
+        self.inner.sidecar.clone()
+    }
+
     /// Stamp `key` with `epoch`. Silently no-ops if the key is out of
     /// bounds. Does not mark the sidecar pending — access-epoch updates
     /// are LRU bookkeeping, not residency state; the sync thread picks

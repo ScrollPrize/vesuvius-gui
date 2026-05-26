@@ -23,6 +23,7 @@
 //! minimal because the file is small (a few KB) and rewritten alongside
 //! the sidecar by the same sync thread.
 
+use super::sidecar::{Sidecar, STATE_RESIDENT};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -131,6 +132,32 @@ impl EpochState {
             s.epoch_chunks[cur as usize] = s.epoch_chunks[cur as usize].saturating_add(1);
         }
         cur
+    }
+
+    /// Add one volume's residency contribution to the global histogram
+    /// and `total_chunks`. Called once per `ChunkCache` at startup, after
+    /// the sidecar is loaded. Multiple volumes sharing the same unified
+    /// root each call this, so the global state accumulates the union.
+    ///
+    /// Resident chunks contribute `+1` to `epoch_chunks[their_access]`
+    /// and `+1` to `total_chunks`. Missing / Empty / Dispatched slots
+    /// don't count. Per-LOD layout comes from `sidecar.header.lods`.
+    ///
+    /// Note: not idempotent — calling twice for the same sidecar
+    /// double-counts. The registry zeros the histogram on load so the
+    /// persisted snapshot doesn't conflict with per-volume seeds.
+    pub fn add_from_sidecar(&self, sidecar: &Sidecar) {
+        let mut s = self.inner.lock().unwrap();
+        for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
+            let lod = lod_idx as u8;
+            for idx in 0..dims.count() {
+                if sidecar.get_state(lod, idx) == STATE_RESIDENT {
+                    let ae = sidecar.get_access_epoch(lod, idx);
+                    s.epoch_chunks[ae as usize] = s.epoch_chunks[ae as usize].saturating_add(1);
+                    s.total_chunks += 1;
+                }
+            }
+        }
     }
 
     /// Account for an evicted chunk whose last-known access epoch was
@@ -323,6 +350,16 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
             Arc::new(EpochState::new(cap_bytes))
         }
     };
+    // The persisted histogram (epoch_chunks + total_chunks) is treated as
+    // advisory only — they get re-accumulated by each ChunkCache's
+    // `add_from_sidecar` call from authoritative per-chunk state. Zero
+    // them here so per-volume seeds don't double-count against the
+    // snapshot.
+    {
+        let mut s = state.inner.lock().unwrap();
+        s.epoch_chunks = [0; EPOCH_SLOTS];
+        s.total_chunks = 0;
+    }
     g.insert(unified_root.to_path_buf(), state.clone());
     state
 }
@@ -370,6 +407,34 @@ mod tests {
         let h_after = s.epoch_chunks();
         assert_eq!(h_after[cur0 as usize], 0);
         assert_eq!(h_after[cur1 as usize], 2);
+    }
+
+    #[test]
+    fn add_from_sidecar_counts_only_resident() {
+        use super::super::sidecar::{Header, Sidecar, STATE_EMPTY, STATE_MISSING, STATE_RESIDENT};
+        let h = Header::new("v".into(), [256, 256, 256], 0);
+        let s = Sidecar::empty(h);
+        // Plant 3 Resident at epochs 10, 10, 200; 1 Empty; 1 Missing.
+        s.set_state(0, 0, STATE_RESIDENT);
+        s.set_access_epoch(0, 0, 10);
+        s.set_state(0, 1, STATE_RESIDENT);
+        s.set_access_epoch(0, 1, 10);
+        s.set_state(0, 2, STATE_RESIDENT);
+        s.set_access_epoch(0, 2, 200);
+        s.set_state(0, 3, STATE_EMPTY);
+        s.set_state(0, 4, STATE_MISSING);
+
+        let e = EpochState::new(1 << 30);
+        e.add_from_sidecar(&s);
+        assert_eq!(e.total_chunks(), 3);
+        let h = e.epoch_chunks();
+        assert_eq!(h[10], 2);
+        assert_eq!(h[200], 1);
+        for i in 0..EPOCH_SLOTS {
+            if i != 10 && i != 200 {
+                assert_eq!(h[i], 0, "expected slot {} to be 0", i);
+            }
+        }
     }
 
     #[test]
