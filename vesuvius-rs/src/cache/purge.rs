@@ -99,6 +99,13 @@ pub fn plan_from_histogram(
 // reading zeros from the punched mmap forever. Pure planning stays here
 // so it can be tested without a full cache.
 
+/// Anything the watchdog can ask to evict chunks under a shared plan.
+/// `ChunkCache::Inner` implements this; the watchdog holds `Weak`s and
+/// upgrades them on each tick so dropped caches are GC'd naturally.
+pub trait PurgeTarget: Send + Sync {
+    fn run_purge(&self, plan: PurgePlan) -> u64;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

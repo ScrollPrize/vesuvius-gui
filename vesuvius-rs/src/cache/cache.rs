@@ -43,7 +43,7 @@ use super::backfiller::{
 use super::disk::{ChunkBitState, DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone, SubmitResult};
 use super::epoch::{self, EpochState};
-use super::purge::PurgePlan;
+use super::purge::{PurgePlan, PurgeTarget};
 use super::sidecar::STATE_MISSING;
 use super::spill::SpillStore;
 use super::state::{ChunkKey, ChunkState};
@@ -252,7 +252,7 @@ impl ChunkCache {
         // chunks_root itself, which keeps the state per-volume rather
         // than cache-wide. That's a degraded mode but still correct.
         let unified_root = chunks_root.parent().unwrap_or(&chunks_root).to_path_buf();
-        let epoch = epoch::shared_for_unified_root(&unified_root, epoch::DEFAULT_CAP_BYTES);
+        let epoch = epoch::shared_for_unified_root(&unified_root, epoch::cap_bytes_from_env());
 
         let disk = DiskStore::new(chunks_root, volume_id, extent, max_lod);
         // Accumulate this volume's residency into the global histogram.
@@ -264,6 +264,27 @@ impl ChunkCache {
         // rebuilt within one process, its chunks get double-counted.
         // No such recycling today; TODO if we add it.
         epoch.add_from_sidecar(&disk.sidecar());
+
+        let cap_bytes = epoch.cap_bytes();
+        let total_chunks = epoch.total_chunks();
+        let chunk_bytes = CHUNK_VOXELS as u64;
+        let resident_bytes = total_chunks.saturating_mul(chunk_bytes);
+        let pct = if cap_bytes > 0 {
+            resident_bytes.saturating_mul(100) / cap_bytes
+        } else {
+            0
+        };
+        log::info!(
+            "cache stats: volume={} cap={} GiB resident={} chunks ({} MiB, {}% of cap) current_epoch={} bytes_per_epoch={} MiB unified_root={}",
+            disk.sidecar().header.volume_id,
+            cap_bytes / (1024 * 1024 * 1024),
+            total_chunks,
+            resident_bytes / (1024 * 1024),
+            pct,
+            epoch.current(),
+            epoch.bytes_per_epoch() / (1024 * 1024),
+            unified_root.display(),
+        );
 
         let inner = Arc::new(Inner {
             map: DashMap::new(),
@@ -287,6 +308,13 @@ impl ChunkCache {
                 .spawn(move || worker_loop(inner))
                 .expect("spawn cache worker");
         }
+
+        // Register this cache so the epoch watchdog can dispatch
+        // purge plans to it. Coerce Arc<Inner> -> Arc<dyn PurgeTarget>
+        // first so the Weak we register is type-erased and EpochState
+        // doesn't need to know about Inner.
+        let target: Arc<dyn PurgeTarget> = inner.clone();
+        inner.epoch.register_target(Arc::downgrade(&target));
 
         Self { inner }
     }
@@ -360,6 +388,17 @@ impl ChunkCache {
     /// integration tests; the cache owns the lifetime.
     pub fn epoch_state(&self) -> Arc<EpochState> {
         self.inner.epoch.clone()
+    }
+
+    /// Stamp `(lod, shard)` as accessed at the current epoch. Called
+    /// from the volume hot path when its local shard slot is
+    /// (re)installed — the per-voxel reads that follow don't go
+    /// through `state_or_fetch`, so without this signal purge would
+    /// see chunks in this shard at their stale per-chunk access epoch.
+    /// O(1) per call (HashMap insert + atomic write).
+    pub fn touch_shard_access(&self, lod: u8, shard: ShardCoord) {
+        let current = self.inner.epoch.current();
+        self.inner.disk.mark_shard_accessed(lod, shard, current);
     }
 
     /// Cheap state lookup without dispatching a fetch. Returns `None` if no
@@ -544,14 +583,35 @@ fn pending_state() -> Arc<ChunkState> {
     Arc::new(ChunkState::pending())
 }
 
+impl PurgeTarget for Inner {
+    fn run_purge(&self, plan: PurgePlan) -> u64 {
+        Inner::run_purge(self, plan)
+    }
+}
+
 impl Inner {
     /// Evict all Resident chunks whose access epoch falls into the
     /// `plan.is_victim` set. See `ChunkCache::purge_to_target` for the
     /// ordering rationale (bitmap demote first, then punch).
+    ///
+    /// A chunk is also spared if the per-shard access map says its
+    /// shard was recently touched by the volume hot path — that path
+    /// bypasses `state_or_fetch` (so per-chunk access doesn't fire)
+    /// and signals freshness at shard granularity instead.
     fn run_purge(&self, plan: PurgePlan) -> u64 {
         let sidecar = self.disk.sidecar();
         let current = self.epoch.current();
+        let volume_id = sidecar.header.volume_id.clone();
+        log::info!(
+            "cache purge starting: volume={} current_epoch={} age_threshold={} target={} expected_freed={}",
+            volume_id,
+            current,
+            plan.age_threshold,
+            plan.target_chunks,
+            plan.freed_chunks,
+        );
         let mut evicted: u64 = 0;
+        let mut shard_spared: u64 = 0;
 
         for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
             let lod = lod_idx as u8;
@@ -571,6 +631,18 @@ impl Inner {
                 let y = ((idx / nx) % ny) as u32;
                 let z = (idx / (nx * ny)) as u32;
                 let key = ChunkKey::new(lod, x, y, z);
+
+                // Shard-level freshness protection: if the volume hot
+                // path has touched this chunk's shard since the plan
+                // threshold age, skip this chunk.
+                if let Some((shard, _)) = self.disk.locate(key) {
+                    if let Some(sa) = self.disk.get_shard_access(lod, shard) {
+                        if !plan.is_victim(sa, current) {
+                            shard_spared += 1;
+                            continue;
+                        }
+                    }
+                }
 
                 // (1) Drop the in-memory Resident entry so new lookups
                 // take the slow path. Existing Arc holders keep their
@@ -605,6 +677,13 @@ impl Inner {
             }
         }
 
+        log::info!(
+            "cache purge finished: volume={} evicted={} shard_spared={} total_remaining={}",
+            volume_id,
+            evicted,
+            shard_spared,
+            self.epoch.total_chunks(),
+        );
         evicted
     }
 

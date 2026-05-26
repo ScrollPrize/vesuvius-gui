@@ -1094,6 +1094,45 @@ fn second_open_picks_up_disk_cache() {
 }
 
 #[test]
+fn shard_access_protects_chunks_from_purge() {
+    // All four chunks share the same shard (small extent, default
+    // SHARD_CHUNKS_PER_AXIS). After the cache ages, we mark the shard
+    // accessed: every chunk in it should be spared even though their
+    // per-chunk access epochs are old.
+    let root = tmp_root("purge-shard-protect");
+    let backfiller = Arc::new(SyntheticBackfiller::new(
+        "purge-shard-vol",
+        [256, 64, 64],
+        0,
+        |x, y, z, _| ((x as u32 ^ y as u32 ^ z as u32) & 0xff) as u8,
+    ));
+    let cache = ChunkCache::new(&root, backfiller);
+
+    let keys: Vec<ChunkKey> = (0..4).map(|cx| ChunkKey::new(0, cx, 0, 0)).collect();
+    for k in &keys {
+        cache.wait_for(*k, Duration::from_secs(2));
+    }
+    let epoch = cache.epoch_state();
+    assert_eq!(epoch.total_chunks(), 4);
+
+    // Age the cache without re-touching any chunk per-chunk-wise.
+    epoch.force_advance(10);
+
+    // Stamp the shard as accessed at the current (now-newer) epoch.
+    let (shard, _) = cache.locate(keys[0]).unwrap();
+    cache.touch_shard_access(0, shard);
+
+    // Attempt to evict all 4 chunks. Shard-level protection should
+    // refuse every one because the shard was just touched.
+    let evicted = cache.purge_to_target(4);
+    assert_eq!(evicted, 0, "shard touch should protect every chunk");
+    assert_eq!(epoch.total_chunks(), 4);
+    for k in &keys {
+        assert!(cache.peek(*k).is_some(), "{} should still be cached", k);
+    }
+}
+
+#[test]
 fn purge_evicts_oldest_and_preserves_survivors() {
     use super::disk::ChunkBitState;
 

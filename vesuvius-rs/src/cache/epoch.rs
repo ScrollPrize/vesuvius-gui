@@ -23,19 +23,59 @@
 //! minimal because the file is small (a few KB) and rewritten alongside
 //! the sidecar by the same sync thread.
 
+use super::purge::{PurgePlan, PurgeTarget};
 use super::sidecar::{Sidecar, STATE_RESIDENT};
+use super::CHUNK_VOXELS;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Watchdog tick interval. Both the periodic save and the watermark /
+/// statvfs checks run at this cadence.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// High watermark expressed as a fraction of cap (×100). At or above
+/// this fill the watchdog triggers a purge.
+const HIGH_WATER_PCT: u64 = 95;
+/// Low watermark expressed as a fraction of cap (×100). Each watermark
+/// purge frees enough chunks to bring usage down to this level.
+const LOW_WATER_PCT: u64 = 80;
+/// Absolute minimum free space on the cache filesystem before the
+/// watchdog issues a defensive purge regardless of cap fill.
+const MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 pub const EPOCH_SLOTS: usize = 256;
 
-/// Default cache cap used to derive `bytes_per_epoch` when no value is
-/// threaded through from configuration yet. 64 GiB is comfortable for
-/// development on the canonical 200 GB target without making
-/// `bytes_per_epoch` so small that tests trigger advances accidentally.
-pub const DEFAULT_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Default cache cap when neither the env var nor configuration sets
+/// one explicitly. Sized for the canonical workstation deployment.
+pub const DEFAULT_CAP_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+
+/// Env var overriding the cache cap, in GB. Parsed once per process on
+/// first access. Decimal integers only; invalid values fall back to
+/// `DEFAULT_CAP_BYTES` and emit a warning.
+pub const CAP_ENV_VAR: &str = "VESUVIUS_CACHE_CAP_GB";
+
+/// Read the cache cap from the env var, falling back to
+/// `DEFAULT_CAP_BYTES`. Cached so the env is parsed exactly once even
+/// across multiple `shared_for_unified_root` calls.
+pub fn cap_bytes_from_env() -> u64 {
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var(CAP_ENV_VAR) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(gb) if gb > 0 => gb.saturating_mul(1024 * 1024 * 1024),
+            Ok(_) => {
+                log::warn!("{} must be a positive integer; using default", CAP_ENV_VAR);
+                DEFAULT_CAP_BYTES
+            }
+            Err(e) => {
+                log::warn!("{} parse failed ({}); using default", CAP_ENV_VAR, e);
+                DEFAULT_CAP_BYTES
+            }
+        },
+        Err(_) => DEFAULT_CAP_BYTES,
+    })
+}
 
 /// Headroom factor applied to the configured cache cap when deriving
 /// `bytes_per_epoch`. With a 10% headroom the full 256 slots cover ≈1.1×
@@ -46,6 +86,7 @@ const HEADROOM_DEN: u128 = 10;
 
 pub struct EpochState {
     inner: Mutex<Inner>,
+    targets: Mutex<Vec<Weak<dyn PurgeTarget>>>,
 }
 
 struct Inner {
@@ -80,7 +121,34 @@ impl EpochState {
                 epoch_times,
                 epoch_chunks: [0; EPOCH_SLOTS],
             }),
+            targets: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a purge target that the watchdog can call into. Weakly
+    /// held; targets that have been dropped are skipped (and GC'd) on
+    /// the next tick.
+    pub fn register_target(&self, target: Weak<dyn PurgeTarget>) {
+        let mut guard = self.targets.lock().unwrap();
+        guard.push(target);
+    }
+
+    /// Build a purge plan against the current histogram and dispatch it
+    /// to every live registered target. Returns the total chunks
+    /// evicted. Used by the watchdog and by tests.
+    pub fn purge_all_to_target(&self, target_chunks: u64) -> u64 {
+        let Some(plan) = PurgePlan::build(self, target_chunks) else {
+            return 0;
+        };
+        let mut total: u64 = 0;
+        let mut targets = self.targets.lock().unwrap();
+        targets.retain(|w| w.upgrade().is_some());
+        let live: Vec<Arc<dyn PurgeTarget>> = targets.iter().filter_map(Weak::upgrade).collect();
+        drop(targets);
+        for t in live {
+            total = total.saturating_add(t.run_purge(plan));
+        }
+        total
     }
 
     pub fn current(&self) -> u8 {
@@ -296,6 +364,7 @@ impl EpochState {
                 epoch_times,
                 epoch_chunks,
             }),
+            targets: Mutex::new(Vec::new()),
         }))
     }
 }
@@ -368,7 +437,93 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
         s.total_chunks = 0;
     }
     g.insert(unified_root.to_path_buf(), state.clone());
+
+    // Spawn the watchdog daemon thread for this unified root. The
+    // thread holds `Weak<EpochState>` so the EpochState can be dropped
+    // (when the registry entry is cleared in tests, say); the next tick
+    // notices and exits. In production no one drops the registry entry,
+    // so the thread lives until process exit.
+    let weak = Arc::downgrade(&state);
+    let watchdog_root = unified_root.to_path_buf();
+    std::thread::Builder::new()
+        .name("vesuvius-cache-epoch-watchdog".into())
+        .spawn(move || watchdog_loop(weak, watchdog_root))
+        .expect("spawn epoch watchdog");
+
     state
+}
+
+fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf) {
+    let path = epoch_state_path(&unified_root);
+    loop {
+        std::thread::sleep(WATCHDOG_INTERVAL);
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+
+        // Save state. Failures are logged but don't kill the loop.
+        if let Err(e) = state.save(&path) {
+            log::warn!("epoch state save failed at {}: {}", path.display(), e);
+        }
+
+        // Watermark + statvfs purge.
+        let cap = state.cap_bytes();
+        if cap == 0 {
+            continue;
+        }
+        let chunk_bytes = CHUNK_VOXELS as u64;
+        let chunks_capacity = cap / chunk_bytes;
+        let high_water_chunks = chunks_capacity.saturating_mul(HIGH_WATER_PCT) / 100;
+        let low_water_chunks = chunks_capacity.saturating_mul(LOW_WATER_PCT) / 100;
+        let total = state.total_chunks();
+
+        let mut target_to_free: u64 = 0;
+        if total > high_water_chunks {
+            target_to_free = total - low_water_chunks;
+        }
+
+        if let Some(free_bytes) = statvfs_free(&unified_root) {
+            if free_bytes < MIN_FREE_BYTES {
+                let need_bytes = MIN_FREE_BYTES - free_bytes;
+                let extra_chunks = need_bytes.div_ceil(chunk_bytes);
+                target_to_free = target_to_free.max(extra_chunks);
+                log::info!(
+                    "epoch watchdog: low disk free ({} MiB < {} MiB), targeting {} chunks",
+                    free_bytes / (1024 * 1024),
+                    MIN_FREE_BYTES / (1024 * 1024),
+                    extra_chunks
+                );
+            }
+        }
+
+        if target_to_free > 0 {
+            let evicted = state.purge_all_to_target(target_to_free);
+            log::info!(
+                "epoch watchdog: purge target={} evicted={} (was {} chunks resident)",
+                target_to_free,
+                evicted,
+                total
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn statvfs_free(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return None;
+    }
+    Some((buf.f_bavail as u64).saturating_mul(buf.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn statvfs_free(_path: &Path) -> Option<u64> {
+    None
 }
 
 #[cfg(test)]

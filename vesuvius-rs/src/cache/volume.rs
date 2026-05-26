@@ -238,6 +238,13 @@ impl UnifiedVolume {
                 _mmap: snap.mmap,
                 state_bits: snap.state_bits,
             });
+            drop(b);
+            // The chunks we're about to read through this shard slot
+            // bypass `state_or_fetch`, so without an explicit signal
+            // their access epochs would stay stale and purge would
+            // consider them eligible for eviction. Stamp the shard
+            // instead.
+            self.cache.touch_shard_access(target_lod, shard);
         }
     }
 
