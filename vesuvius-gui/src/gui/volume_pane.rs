@@ -526,18 +526,16 @@ impl VolumePane {
         let mut changed = false;
 
         if response.hovered() {
-            let delta = ui.input(|i| i.smooth_scroll_delta);
+            let delta = ui.input(|i| i.raw_scroll_delta);
             let zoom_delta = ui.input(|i| i.zoom_delta());
 
             if zoom_delta != 1.0 {
                 *zoom = (*zoom * zoom_delta).max(ZOOM_MIN).min(ZOOM_MAX);
                 changed = true;
             } else if delta.y != 0.0 {
-                let min_level = 1 << ((ZOOM_RES_FACTOR / *zoom) as i32).min(6);
-                let delta = delta.y.signum() * min_level as f32;
+                let delta = delta.y.signum() * 1.0;
                 let m = &mut coord[d_coord];
-                *m = ((*m + delta as i32) / min_level as i32 * min_level as i32)
-                    .clamp(*ranges[d_coord].start(), *ranges[d_coord].end());
+                *m = (*m + delta as i32).clamp(*ranges[d_coord].start(), *ranges[d_coord].end());
                 changed = true;
             }
         }
