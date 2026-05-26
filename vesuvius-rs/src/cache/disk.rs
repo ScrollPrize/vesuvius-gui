@@ -441,6 +441,36 @@ impl DiskStore {
         Ok(lf.state_bits.store_if_unknown(r.in_shard_idx, ChunkBitState::Dispatched))
     }
 
+    /// Write `bytes` into the slot for `key` in the matching shard file
+    /// **without** touching the sidecar or the per-shard bitmap. Used by
+    /// the upscale-from-parent preview path: it stashes interpolated
+    /// bytes into the target shard's mmap region so subsequent reads
+    /// see a preview. The real `write_atomic` path is what eventually
+    /// marks the chunk Resident and overwrites these bytes with the
+    /// downloaded data.
+    ///
+    /// Callers must serialize against `write_atomic` for the same key
+    /// (the `ChunkCache` dispatching claim is sufficient).
+    pub fn write_unconfirmed(&self, key: ChunkKey, bytes: &[u8]) -> std::io::Result<()> {
+        assert_eq!(
+            bytes.len(),
+            CHUNK_VOXELS,
+            "unified-cache: write_unconfirmed got {} bytes, expected {}",
+            bytes.len(),
+            CHUNK_VOXELS
+        );
+        let r = self.inner.resolve(key).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("chunk {} out of bounds for this LOD", key),
+            )
+        })?;
+        let lf = self.inner.ensure_open(key.lod, r.shard)?;
+        let off = r.in_shard_idx * CHUNK_VOXELS as u64;
+        pwrite_all(&lf.file, off, bytes)?;
+        Ok(())
+    }
+
     /// Mark `key` as definitively absent in the sidecar. No bytes are written
     /// to a data file.
     pub fn mark_empty(&self, key: ChunkKey) -> std::io::Result<()> {

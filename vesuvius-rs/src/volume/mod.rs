@@ -147,6 +147,14 @@ impl Default for DrawingConfig {
 pub trait VoxelVolume {
     fn reset_for_painting(&self) {}
 
+    /// Pre-touch every chunk inside the axis-aligned voxel-coord box
+    /// `[min, max]` at the LOD selected by `downsampling`. Backends that
+    /// stream chunks asynchronously (the unified cache) use this to
+    /// kick dispatch + upscale-from-parent for a whole triangle's worth
+    /// of samples before the per-voxel composite loop runs. Default
+    /// impl: no-op (in-memory backends already have everything).
+    fn touch_aabb(&self, _min: [f64; 3], _max: [f64; 3], _downsampling: i32) {}
+
     fn get(&self, xyz: [f64; 3], downsampling: i32) -> u8;
 
     fn get_interpolated(&self, xyz: [f64; 3], downsampling: i32) -> u8 {
@@ -372,6 +380,9 @@ impl VoxelVolume for Volume {
     }
     fn reset_for_painting(&self) {
         self.volume.reset_for_painting();
+    }
+    fn touch_aabb(&self, min: [f64; 3], max: [f64; 3], downsampling: i32) {
+        self.volume.touch_aabb(min, max, downsampling);
     }
     fn composite_along_normal(
         &self,

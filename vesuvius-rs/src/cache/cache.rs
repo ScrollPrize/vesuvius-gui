@@ -44,7 +44,7 @@ use super::disk::{DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone, SubmitResult};
 use super::spill::SpillStore;
 use super::state::{ChunkKey, ChunkState};
-use super::MAX_AGE;
+use super::{CHUNK_VOXELS, MAX_AGE};
 use dashmap::DashMap;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -367,6 +367,61 @@ impl ChunkCache {
         self.inner.frame.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Dispatch every chunk in the AABB `[min, max]` (inclusive, in
+    /// target-LOD voxel coords) at `target_lod`, and pre-dispatch the
+    /// matching LOD-(target+1) parents so the upscale-from-parent
+    /// preview path inside `dispatch_chunk` has a chance to fire. Used
+    /// by `ObjVolume::paint` to pre-touch the chunks each triangle's
+    /// ray will hit before the per-voxel composite loop runs — that
+    /// loop reads the shard mmap unconditionally and relies on
+    /// pre-dispatch (or the upscale fill) for the bytes to be there.
+    pub fn touch_aabb(&self, min: [f64; 3], max: [f64; 3], target_lod: u8) {
+        let max_lod = self.max_lod();
+        if target_lod > max_lod {
+            return;
+        }
+        let to_chunk = |v: f64| -> i64 { (v as i64).div_euclid(64) };
+        let cx0 = to_chunk(min[0]).max(0);
+        let cy0 = to_chunk(min[1]).max(0);
+        let cz0 = to_chunk(min[2]).max(0);
+        let cx1 = to_chunk(max[0]).max(0);
+        let cy1 = to_chunk(max[1]).max(0);
+        let cz1 = to_chunk(max[2]).max(0);
+        if cx1 < cx0 || cy1 < cy0 || cz1 < cz0 {
+            return;
+        }
+        // Pass 1: parent chunks (one LOD coarser, deduped via >>1).
+        // Queued first so they're likely Resident by the time the next
+        // touch_aabb on this region runs dispatch on target chunks and
+        // checks the parent in `try_upscale_from_parent`.
+        if target_lod < max_lod {
+            let parent_lod = target_lod + 1;
+            let px0 = (cx0 as u32) >> 1;
+            let py0 = (cy0 as u32) >> 1;
+            let pz0 = (cz0 as u32) >> 1;
+            let px1 = (cx1 as u32) >> 1;
+            let py1 = (cy1 as u32) >> 1;
+            let pz1 = (cz1 as u32) >> 1;
+            for pz in pz0..=pz1 {
+                for py in py0..=py1 {
+                    for px in px0..=px1 {
+                        let _ = self.state_or_fetch(ChunkKey::new(parent_lod, px, py, pz));
+                    }
+                }
+            }
+        }
+        // Pass 2: target chunks. Each first dispatch flips the bitmap
+        // to Dispatched and (inside dispatch_chunk) tries upscale fill
+        // from any already-Resident parent.
+        for cz in cz0..=cz1 {
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    let _ = self.state_or_fetch(ChunkKey::new(target_lod, cx as u32, cy as u32, cz as u32));
+                }
+            }
+        }
+    }
+
     /// Synchronously persist the on-disk chunk-state sidecar. Call this
     /// before relying on a fresh `ChunkCache` opened against the same root
     /// to see chunks written by the current process — the background sync
@@ -524,6 +579,17 @@ impl Inner {
         if let Err(e) = self.disk.mark_dispatched(key) {
             log::trace!("[{}] mark_dispatched failed: {}", key, e);
         }
+
+        // Upscale-from-parent preview. If the LOD-(target+1) parent chunk
+        // is already Resident, we synthesize a 2× upsampled fill for the
+        // target slot's shard mmap so the composite reads a sensible
+        // preview while the real bytes stream in. Bytes get overwritten
+        // by `write_atomic` when the real fetch lands. Serialized via the
+        // outer `dispatching` claim — only the thread that won the claim
+        // is here, so we can't tear with another upscale on the same key
+        // (and the real download is queued *after* this point, ordering
+        // pwrites by submission).
+        self.try_upscale_from_parent(key);
 
         let plan = match self.backfiller.plan(key) {
             Ok(p) => p,
@@ -1117,6 +1183,29 @@ impl Inner {
         }
     }
 
+    /// If `key`'s LOD-(target+1) parent chunk is already Resident on
+    /// disk, synthesize a 2× upsampled fill (nearest neighbor) and
+    /// pwrite it into the target shard's mmap region. Used to show a
+    /// preview while the real bytes stream in. No-op when no parent
+    /// exists, the parent isn't Resident, or the I/O fails (we log on
+    /// failure and let the real download path be the source of truth).
+    fn try_upscale_from_parent(&self, key: ChunkKey) {
+        let max_lod = self.backfiller.max_lod();
+        if key.lod >= max_lod {
+            return;
+        }
+        let parent = ChunkKey::new(key.lod + 1, key.x >> 1, key.y >> 1, key.z >> 1);
+        let (mmap, offset) = match self.disk.load(parent) {
+            LoadOutcome::Resident { mmap, offset } => (mmap, offset),
+            _ => return,
+        };
+        let parent_slice = &mmap[offset..offset + CHUNK_VOXELS];
+        let bytes = upsample_2x_subregion(parent_slice, key.x & 1, key.y & 1, key.z & 1);
+        if let Err(e) = self.disk.write_unconfirmed(key, &bytes) {
+            log::debug!("[{}] upscale-from-parent write failed: {}", key, e);
+        }
+    }
+
     fn is_out_of_bounds(&self, key: ChunkKey) -> bool {
         let extent = self.backfiller.voxel_extent();
         let scale = 1u64 << key.lod;
@@ -1280,4 +1369,32 @@ fn worker_loop(inner: Arc<Inner>) {
             }
         }
     }
+}
+
+/// Nearest-neighbor 2× upsample of a 32³ subregion of a 64³ parent chunk
+/// into a fresh 64³ buffer. `(half_x, half_y, half_z)` ∈ {0,1} select
+/// which octant of the parent corresponds to this target chunk: the
+/// target voxel at `(tx, ty, tz)` reads from the parent voxel at
+/// `(half_x*32 + tx/2, half_y*32 + ty/2, half_z*32 + tz/2)`.
+fn upsample_2x_subregion(parent: &[u8], half_x: u32, half_y: u32, half_z: u32) -> Vec<u8> {
+    debug_assert_eq!(parent.len(), CHUNK_VOXELS);
+    let mut out = vec![0u8; CHUNK_VOXELS];
+    let ox = (half_x as usize) * 32;
+    let oy = (half_y as usize) * 32;
+    let oz = (half_z as usize) * 32;
+    for tz in 0..64usize {
+        let pz = oz + (tz >> 1);
+        for ty in 0..64usize {
+            let py = oy + (ty >> 1);
+            let p_row = pz * 64 * 64 + py * 64 + ox;
+            let t_row = tz * 64 * 64 + ty * 64;
+            // Two output voxels per parent voxel along x; unroll the pair.
+            for k in 0..32usize {
+                let v = parent[p_row + k];
+                out[t_row + 2 * k] = v;
+                out[t_row + 2 * k + 1] = v;
+            }
+        }
+    }
+    out
 }

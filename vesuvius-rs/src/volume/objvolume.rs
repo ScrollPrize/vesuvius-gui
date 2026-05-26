@@ -849,6 +849,50 @@ impl PaintVolume for ObjVolume {
                         let tmax_v = paint_zoom_align_up(v1i.max(v2i).max(v3i), paint_zoom)
                             .min(height as i32 * paint_zoom as i32 - 1);
 
+                        // Per-tri pre-dispatch. For composite rays we
+                        // conservatively bound the box of target-LOD
+                        // voxels every ray within this triangle could
+                        // touch (3 vertex bases × {start, end} ray
+                        // extents), and ask the backend to kick fetches
+                        // + parent-LOD upscale fills for those chunks
+                        // before the pixel loop drives the per-voxel
+                        // composite. The composite inner loop reads the
+                        // shard mmap unconditionally — without this
+                        // pre-touch, the only thing it would see for
+                        // unloaded chunks is the kernel zero page.
+                        if composite && config.trilinear_interpolation {
+                            let inv_f = 1.0 / ffactor;
+                            let xyz1 = &obj.vertices[tri.v[0] as usize];
+                            let xyz2 = &obj.vertices[tri.v[1] as usize];
+                            let xyz3 = &obj.vertices[tri.v[2] as usize];
+                            let nxyz1 = &obj.normals[tri.n[0] as usize];
+                            let nxyz2 = &obj.normals[tri.n[1] as usize];
+                            let nxyz3 = &obj.normals[tri.n[2] as usize];
+                            let start_w = (xyz[2] + composite_direction * composite_layers_in_front) as f64;
+                            let end_w = (xyz[2] - composite_direction * (composite_layers_behind + 1)) as f64;
+                            let verts = [(xyz1, nxyz1), (xyz2, nxyz2), (xyz3, nxyz3)];
+                            let mut tmin = [f64::INFINITY; 3];
+                            let mut tmax = [f64::NEG_INFINITY; 3];
+                            for (p, n) in &verts {
+                                for &w in &[start_w, end_w] {
+                                    let q = [
+                                        (p.x + w * n.x) * inv_f,
+                                        (p.y + w * n.y) * inv_f,
+                                        (p.z + w * n.z) * inv_f,
+                                    ];
+                                    for d in 0..3 {
+                                        if q[d] < tmin[d] {
+                                            tmin[d] = q[d];
+                                        }
+                                        if q[d] > tmax[d] {
+                                            tmax[d] = q[d];
+                                        }
+                                    }
+                                }
+                            }
+                            volume.touch_aabb(tmin, tmax, sfactor as i32);
+                        }
+
                         /* println!(
                             "tmin_u: {}, tmax_u: {}, tmin_v: {}, tmax_v: {}",
                             tmin_u, tmax_u, tmin_v, tmax_v
