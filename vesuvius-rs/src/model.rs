@@ -7,7 +7,9 @@ use crate::{
     volume::{LayersMappedVolume, Volume, VolumeGrid500Mapped, VolumeGrid64x4Mapped, VoxelPaintVolume},
 };
 use std::{path::Path, sync::Arc};
-use vesuvius_zarr::{default_cache_dir_for_url, OmeZarrContext, ZarrArray};
+use vesuvius_zarr::{
+    base_cache_dir, default_cache_dir_for_url, unified_volume_key, OmeZarrContext, ZarrArray,
+};
 
 #[derive(Copy, Clone, Debug)]
 pub struct Quality {
@@ -312,7 +314,16 @@ impl NewVolumeReference {
                     ),
                     VolumeLocation::LocalPath(path) => (OmeZarrContext::from_path(path), format!("file://{}", path)),
                 };
-                let cache_root = std::path::PathBuf::from(default_cache_dir_for_url(&source_key));
+                // Use the single process-global cache base so every
+                // zarr store ends up under one `<base>/unified/` dir
+                // and shares one epoch counter / purge plan.
+                // ChunkCache::new appends `/unified/<volume_id>` so we
+                // pass the base, not the unified subdir directly.
+                let cache_root = base_cache_dir();
+                // Embed the source's sha256 into the on-disk volume
+                // key so two sources advertising the same volume_id
+                // can coexist under one unified root.
+                let unique_id = unified_volume_key(&source_key, &id);
                 // Pad pyramidal OME-Zarr volumes with synthesized coarse
                 // levels so panes at extreme zoom-out paint a downsampled
                 // preview instead of black. The wrapper gates itself off
@@ -320,7 +331,8 @@ impl NewVolumeReference {
                 // native level over 32 chunks (any partial-pyramid /
                 // single-level zarr) bypasses synthesis entirely so we
                 // don't end up averaging thousands of full-res chunks.
-                let native: Arc<dyn ChunkBackfiller> = Arc::new(OmeZarrBackfiller::from_ome(id, ome));
+                let native: Arc<dyn ChunkBackfiller> =
+                    Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
                 let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
                 let cache = ChunkCache::new(cache_root, backfiller);
                 UnifiedVolume::new(cache).into_volume()

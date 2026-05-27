@@ -265,27 +265,10 @@ impl ChunkCache {
         // zero residency, but still records the volume_id so future
         // calls remain idempotent.
         epoch.add_from_sidecar(&disk.sidecar());
-
-        let cap_bytes = epoch.cap_bytes();
-        let total_chunks = epoch.total_chunks();
-        let chunk_bytes = CHUNK_VOXELS as u64;
-        let resident_bytes = total_chunks.saturating_mul(chunk_bytes);
-        let pct = if cap_bytes > 0 {
-            resident_bytes.saturating_mul(100) / cap_bytes
-        } else {
-            0
-        };
-        log::info!(
-            "cache stats: volume={} cap={} GiB resident={} chunks ({} MiB, {}% of cap) current_epoch={} bytes_per_epoch={} MiB unified_root={}",
-            disk.sidecar().header.volume_id,
-            cap_bytes / (1024 * 1024 * 1024),
-            total_chunks,
-            resident_bytes / (1024 * 1024),
-            pct,
-            epoch.current(),
-            epoch.bytes_per_epoch() / (1024 * 1024),
-            unified_root.display(),
-        );
+        // Cache-wide stats are logged once in `shared_for_unified_root`
+        // after the disk scan completes — no per-volume stats line here
+        // (the numbers would be global but the volume= label was
+        // misleading).
 
         let inner = Arc::new(Inner {
             map: DashMap::new(),

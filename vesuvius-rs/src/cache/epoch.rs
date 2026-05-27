@@ -51,7 +51,7 @@ pub const EPOCH_SLOTS: usize = 256;
 
 /// Default cache cap when neither the env var nor configuration sets
 /// one explicitly. Sized for the canonical workstation deployment.
-pub const DEFAULT_CAP_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+pub const DEFAULT_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Env var overriding the cache cap, in GB. Parsed once per process on
 /// first access. Decimal integers only; invalid values fall back to
@@ -222,11 +222,7 @@ impl EpochState {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
             Err(e) => {
-                log::warn!(
-                    "offline purge: read_dir {} failed: {}",
-                    unified_root.display(),
-                    e
-                );
+                log::warn!("offline purge: read_dir {} failed: {}", unified_root.display(), e);
                 return 0;
             }
         };
@@ -246,11 +242,7 @@ impl EpochState {
                 Ok(Some(s)) => s,
                 Ok(None) => continue,
                 Err(e) => {
-                    log::warn!(
-                        "offline purge: sidecar {} failed: {}",
-                        sidecar_path.display(),
-                        e
-                    );
+                    log::warn!("offline purge: sidecar {} failed: {}", sidecar_path.display(), e);
                     continue;
                 }
             };
@@ -259,8 +251,7 @@ impl EpochState {
             }
 
             let mut evicted_here: u64 = 0;
-            let mut open_shards: HashMap<(u8, super::disk::ShardCoord), std::fs::File> =
-                HashMap::new();
+            let mut open_shards: HashMap<(u8, super::disk::ShardCoord), std::fs::File> = HashMap::new();
 
             for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
                 let lod = lod_idx as u8;
@@ -310,11 +301,7 @@ impl EpochState {
                                             continue;
                                         }
                                         Err(err) => {
-                                            log::warn!(
-                                                "offline purge: stat {} failed: {}",
-                                                path.display(),
-                                                err
-                                            );
+                                            log::warn!("offline purge: stat {} failed: {}", path.display(), err);
                                             continue;
                                         }
                                     }
@@ -328,11 +315,7 @@ impl EpochState {
                                     continue;
                                 }
                                 Err(err) => {
-                                    log::warn!(
-                                        "offline purge: open {} failed: {}",
-                                        path.display(),
-                                        err
-                                    );
+                                    log::warn!("offline purge: open {} failed: {}", path.display(), err);
                                     continue;
                                 }
                             }
@@ -360,11 +343,7 @@ impl EpochState {
             // current in-memory bitmaps; write_to does atomic rename.
             let snap = sidecar.snapshot();
             if let Err(e) = snap.write_to(&sidecar.header, &sidecar_path) {
-                log::warn!(
-                    "offline purge: sidecar write {} failed: {}",
-                    sidecar_path.display(),
-                    e
-                );
+                log::warn!("offline purge: sidecar write {} failed: {}", sidecar_path.display(), e);
             }
             log::info!(
                 "offline purge: volume={} evicted={}",
@@ -537,10 +516,7 @@ impl EpochState {
 
         let parent = path.parent().expect("epoch path has parent");
         std::fs::create_dir_all(parent)?;
-        let tmp = parent.join(format!(
-            "{}.tmp",
-            path.file_name().unwrap().to_string_lossy()
-        ));
+        let tmp = parent.join(format!("{}.tmp", path.file_name().unwrap().to_string_lossy()));
         {
             use std::io::Write;
             let mut f = std::fs::File::create(&tmp)?;
@@ -638,10 +614,11 @@ pub fn epoch_state_path(unified_root: &Path) -> PathBuf {
 /// epoch advances, the histogram, and the chunk count are cache-wide.
 ///
 /// First call for a given root loads the persisted state if present, or
-/// constructs a fresh one with `cap_bytes`. Subsequent calls return the
-/// existing `Arc` and ignore `cap_bytes` (a running process keeps the
-/// cap it was first given for this root — resize-while-running isn't
-/// supported yet).
+/// constructs a fresh one with `cap_bytes`. When loading from disk, the
+/// caller-provided `cap_bytes` overrides whatever was persisted — the
+/// env / default is the source of truth, the file is just a snapshot.
+/// Subsequent calls within the same process return the existing `Arc`
+/// and ignore `cap_bytes` (no resize-while-running).
 pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<EpochState> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<EpochState>>>> = OnceLock::new();
     let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -654,11 +631,7 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
         Ok(Some(s)) => Arc::new(s),
         Ok(None) => Arc::new(EpochState::new(cap_bytes)),
         Err(e) => {
-            log::warn!(
-                "epoch state load failed at {}: {}; starting fresh",
-                path.display(),
-                e
-            );
+            log::warn!("epoch state load failed at {}: {}; starting fresh", path.display(), e);
             Arc::new(EpochState::new(cap_bytes))
         }
     };
@@ -667,15 +640,31 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
     // sidecars right below. Zero here so the scan starts clean and the
     // counts reflect every volume in the cache dir, not just the one
     // being opened right now.
+    //
+    // Cap + derived `bytes_per_epoch` come from this call's argument
+    // (which is `cap_bytes_from_env()` in production). The persisted
+    // values are ignored on load — otherwise changing
+    // `VESUVIUS_CACHE_CAP_GB` or `DEFAULT_CAP_BYTES` would have no
+    // effect once an epoch.idx exists on disk.
     {
         let mut s = state.inner.lock().unwrap();
         s.epoch_chunks = [0; EPOCH_SLOTS];
         s.total_chunks = 0;
+        if s.cap_bytes != cap_bytes {
+            log::info!(
+                "epoch.idx cap override: persisted={} GiB -> using={} GiB",
+                s.cap_bytes / (1024 * 1024 * 1024),
+                cap_bytes / (1024 * 1024 * 1024),
+            );
+            s.cap_bytes = cap_bytes;
+            s.bytes_per_epoch = derive_bytes_per_epoch(cap_bytes);
+        }
     }
     // Record the root so `purge_all_to_target` can run the offline
     // sweep against volume subdirs that don't have a live target.
     let _ = state.unified_root.set(unified_root.to_path_buf());
     seed_from_disk(&state, unified_root);
+    log_global_stats(&state, unified_root);
     g.insert(unified_root.to_path_buf(), state.clone());
 
     // Spawn the watchdog daemon thread for this unified root. The
@@ -691,6 +680,39 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
         .expect("spawn epoch watchdog");
 
     state
+}
+
+/// Emit a one-shot info log summarizing the cache-wide state right
+/// after the registry init + disk scan. Reports global numbers (every
+/// on-disk volume under `unified_root`), not the per-volume slice that
+/// the first `ChunkCache` happens to attach to. Fires once per process
+/// per unified root.
+fn log_global_stats(state: &EpochState, unified_root: &Path) {
+    let cap_bytes = state.cap_bytes();
+    let total_chunks = state.total_chunks();
+    let accumulated = state.accumulated_volume_ids().len();
+    let chunk_bytes = CHUNK_VOXELS as u64;
+    let resident_bytes = total_chunks.saturating_mul(chunk_bytes);
+    let pct = if cap_bytes > 0 {
+        resident_bytes.saturating_mul(100) / cap_bytes
+    } else {
+        0
+    };
+    let free_bytes = statvfs_free(unified_root);
+    log::info!(
+        "cache stats (global): root={} cap={} GiB volumes={} resident={} chunks ({} MiB, {}% of cap) current_epoch={} bytes_per_epoch={} MiB disk_free={}",
+        unified_root.display(),
+        cap_bytes / (1024 * 1024 * 1024),
+        accumulated,
+        total_chunks,
+        resident_bytes / (1024 * 1024),
+        pct,
+        state.current(),
+        state.bytes_per_epoch() / (1024 * 1024),
+        free_bytes
+            .map(|b| format!("{} MiB", b / (1024 * 1024)))
+            .unwrap_or_else(|| "?".to_string()),
+    );
 }
 
 /// Scan `unified_root` for every per-volume cache subdirectory and
@@ -710,11 +732,7 @@ fn seed_from_disk(state: &EpochState, unified_root: &Path) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            log::warn!(
-                "epoch seed: read_dir {} failed: {}",
-                unified_root.display(),
-                e
-            );
+            log::warn!("epoch seed: read_dir {} failed: {}", unified_root.display(), e);
             return;
         }
     };
@@ -731,11 +749,7 @@ fn seed_from_disk(state: &EpochState, unified_root: &Path) {
                 seeded += 1;
             }
             Ok(None) => {}
-            Err(e) => log::warn!(
-                "epoch seed: sidecar {} failed to load: {}",
-                sidecar_path.display(),
-                e
-            ),
+            Err(e) => log::warn!("epoch seed: sidecar {} failed to load: {}", sidecar_path.display(), e),
         }
     }
     if seeded > 0 {
@@ -951,8 +965,7 @@ mod tests {
                 s.set_access_epoch(0, idx, ae);
             }
             let snap = s.snapshot();
-            snap.write_to(&s.header, &sidecar::sidecar_path(&vol_dir))
-                .unwrap();
+            snap.write_to(&s.header, &sidecar::sidecar_path(&vol_dir)).unwrap();
         }
 
         // Build EpochState directly and run the scan (avoids the
@@ -1029,9 +1042,7 @@ mod tests {
 
         // Re-load from disk and confirm sidecar was persisted with
         // demoted states.
-        let after = Sidecar::load(&sidecar::sidecar_path(&stale_dir))
-            .unwrap()
-            .unwrap();
+        let after = Sidecar::load(&sidecar::sidecar_path(&stale_dir)).unwrap().unwrap();
         for idx in 0..3u64 {
             assert_eq!(
                 after.get_state(0, idx),
@@ -1084,9 +1095,7 @@ mod tests {
         state.unified_root.set(unified.clone()).unwrap();
         seed_from_disk(&state, &unified);
 
-        let target: Arc<dyn PurgeTarget> = Arc::new(FakeTarget {
-            vid: "vol-live".into(),
-        });
+        let target: Arc<dyn PurgeTarget> = Arc::new(FakeTarget { vid: "vol-live".into() });
         state.register_target(Arc::downgrade(&target));
 
         state.force_advance(200);

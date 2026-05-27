@@ -507,6 +507,35 @@ pub fn default_cache_dir_for_url(url: &str) -> String {
         .to_string()
 }
 
+/// The vesuvius-gui base cache directory, shared by every artifact this
+/// app writes to disk: `<XDG_CACHE_HOME>/vesuvius-gui/`.
+pub fn base_cache_dir() -> std::path::PathBuf {
+    BaseDirs::new().unwrap().cache_dir().join("vesuvius-gui")
+}
+
+/// Single global root for the unified-cache subsystem. All volumes from
+/// every source share this dir so the cache-wide LRU (epoch.idx) and
+/// purge sweep operate on one cohesive picture.
+pub fn unified_cache_root() -> std::path::PathBuf {
+    base_cache_dir().join("unified")
+}
+
+/// Stable per-volume key combining the source URL's sha256 with the
+/// caller's volume_id. Used as the on-disk directory name under
+/// `unified_cache_root()`. The sha256 prefix prevents collisions when
+/// two sources advertise the same volume_id; the volume_id suffix keeps
+/// the dir name browseable.
+pub fn unified_volume_key(source_url: &str, volume_id: &str) -> String {
+    let canonical = if source_url.ends_with('/') {
+        &source_url[..source_url.len() - 1]
+    } else {
+        source_url
+    };
+    let sha256 = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+    format!("{}__{}", &sha256[..16], volume_id)
+}
+
+
 impl<const N: usize> ZarrArray<N, u8> {
     fn load_chunk_context(&self, chunk_no: [usize; N]) -> Option<ChunkContext> {
         self.access.load_chunk(&self.def, &chunk_no)

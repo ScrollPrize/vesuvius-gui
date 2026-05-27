@@ -25,7 +25,7 @@ use vesuvius_rs::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
 use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, UnifiedVolume};
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
-use vesuvius_zarr::{default_cache_dir_for_url, OmeZarrContext, ZarrArray};
+use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext, ZarrArray};
 
 pub(crate) const ZOOM_MIN: f32 = 0.01;
 pub(crate) const ZOOM_MAX: f32 = 8.0;
@@ -379,9 +379,10 @@ impl TemplateApp {
                             format!("file://{}", segment_file),
                         )
                     };
-                    let cache_root = std::path::PathBuf::from(default_cache_dir_for_url(&source_key));
+                    let cache_root = base_cache_dir();
+                    let unique_id = unified_volume_key(&source_key, "overlay");
                     let native: Arc<dyn ChunkBackfiller> =
-                        Arc::new(OmeZarrBackfiller::from_ome("overlay", ome));
+                        Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
                     let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
                     let cache = ChunkCache::new(cache_root, backfiller);
                     UnifiedVolume::new(cache).into_volume()
