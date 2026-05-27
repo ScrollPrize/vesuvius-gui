@@ -323,6 +323,64 @@ impl UnifiedCache {
         self.epoch.run_purge_pass("startup")
     }
 
+    /// Synchronously flush every live volume's sidecar plus the
+    /// cache-wide epoch state. Call this from the app's `on_exit` hook
+    /// so a graceful shutdown durably records every chunk written
+    /// during the session, even if the per-volume sync watchdog hasn't
+    /// fired since the last batch of writes.
+    ///
+    /// Without this, the registry holds `Weak<Inner>` but workers and
+    /// the purge target keep strong refs through process lifetime — so
+    /// `DiskStore::Drop` never runs and the last 0–10 s of writes are
+    /// lost when the process exits between watchdog ticks.
+    ///
+    /// Idempotent: re-flushing after no writes is cheap (the snapshot
+    /// path early-returns when `pending == 0`). Safe to call from any
+    /// thread.
+    pub fn shutdown(&self) {
+        // Snapshot the volume map under the lock, then drop the lock
+        // before flushing — `disk.flush()` can block on fsync and we
+        // don't want to hold the registry lock for that long.
+        let live: Vec<Arc<Inner>> = {
+            let mut volumes = self.volumes.lock().unwrap();
+            volumes.retain(|_, w| w.strong_count() > 0);
+            volumes.values().filter_map(|w| w.upgrade()).collect()
+        };
+        let n_vols = live.len();
+        for inner in &live {
+            inner.flush();
+        }
+        let epoch_path = epoch::epoch_state_path(&self.unified_root);
+        if let Err(e) = self.epoch.save(&epoch_path) {
+            log::warn!(
+                target: super::purge::LOG_TARGET,
+                "shutdown: epoch state save failed at {}: {}",
+                epoch_path.display(),
+                e
+            );
+        }
+        log::info!(
+            target: super::purge::LOG_TARGET,
+            "shutdown: flushed {} volume(s) under {}",
+            n_vols,
+            self.unified_root.display()
+        );
+    }
+
+    /// Flush every `UnifiedCache` registered in the process. Call this
+    /// from the app's `on_exit` when you don't know which cache roots
+    /// were touched. Order across roots is arbitrary; per-root work is
+    /// synchronous.
+    pub fn shutdown_all() {
+        let caches: Vec<Arc<UnifiedCache>> = {
+            let reg = unified_registry().lock().unwrap();
+            reg.values().cloned().collect()
+        };
+        for c in caches {
+            c.shutdown();
+        }
+    }
+
     /// Get-or-create the `ChunkCache` for one volume under this
     /// unified root. The second call for the same `volume_id` reuses
     /// the same in-memory `Inner` (and therefore the same workers,
@@ -698,6 +756,13 @@ impl PurgeTarget for Inner {
 }
 
 impl Inner {
+    /// Synchronously flush this volume's sidecar to disk. Wraps
+    /// `DiskStore::flush` so `UnifiedCache::shutdown` can drive it
+    /// through a `Weak<Inner>` upgrade without exposing the disk store.
+    fn flush(&self) {
+        self.disk.flush();
+    }
+
     /// Evict all Resident chunks whose access epoch falls into the
     /// `plan.is_victim` set, under per-slot CAS protection.
     ///

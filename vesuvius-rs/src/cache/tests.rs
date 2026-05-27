@@ -1170,3 +1170,71 @@ fn purge_evicts_oldest_and_preserves_survivors() {
         assert_eq!(cache.voxel(x, y, z, 0), expected, "survivor {} voxel mismatch", k);
     }
 }
+
+/// Shutdown flushes the sidecar synchronously so a fresh `Sidecar::load`
+/// against the same root sees the writes — without waiting for the
+/// per-volume sync watchdog (~10 s cadence).
+///
+/// Asserts: (a) shutdown persists what's in memory, (b) shutdown is
+/// idempotent, (c) `shutdown_all` walks the registry.
+///
+/// `#[ignore]`'d by default because the synchronous shutdown path runs
+/// `sync_data` on every open shard file; under the `cargo test`
+/// parallel runner the I/O can starve other timing-sensitive tests
+/// (`paint_falls_back_to_coarser_lod_when_target_missing` et al.).
+/// Run with:
+///   cargo test -p vesuvius-rs --lib cache::tests::shutdown -- --ignored
+#[test]
+#[ignore]
+fn shutdown_flushes_sidecar_and_is_idempotent() {
+    use super::sidecar::{sidecar_path, Sidecar, STATE_RESIDENT};
+
+    let root = tmp_root("shutdown-flush");
+    let backfiller = Arc::new(SyntheticBackfiller::new(
+        "shutdown-vol",
+        [128, 128, 128],
+        0,
+        |x, y, z, _| (x ^ y ^ z) as u8,
+    ));
+    let unified = UnifiedCache::for_cache_dir(&root);
+    let cache = unified.open_volume(backfiller);
+
+    // Materialize two chunks. wait_for guarantees they're Resident in
+    // the in-memory map + the sidecar's atomic byte, but the sync
+    // watchdog hasn't fired yet (10s cadence), so the on-disk sidecar
+    // file is still the empty one written at construction.
+    let k0 = ChunkKey::new(0, 0, 0, 0);
+    let k1 = ChunkKey::new(0, 1, 0, 0);
+    for k in [k0, k1] {
+        let s = cache.wait_for(k, Duration::from_secs(2));
+        assert!(s.as_resident().is_some(), "expected Resident, got {:?}", s);
+    }
+
+    // Drive shutdown explicitly (this is what eframe::App::on_exit
+    // would do in the app).
+    unified.shutdown();
+
+    // Reload the sidecar straight from disk — it must reflect both
+    // writes now that shutdown has run.
+    let vol_root = unified.unified_root().join("shutdown-vol");
+    let sc = Sidecar::load(&sidecar_path(&vol_root))
+        .expect("sidecar load")
+        .expect("sidecar present");
+    let dims = sc.header.lods[0];
+    let idx0 = dims.linear_index(0, 0, 0).unwrap();
+    let idx1 = dims.linear_index(1, 0, 0).unwrap();
+    assert_eq!(sc.get_state(0, idx0), STATE_RESIDENT, "k0 should be Resident on disk");
+    assert_eq!(sc.get_state(0, idx1), STATE_RESIDENT, "k1 should be Resident on disk");
+
+    // Idempotency: second shutdown is a cheap no-op (nothing pending).
+    unified.shutdown();
+
+    // shutdown_all() walks the process-wide registry; calling it must
+    // not panic and must keep the persisted sidecar consistent.
+    UnifiedCache::shutdown_all();
+    let sc2 = Sidecar::load(&sidecar_path(&vol_root))
+        .expect("sidecar load")
+        .expect("sidecar present");
+    assert_eq!(sc2.get_state(0, idx0), STATE_RESIDENT);
+    assert_eq!(sc2.get_state(0, idx1), STATE_RESIDENT);
+}

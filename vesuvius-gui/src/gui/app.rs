@@ -1696,6 +1696,19 @@ impl eframe::App for TemplateApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
+
+    /// Called once after the event loop exits and before the App is
+    /// dropped. We use it to flush every UnifiedCache the process
+    /// touched: per-volume sidecars + the cache-wide epoch state.
+    /// Without this, the watchdog threads only persist on their
+    /// ~10–30 s cadence, so chunks written in the final window
+    /// before the user closed the window stay on disk but are
+    /// invisible to the sidecar — leading to "shards fuller than
+    /// reported" on the next launch.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        vesuvius_rs::cache::UnifiedCache::shutdown_all();
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("op_bar")
             .frame(egui::Frame::NONE.inner_margin(4.0))
