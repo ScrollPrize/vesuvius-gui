@@ -298,6 +298,21 @@ impl TifXyzData {
 
 // ---------- TifXyzVolume ----------
 
+/// Default texture (== "nominal" / voxel-space) dimensions for a tifxyz base.
+/// Matches `QuadSurface::scale()` semantics in volume-cartographer
+/// (`core/src/QuadSurface.cpp:505`): `{cols / scale_x, rows / scale_y}`.
+/// `meta.json.scale` is grid-cells-per-nominal-unit, so dividing the grid dims
+/// by it yields the segment's extent in the same units ObjVolume's catalog
+/// width/height use (voxel-space pixels), which is what downstream LOD
+/// selection and zoom math assume.
+fn nominal_dims(base: &TifXyzBase) -> (usize, usize) {
+    let sx = base.scale[0].max(1e-9);
+    let sy = base.scale[1].max(1e-9);
+    let w = ((base.cols as f64) / sx).max(1.0).round() as usize;
+    let h = ((base.rows as f64) / sy).max(1.0).round() as usize;
+    (w, h)
+}
+
 impl TifXyzVolume {
     pub fn load_from_directory(
         dir: impl AsRef<Path>,
@@ -309,14 +324,21 @@ impl TifXyzVolume {
             bail!("tifxyz path is not a directory: {}", dir.display());
         }
         let base = TifXyzBase::load(dir)?;
-        let cols = base.cols;
-        let rows = base.rows;
+        let (tex_width, tex_height) = nominal_dims(&base);
+        log::info!(
+            "TifXyzVolume::load_from_directory grid {}x{} scale {:?} → nominal {}x{}",
+            base.cols,
+            base.rows,
+            base.scale,
+            tex_width,
+            tex_height
+        );
         let data = TifXyzData::build(base, transform);
         Ok(Self {
             volume: base_volume,
             data,
-            tex_width: cols,
-            tex_height: rows,
+            tex_width,
+            tex_height,
         })
     }
 
@@ -331,11 +353,14 @@ impl TifXyzVolume {
     }
 
     /// Reuse the parsed grid; only re-apply the affine if it changed.
+    /// `width`/`height` are accepted for API parity with `ObjVolume::with_base`
+    /// but ignored — tex dims are determined by `scale` + grid dims, not by
+    /// caller-supplied values, so a fresh load and a `with_base` agree.
     pub fn with_base(
         &self,
         base_volume: Volume,
-        width: usize,
-        height: usize,
+        _width: usize,
+        _height: usize,
         transform: &Option<AffineTransform>,
     ) -> Self {
         let data = if transforms_equal(&self.data.applied_transform, transform) {
@@ -346,9 +371,15 @@ impl TifXyzVolume {
         Self {
             volume: base_volume,
             data,
-            tex_width: width,
-            tex_height: height,
+            tex_width: self.tex_width,
+            tex_height: self.tex_height,
         }
+    }
+
+    /// Segment-space (nominal/voxel-unit) UV → grid-cell fractional coords.
+    #[inline]
+    fn seg_to_grid(&self, seg_u: f64, seg_v: f64) -> (f64, f64) {
+        (seg_u * self.data.base.scale[0] as f64, seg_v * self.data.base.scale[1] as f64)
     }
 
     /// UV-pane segment-coord → world voxel coord lookup.
@@ -357,13 +388,10 @@ impl TifXyzVolume {
         let v = coord[1];
         let w = coord[2] as f64;
 
-        let cols = self.data.base.cols;
-        let rows = self.data.base.rows;
         if u < 0 || v < 0 || u as usize >= self.tex_width || v as usize >= self.tex_height {
             return [-1, -1, -1];
         }
-        let gc = u as f64 * (cols.saturating_sub(1)) as f64 / (self.tex_width.saturating_sub(1).max(1)) as f64;
-        let gr = v as f64 * (rows.saturating_sub(1)) as f64 / (self.tex_height.saturating_sub(1).max(1)) as f64;
+        let (gc, gr) = self.seg_to_grid(u as f64, v as f64);
         let Some(s) = self.sample_grid(gc, gr) else {
             return [-1, -1, -1];
         };
@@ -479,20 +507,6 @@ impl PaintVolume for TifXyzVolume {
         let ffactor = sfactor as f64;
         let w_factor = xyz[2] as f64;
 
-        let cols = self.data.base.cols;
-        let rows = self.data.base.rows;
-        // segment-space (u, v) → grid-cell (gc, gr) — identity when tex dims match grid dims
-        let col_scale = if self.tex_width > 1 {
-            (cols.saturating_sub(1)) as f64 / (self.tex_width - 1) as f64
-        } else {
-            0.0
-        };
-        let row_scale = if self.tex_height > 1 {
-            (rows.saturating_sub(1)) as f64 / (self.tex_height - 1) as f64
-        } else {
-            0.0
-        };
-
         let origin_u = xyz[0] - width as i32 / 2 * paint_zoom as i32;
         let origin_v = xyz[1] - height as i32 / 2 * paint_zoom as i32;
 
@@ -500,8 +514,7 @@ impl PaintVolume for TifXyzVolume {
             for bx in 0..width {
                 let seg_u = origin_u + (bx as i32) * paint_zoom as i32;
                 let seg_v = origin_v + (by as i32) * paint_zoom as i32;
-                let gc = seg_u as f64 * col_scale;
-                let gr = seg_v as f64 * row_scale;
+                let (gc, gr) = self.seg_to_grid(seg_u as f64, seg_v as f64);
                 let Some(sample) = self.sample_grid(gc, gr) else {
                     continue;
                 };
@@ -609,19 +622,8 @@ impl VoxelVolume for TifXyzVolume {
         if u <= 0.0 || v <= 0.0 || u >= self.tex_width as f64 || v >= self.tex_height as f64 || w.abs() > 45.0 {
             return 0;
         }
-        let cols = self.data.base.cols;
-        let rows = self.data.base.rows;
-        let col_scale = if self.tex_width > 1 {
-            (cols.saturating_sub(1)) as f64 / (self.tex_width - 1) as f64
-        } else {
-            0.0
-        };
-        let row_scale = if self.tex_height > 1 {
-            (rows.saturating_sub(1)) as f64 / (self.tex_height - 1) as f64
-        } else {
-            0.0
-        };
-        let Some(s) = self.sample_grid(u * col_scale, v * row_scale) else {
+        let (gc, gr) = self.seg_to_grid(u, v);
+        let Some(s) = self.sample_grid(gc, gr) else {
             return 0;
         };
         let px = s.xyz[0] as f64 + w * s.n[0] as f64;
@@ -712,17 +714,35 @@ mod tests {
             eprintln!("skipping: fixture not present");
             return;
         };
-        let data = TifXyzData::build(base.clone(), &None);
+        let (tex_w, tex_h) = nominal_dims(&base);
+        let data = TifXyzData::build(base, &None);
         let vol = TifXyzVolume {
             volume: EmptyVolume {}.into_volume(),
             data,
-            tex_width: base.cols,
-            tex_height: base.rows,
+            tex_width: tex_w,
+            tex_height: tex_h,
         };
         assert_eq!(vol.get([-1.0, 5.0, 0.0], 1), 0);
         assert_eq!(vol.get([5.0, -1.0, 0.0], 1), 0);
-        assert_eq!(vol.get([1000.0, 1000.0, 0.0], 1), 0);
+        let oob = (tex_w + 100) as f64;
+        assert_eq!(vol.get([oob, oob, 0.0], 1), 0);
         // valid coords return 0 too because base is EmptyVolume — just exercise the path.
-        let _ = vol.get([64.0, 64.0, 0.0], 1);
+        let mid_u = (tex_w / 2) as f64;
+        let mid_v = (tex_h / 2) as f64;
+        let _ = vol.get([mid_u, mid_v, 0.0], 1);
+    }
+
+    #[test]
+    fn nominal_dims_match_quadsurface_scale() {
+        let Ok(base) = TifXyzBase::load(Path::new(FIXTURE)) else {
+            eprintln!("skipping: fixture not present");
+            return;
+        };
+        // Fixture: scale = 0.0078125 = 1/128. 129 cells / (1/128) = 16512.
+        // Mirrors QuadSurface::scale() in volume-cartographer
+        // (core/src/QuadSurface.cpp:505): {cols/scale_x, rows/scale_y}.
+        let (w, h) = nominal_dims(&base);
+        assert_eq!(w, 16512, "nominal width should be cols/scale_x");
+        assert_eq!(h, 16512, "nominal height should be rows/scale_y");
     }
 }
