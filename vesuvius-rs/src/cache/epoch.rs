@@ -8,7 +8,7 @@
 //! - `bytes_since_advance` — cache-wide bytes written into shard files since
 //!   the last advance. Advancing happens once `bytes_per_epoch` is crossed.
 //! - `bytes_per_epoch` — derived from the configured cache cap so the full
-//!   256-slot range covers ≈1.1× cap (10% headroom).
+//!   256-slot range covers ≈1.3× cap (30% headroom).
 //! - `total_chunks` — current resident chunk count (cache-wide).
 //! - `epoch_times[i]` — wall time at which slot `i` was last entered.
 //! - `epoch_chunks[i]` — number of chunks whose `access_epoch == i`. Updated
@@ -30,7 +30,7 @@ use super::CHUNK_VOXELS;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Watchdog tick interval. Both the periodic save and the watermark /
@@ -80,10 +80,12 @@ pub fn cap_bytes_from_env() -> u64 {
 }
 
 /// Headroom factor applied to the configured cache cap when deriving
-/// `bytes_per_epoch`. With a 10% headroom the full 256 slots cover ≈1.1×
-/// cap, so even a cache that runs slightly over its target before purge
-/// fires still has wrap-safe budget.
-const HEADROOM_NUM: u128 = 11;
+/// `bytes_per_epoch`. With a 30% headroom the full 256 slots cover ≈1.3×
+/// cap, so the modular wrap guard absorbs a cache that overshoots its
+/// target while the watchdog is still building / running the purge plan
+/// — including pathological cases where the planner refuses to evict
+/// (no candidates above current) for several ticks in a row.
+const HEADROOM_NUM: u128 = 13;
 const HEADROOM_DEN: u128 = 10;
 
 pub struct EpochState {
@@ -102,6 +104,16 @@ pub struct EpochState {
     /// an offline sweep against subdirs not represented by a live
     /// target.
     unified_root: OnceLock<PathBuf>,
+    /// Wake-the-watchdog channel: `bool` is "save requested", `Condvar`
+    /// is the wake signal. `record_fill` fires this whenever
+    /// `maybe_advance` actually moves `current`, so a fresh epoch hits
+    /// disk within milliseconds instead of waiting up to a full
+    /// `WATCHDOG_INTERVAL`. Without this, exits between watchdog ticks
+    /// silently roll the loaded `current` back to a stale value on the
+    /// next process start. `Arc` so the watchdog can hold its own
+    /// reference and outlive a dropping `EpochState` cleanly (the
+    /// watchdog loop uses `Weak<EpochState>` to detect shutdown).
+    save_signal: Arc<(Mutex<bool>, Condvar)>,
 }
 
 struct Inner {
@@ -139,6 +151,7 @@ impl EpochState {
             targets: Mutex::new(Vec::new()),
             accumulated: Mutex::new(HashSet::new()),
             unified_root: OnceLock::new(),
+            save_signal: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
 
@@ -410,13 +423,33 @@ impl EpochState {
     /// histogram bucket for that epoch. Returns the epoch the chunk
     /// should be written into the sidecar's access-epoch column.
     pub fn record_fill(&self, bytes_written: u64) -> u8 {
-        let mut s = self.inner.lock().unwrap();
-        s.bytes_since_advance = s.bytes_since_advance.saturating_add(bytes_written);
-        Self::maybe_advance(&mut s, SystemTime::now());
-        s.total_chunks += 1;
-        let cur = s.current;
-        s.epoch_chunks[cur as usize] = s.epoch_chunks[cur as usize].saturating_add(1);
+        let (cur, advanced) = {
+            let mut s = self.inner.lock().unwrap();
+            let pre = s.current;
+            s.bytes_since_advance = s.bytes_since_advance.saturating_add(bytes_written);
+            Self::maybe_advance(&mut s, SystemTime::now());
+            s.total_chunks += 1;
+            let cur = s.current;
+            s.epoch_chunks[cur as usize] = s.epoch_chunks[cur as usize].saturating_add(1);
+            (cur, pre != cur)
+        };
+        if advanced {
+            // Persist the new `current` ASAP — without this signal a
+            // process exit before the next watchdog tick rewinds
+            // `current` on the next start.
+            self.signal_save();
+        }
         cur
+    }
+
+    /// Wake the watchdog to flush `epoch.idx` immediately. Cheap (one
+    /// `Mutex` lock + `Condvar` notify). No-op if no watchdog thread is
+    /// running (tests that build `EpochState` directly via `new()`).
+    fn signal_save(&self) {
+        let (m, cv) = &*self.save_signal;
+        let mut g = m.lock().unwrap();
+        *g = true;
+        cv.notify_one();
     }
 
     /// Account for an access to a chunk currently tagged with `old_epoch`.
@@ -599,6 +632,7 @@ impl EpochState {
             targets: Mutex::new(Vec::new()),
             accumulated: Mutex::new(HashSet::new()),
             unified_root: OnceLock::new(),
+            save_signal: Arc::new((Mutex::new(false), Condvar::new())),
         }))
     }
 }
@@ -697,9 +731,10 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
     // so the thread lives until process exit.
     let weak = Arc::downgrade(&state);
     let watchdog_root = unified_root.to_path_buf();
+    let signal = state.save_signal.clone();
     std::thread::Builder::new()
         .name("vesuvius-cache-epoch-watchdog".into())
-        .spawn(move || watchdog_loop(weak, watchdog_root))
+        .spawn(move || watchdog_loop(weak, watchdog_root, signal))
         .expect("spawn epoch watchdog");
 
     state
@@ -847,10 +882,21 @@ fn seed_from_disk(state: &EpochState, unified_root: &Path) {
     }
 }
 
-fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf) {
+fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf, signal: Arc<(Mutex<bool>, Condvar)>) {
     let path = epoch_state_path(&unified_root);
+    let mut last_purge_check = std::time::Instant::now();
     loop {
-        std::thread::sleep(WATCHDOG_INTERVAL);
+        // Block until a save is requested or the watchdog interval
+        // elapses, whichever comes first. We unset the flag pre-emptively
+        // so a signal arriving during `state.save()` is captured by the
+        // next wait (it'll find the flag set and skip the wait).
+        let timed_out = {
+            let g = signal.0.lock().unwrap();
+            let (mut g, res) = signal.1.wait_timeout(g, WATCHDOG_INTERVAL).unwrap();
+            *g = false;
+            res.timed_out()
+        };
+
         let Some(state) = weak.upgrade() else {
             return;
         };
@@ -860,7 +906,17 @@ fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf) {
             log::warn!(target: super::purge::LOG_TARGET, "epoch state save failed at {}: {}", path.display(), e);
         }
 
-        // Watermark + statvfs purge.
+        // Watermark + statvfs purge runs on the slow cadence only —
+        // signal wakeups are for save-on-advance and shouldn't trigger
+        // an extra purge plan each time. With WATCHDOG_INTERVAL slack,
+        // we run the check whenever a tick fully elapsed since the last
+        // one (matches the original 30s cadence even under signal
+        // storms).
+        if !timed_out && last_purge_check.elapsed() < WATCHDOG_INTERVAL {
+            continue;
+        }
+        last_purge_check = std::time::Instant::now();
+
         let cap = state.cap_bytes();
         if cap == 0 {
             continue;
@@ -944,10 +1000,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bytes_per_epoch_is_capx11_div_256() {
+    fn bytes_per_epoch_is_capx13_div_256() {
         let cap = 200u64 << 30; // 200 GiB
         let bpe = derive_bytes_per_epoch(cap);
-        let expected = (cap as u128 * 11 / 10 / 256) as u64;
+        let expected = (cap as u128 * 13 / 10 / 256) as u64;
         assert_eq!(bpe, expected);
     }
 
