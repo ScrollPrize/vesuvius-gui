@@ -328,7 +328,6 @@ impl VoxelVolume for OverlayVolume {
         downsampling: i32,
         compositor: &mut Compositor,
         num_layers: u32,
-        climb_lod: bool,
     ) -> Color32 {
         compositor.reset();
         self.base.composite_along_normal(
@@ -338,7 +337,6 @@ impl VoxelVolume for OverlayVolume {
             w_hi,
             downsampling,
             &mut compositor.as_ref_mut(),
-            climb_lod,
         );
         let base_color = Color32::from_gray(compositor.result(num_layers));
 
@@ -350,7 +348,6 @@ impl VoxelVolume for OverlayVolume {
             w_hi,
             downsampling,
             &mut overlay_comp.as_ref_mut(),
-            climb_lod,
         );
         let overlay_val = overlay_comp.result(num_layers);
 

@@ -324,20 +324,19 @@ impl VoxelVolume for UnifiedVolume {
         w_hi: f64,
         downsampling: i32,
         compositor: &mut CompositorRef<'_>,
-        climb_lod: bool,
     ) {
         match compositor {
             CompositorRef::Max(s) => {
-                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, climb_lod, |v| s.update(v))
+                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| s.update(v))
             }
             CompositorRef::Alpha(s) => {
-                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, climb_lod, |v| s.update(v))
+                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| s.update(v))
             }
             CompositorRef::HeightMap(s) => {
-                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, climb_lod, |v| s.update(v))
+                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| s.update(v))
             }
             CompositorRef::None(s) => {
-                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, climb_lod, |v| s.update(v))
+                self.composite_along_normal_inner(base, dir, w_lo, w_hi, downsampling, |v| s.update(v))
             }
         }
     }
@@ -356,8 +355,7 @@ impl UnifiedVolume {
     /// chunks the ray crosses before this is called; un-arrived bytes
     /// read as zero from the sparse mmap, and the optional one-level
     /// upscale-from-parent path in `touch_aabb` fills target chunks with
-    /// a preview while the real bytes stream in. `_climb_lod` is kept on
-    /// the trait method for compatibility and ignored here.
+    /// a preview while the real bytes stream in.
     fn composite_along_normal_inner<F: FnMut(u8) -> bool>(
         &self,
         base: [f64; 3],
@@ -365,7 +363,6 @@ impl UnifiedVolume {
         w_lo: f64,
         w_hi: f64,
         downsampling: i32,
-        _climb_lod: bool,
         mut sink: F,
     ) {
         let target_lod = lod_for(downsampling.max(1) as u8);
@@ -759,8 +756,7 @@ impl UnifiedVolume {
         let mut state = MaxCompositionState::new();
         let mut compositor = CompositorRef::Max(&mut state);
         // Drive the trait override so we exercise the same unswitch +
-        // monomorphized inner-loop path callers reach via Volume. Climb
-        // enabled so the bench measures the full pyramid-aware behavior.
+        // monomorphized inner-loop path callers reach via Volume.
         <Self as VoxelVolume>::composite_along_normal(
             self,
             base,
@@ -769,7 +765,6 @@ impl UnifiedVolume {
             w_hi,
             downsampling,
             &mut compositor,
-            true,
         );
         state.result(0)
     }

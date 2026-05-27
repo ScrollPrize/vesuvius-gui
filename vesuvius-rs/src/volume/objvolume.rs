@@ -995,7 +995,6 @@ impl PaintVolume for ObjVolume {
                                                     sfactor as i32,
                                                     &mut composition,
                                                     composite_total_layers as u32,
-                                                    config.compositing.climb_lod,
                                                 );
                                                 buffer.set(
                                                     u as usize / paint_zoom as usize,

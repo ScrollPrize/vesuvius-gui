@@ -62,12 +62,6 @@ pub struct CompositingSettings {
     pub alpha_threshold: u16,
     pub opacity: u16,
     pub reverse_direction: bool,
-    /// If `false`, the per-ray composite walk skips the LOD pyramid: a
-    /// non-resident target chunk reads as zero instead of being served from
-    /// a coarser parent. Trades smooth-during-streaming for a faster hot
-    /// loop (the climb is the dominant cost once the shard-slot fast path
-    /// is in place).
-    pub climb_lod: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
@@ -137,7 +131,6 @@ impl Default for DrawingConfig {
                 alpha_threshold: 9500,
                 opacity: 1,
                 reverse_direction: false,
-                climb_lod: true,
             },
             debug_chunk_overlay: false,
         }
@@ -204,11 +197,6 @@ pub trait VoxelVolume {
     /// to a monomorphized inner loop per arm, so the per-sample update
     /// folds into the trilerp body without any virtual call.
     ///
-    /// `climb_lod` toggles per-sample LOD-pyramid fallback. The default
-    /// impl below has nothing to climb (it just calls `get_interpolated`,
-    /// whose behavior is backend-specific), so the flag is wired through
-    /// only for backends that implement multi-LOD chunk fallback.
-    ///
     /// The default impl is the same per-sample loop the call site used to
     /// inline. Backends that resolve to a chunked cache override this to
     /// amortize chunk lookups across the whole walk.
@@ -220,7 +208,6 @@ pub trait VoxelVolume {
         w_hi: f64,
         downsampling: i32,
         compositor: &mut CompositorRef<'_>,
-        _climb_lod: bool,
     ) {
         let n = (w_hi - w_lo) as i32;
         for k in 0..n {
@@ -250,7 +237,6 @@ pub trait VoxelVolume {
         downsampling: i32,
         compositor: &mut Compositor,
         num_layers: u32,
-        climb_lod: bool,
     ) -> Color32 {
         compositor.reset();
         self.composite_along_normal(
@@ -260,7 +246,6 @@ pub trait VoxelVolume {
             w_hi,
             downsampling,
             &mut compositor.as_ref_mut(),
-            climb_lod,
         );
         Color32::from_gray(compositor.result(num_layers))
     }
@@ -424,10 +409,9 @@ impl VoxelVolume for Volume {
         w_hi: f64,
         downsampling: i32,
         compositor: &mut CompositorRef<'_>,
-        climb_lod: bool,
     ) {
         self.volume
-            .composite_along_normal(base, dir, w_lo, w_hi, downsampling, compositor, climb_lod);
+            .composite_along_normal(base, dir, w_lo, w_hi, downsampling, compositor);
     }
     fn composite_color_along_normal(
         &self,
@@ -438,7 +422,6 @@ impl VoxelVolume for Volume {
         downsampling: i32,
         compositor: &mut Compositor,
         num_layers: u32,
-        climb_lod: bool,
     ) -> Color32 {
         self.volume.composite_color_along_normal(
             base,
@@ -448,7 +431,6 @@ impl VoxelVolume for Volume {
             downsampling,
             compositor,
             num_layers,
-            climb_lod,
         )
     }
 }
