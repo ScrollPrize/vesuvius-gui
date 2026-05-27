@@ -25,7 +25,7 @@
 //! is always a strict subset of durable bytes, so a crash loses at most
 //! the last sync interval of work (chunks are re-downloaded).
 
-use super::sidecar::{self, LodDims, Sidecar, STATE_EMPTY, STATE_MISSING, STATE_RESIDENT};
+use super::sidecar::{self, LodDims, Sidecar, STATE_EMPTY, STATE_LOCKED, STATE_MISSING, STATE_RESIDENT};
 use super::state::ChunkKey;
 use super::CHUNK_VOXELS;
 use memmap::{Mmap, MmapOptions};
@@ -41,6 +41,25 @@ pub enum LoadOutcome {
     Resident { mmap: Arc<Mmap>, offset: usize },
     Empty,
     Missing,
+}
+
+/// Result of `DiskStore::write_atomic`. The variant tells the caller
+/// whether the slot transitioned (so it should `record_fill` for LRU
+/// accounting) or whether another thread had already published a
+/// definitive state. See `write_atomic` for the full protocol.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// We held the per-slot lock and wrote the bytes; sidecar
+    /// transitioned `MISSING → RESIDENT`. Caller must call
+    /// `record_fill` exactly once.
+    Wrote,
+    /// CAS observed `RESIDENT` before we could claim — another writer
+    /// got there first. Skip the write; the existing bytes are
+    /// authoritative.
+    AlreadyResident,
+    /// CAS observed `EMPTY` — another path marked this slot
+    /// definitively absent. Skip the write; publish `Empty`.
+    AlreadyEmpty,
 }
 
 /// Read-only view returned by `DiskStore::peek_shard`. Bundles the shard's
@@ -349,11 +368,25 @@ impl DiskStore {
         }
     }
 
-    /// Write a 64³ chunk into its slot in the matching shard file, then
-    /// publish `Resident` in the sidecar bitmap with `Release`. Concurrent
-    /// readers using `Acquire` are guaranteed to see all 256 KiB of bytes
-    /// before observing the Resident transition.
-    pub fn write_atomic(&self, key: ChunkKey, bytes: &[u8]) -> std::io::Result<()> {
+    /// Write a 64³ chunk into its slot in the matching shard file under
+    /// per-slot CAS protection.
+    ///
+    /// Protocol:
+    ///   1. CAS sidecar `MISSING → LOCKED` to claim exclusive access.
+    ///   2. pwrite the bytes into the shard.
+    ///   3. Store `RESIDENT` (releases the lock, publishes visibility).
+    ///   4. Store `Resident` into the per-shard bitmap with `Release`,
+    ///      pairing with the reader fast path's `Acquire`.
+    ///
+    /// Concurrency outcomes (see `WriteOutcome` for the return type):
+    ///   - CAS sees `RESIDENT` → another writer already filled the slot.
+    ///     Skip — return `AlreadyResident` so the caller can publish from
+    ///     the existing bytes without double-counting in `record_fill`.
+    ///   - CAS sees `EMPTY` → another path marked the slot definitively
+    ///     absent. Return `AlreadyEmpty`; caller publishes `Empty`.
+    ///   - CAS sees `LOCKED` → a peer write or punch_hole is in flight.
+    ///     Spin (µs-scale) until the lock releases, then retry the CAS.
+    pub fn write_atomic(&self, key: ChunkKey, bytes: &[u8]) -> std::io::Result<WriteOutcome> {
         assert_eq!(
             bytes.len(),
             CHUNK_VOXELS,
@@ -368,16 +401,38 @@ impl DiskStore {
             )
         })?;
         let lf = self.inner.ensure_open(key.lod, r.shard)?;
+
+        // Acquire the per-slot lock. The sidecar byte itself is the
+        // mutex cell — see `STATE_LOCKED`.
+        let sidecar = &self.inner.sidecar;
+        loop {
+            match sidecar.compare_exchange_state(key.lod, r.sidecar_idx, STATE_MISSING, STATE_LOCKED) {
+                Ok(_) => break,
+                Err(STATE_LOCKED) => std::hint::spin_loop(),
+                Err(STATE_RESIDENT) => return Ok(WriteOutcome::AlreadyResident),
+                Err(STATE_EMPTY) => return Ok(WriteOutcome::AlreadyEmpty),
+                Err(other) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("unexpected sidecar state {} for {}", other, key),
+                    ));
+                }
+            }
+        }
+
         let off = r.in_shard_idx * CHUNK_VOXELS as u64;
-        pwrite_all(&lf.file, off, bytes)?;
-        self.inner.sidecar.set_state(key.lod, r.sidecar_idx, STATE_RESIDENT);
-        // Bitmap store is the *visibility* publish for readers using the
-        // per-shard fast path: `Release` here pairs with `Acquire` in
-        // `ChunkStateBits::load`, ensuring the mmap bytes pwritten above are
-        // observable once a reader sees `Resident`.
+        if let Err(e) = pwrite_all(&lf.file, off, bytes) {
+            // Release the lock back to MISSING so spinning peers can
+            // make progress. The slot stays logically empty; any
+            // orphan bytes already written will be overwritten on
+            // retry or punched by a later eviction.
+            sidecar.set_state(key.lod, r.sidecar_idx, STATE_MISSING);
+            return Err(e);
+        }
+        sidecar.set_state(key.lod, r.sidecar_idx, STATE_RESIDENT);
         lf.state_bits.store(r.in_shard_idx, ChunkBitState::Resident);
         self.inner.maybe_wake_sync();
-        Ok(())
+        Ok(WriteOutcome::Wrote)
     }
 
     /// Synchronously snapshot the sidecar, fsync any shard files that
@@ -441,17 +496,21 @@ impl DiskStore {
         Ok(lf.state_bits.store_if_unknown(r.in_shard_idx, ChunkBitState::Dispatched))
     }
 
-    /// Write `bytes` into the slot for `key` in the matching shard file
-    /// **without** touching the sidecar or the per-shard bitmap. Used by
-    /// the upscale-from-parent preview path: it stashes interpolated
+    /// Write `bytes` into the slot for `key` as a best-effort preview.
+    /// Used by the upscale-from-parent path: it stashes interpolated
     /// bytes into the target shard's mmap region so subsequent reads
-    /// see a preview. The real `write_atomic` path is what eventually
-    /// marks the chunk Resident and overwrites these bytes with the
-    /// downloaded data.
+    /// see something while the real fetch streams in. The eventual
+    /// `write_atomic` overwrites these bytes with the downloaded data.
     ///
-    /// Callers must serialize against `write_atomic` for the same key
-    /// (the `ChunkCache` dispatching claim is sufficient).
-    pub fn write_unconfirmed(&self, key: ChunkKey, bytes: &[u8]) -> std::io::Result<()> {
+    /// Concurrency: takes the per-slot CAS lock to serialize against
+    /// `write_atomic` and `punch_hole`. Returns `Ok(false)` (silently
+    /// skipped) if the CAS finds the slot in any non-MISSING state —
+    /// the preview is best-effort and must never compete with, or
+    /// clobber, a definitive transition. Always resets the sidecar
+    /// byte back to `MISSING` after writing, so the preview bytes are
+    /// effectively orphaned from a sidecar-state perspective (kept
+    /// only as a read-through-mmap hint until the real fetch lands).
+    pub fn write_unconfirmed(&self, key: ChunkKey, bytes: &[u8]) -> std::io::Result<bool> {
         assert_eq!(
             bytes.len(),
             CHUNK_VOXELS,
@@ -466,9 +525,24 @@ impl DiskStore {
             )
         })?;
         let lf = self.inner.ensure_open(key.lod, r.shard)?;
+
+        // Try to claim the per-slot lock. Don't spin on LOCKED —
+        // upscale is best-effort; if a real op is in flight we skip.
+        let sidecar = &self.inner.sidecar;
+        if sidecar
+            .compare_exchange_state(key.lod, r.sidecar_idx, STATE_MISSING, STATE_LOCKED)
+            .is_err()
+        {
+            return Ok(false);
+        }
+
         let off = r.in_shard_idx * CHUNK_VOXELS as u64;
-        pwrite_all(&lf.file, off, bytes)?;
-        Ok(())
+        let result = pwrite_all(&lf.file, off, bytes);
+        // Release the lock back to MISSING regardless of write result:
+        // the slot has no durable readable state from this path, and
+        // a future write_atomic must be free to claim it.
+        sidecar.set_state(key.lod, r.sidecar_idx, STATE_MISSING);
+        result.map(|_| true)
     }
 
     /// Mark `key` as definitively absent in the sidecar. No bytes are written
@@ -1032,6 +1106,134 @@ mod tests {
                 assert_eq!(mmap[off + 1], (1u8 ^ t).wrapping_mul(31), "{}", key);
             }
         }
+    }
+
+    /// Stress test for the per-slot CAS protocol: a writer pool races a
+    /// purger over the same key set. Invariant: any slot whose sidecar
+    /// reports RESIDENT at end-of-test has its sentinel bytes intact —
+    /// no permanent "sidecar RESIDENT + shard punched-to-zero" state.
+    ///
+    /// Without the CAS path the purger could punch a slot between a
+    /// writer's pwrite and the writer's `set_state(RESIDENT)`, leaving
+    /// the sidecar claiming Resident while the bytes were zeroed. With
+    /// the CAS path that interleaving is structurally impossible.
+    ///
+    /// `#[ignore]`'d by default because the busy writers + purger
+    /// briefly saturate the cores and can starve other timing-sensitive
+    /// tests in the same `cargo test` parallel run. Run with:
+    ///   cargo test -p vesuvius-rs --lib cache::disk::tests::write_atomic_vs_purge -- --ignored
+    #[test]
+    #[ignore]
+    fn write_atomic_vs_purge_no_resident_zero_drift() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        const NUM_SLOTS: u32 = 32;
+        const SENTINEL_HEAD: u8 = 0xa5;
+        const SENTINEL_TAIL: u8 = 0x5a;
+
+        let tmp = tempdir();
+        // Extent picked so the slot range [0..NUM_SLOTS] all fit at LOD 0
+        // in a single shard (avoids the small-shard test path here).
+        let store = Arc::new(DiskStore::new(&tmp, "v".into(), [4096, 64, 64], 0));
+
+        // Compute the LOD-0 dims once so the purger can map x → sidecar
+        // idx without going through the private resolve().
+        let lod0 = store.sidecar().header.lods[0];
+        let nx = lod0.nx as u64;
+        let ny = lod0.ny as u64;
+        let _ = ny; // (z=0, y=0): idx is just x
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+        // Writer threads: re-fill the slot range with sentinel bytes.
+        // `thread::yield_now` between iterations keeps us from starving
+        // concurrently-running unit tests of CPU.
+        for _ in 0..2 {
+            let store = store.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut bytes = vec![0u8; CHUNK_VOXELS];
+                bytes[0] = SENTINEL_HEAD;
+                bytes[CHUNK_VOXELS - 1] = SENTINEL_TAIL;
+                while !stop.load(Ordering::Relaxed) {
+                    for x in 0..NUM_SLOTS {
+                        let _ = store.write_atomic(ChunkKey::new(0, x, 0, 0), &bytes);
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        // Purger thread: imitate cache.rs::run_purge per-slot — CAS
+        // RESIDENT→LOCKED, punch, set MISSING. Failures (slot wasn't
+        // RESIDENT when we tried) are expected and just skipped.
+        {
+            let store = store.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for x in 0..NUM_SLOTS {
+                        let key = ChunkKey::new(0, x, 0, 0);
+                        let idx: u64 = x as u64; // (z=0, y=0) at LOD 0
+                        let sidecar = store.sidecar();
+                        if sidecar
+                            .compare_exchange_state(0, idx, STATE_RESIDENT, STATE_LOCKED)
+                            .is_ok()
+                        {
+                            // Replicate the cache-side ordering: punch
+                            // under the lock, then release with
+                            // MISSING.
+                            let _ = store.punch_hole(key);
+                            sidecar.set_state(0, idx, STATE_MISSING);
+                            let _ = nx;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Invariant: any RESIDENT slot must read back our sentinel.
+        let sidecar = store.sidecar();
+        let mut checked = 0usize;
+        for x in 0..NUM_SLOTS {
+            let key = ChunkKey::new(0, x, 0, 0);
+            let idx: u64 = x as u64;
+            if sidecar.get_state(0, idx) != STATE_RESIDENT {
+                continue;
+            }
+            let (mmap, off) = store
+                .try_load(key)
+                .expect("RESIDENT slot must be loadable");
+            assert_eq!(
+                mmap[off], SENTINEL_HEAD,
+                "slot {} sidecar=RESIDENT but head byte = {:#x} (race left punched bytes)",
+                x, mmap[off]
+            );
+            assert_eq!(
+                mmap[off + CHUNK_VOXELS - 1],
+                SENTINEL_TAIL,
+                "slot {} sidecar=RESIDENT but tail byte = {:#x}",
+                x,
+                mmap[off + CHUNK_VOXELS - 1]
+            );
+            checked += 1;
+        }
+        // Sanity: the test is meaningful only if some slots ended up
+        // RESIDENT. With 4 writers vs 1 purger the writers should
+        // almost always win some races.
+        assert!(checked > 0, "no RESIDENT slots at end — test inconclusive");
     }
 
     #[test]

@@ -18,6 +18,19 @@ pub const MAGIC: &[u8; 8] = b"VCSPRS01";
 pub const STATE_MISSING: u8 = 0;
 pub const STATE_RESIDENT: u8 = 1;
 pub const STATE_EMPTY: u8 = 2;
+/// Transient "operation in flight on this slot" marker. Acts as a
+/// per-slot mutex: every state transition is a `compare_exchange` from a
+/// specific predecessor to `STATE_LOCKED`, the disk op runs while we
+/// hold the lock, then a plain `store` of the destination value
+/// releases it. Other contenders observing LOCKED spin until released
+/// (the critical sections — `pwrite_all` of one 256 KiB chunk,
+/// `fallocate(PUNCH_HOLE)` of one chunk — are µs-scale on local disk).
+///
+/// LOCKED on a persisted sidecar (process died mid-op) signals
+/// "presumed compromised": the startup sweep punches the slot and
+/// demotes it to MISSING. The reader fast path treats LOCKED as
+/// not-readable (same as MISSING).
+pub const STATE_LOCKED: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LodDims {
@@ -290,6 +303,25 @@ impl Sidecar {
             self.pending[lod as usize].fetch_add(1, Ordering::Relaxed);
         }
         prev
+    }
+
+    /// CAS the state byte at `(lod, idx)` from `current` to `new`. Returns
+    /// `Ok(current)` on success or `Err(observed)` on failure (the caller
+    /// gets the actual current value to drive its retry / skip logic).
+    /// AcqRel on success pairs with `Acquire` loads on the reader fast
+    /// path; Acquire on failure ensures the failed CAS doesn't reorder
+    /// later loads. Bumps the pending counter only on success.
+    pub fn compare_exchange_state(&self, lod: u8, idx: u64, current: u8, new: u8) -> Result<u8, u8> {
+        let res = self.bitmaps[lod as usize][idx as usize].compare_exchange(
+            current,
+            new,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if res.is_ok() && current != new {
+            self.pending[lod as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        res
     }
 
     /// Snapshot the bitmap, access-epoch column, and the pending counters.

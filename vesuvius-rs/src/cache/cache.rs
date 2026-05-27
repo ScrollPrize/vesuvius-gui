@@ -44,7 +44,6 @@ use super::disk::{ChunkBitState, DiskStore, LoadOutcome, ShardCoord, ShardSnapsh
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone, SubmitResult};
 use super::epoch::{self, EpochState};
 use super::purge::{PurgePlan, PurgeTarget};
-use super::sidecar::STATE_MISSING;
 use super::spill::SpillStore;
 use super::state::{ChunkKey, ChunkState};
 use super::{CHUNK_VOXELS, MAX_AGE};
@@ -689,8 +688,26 @@ impl PurgeTarget for Inner {
 
 impl Inner {
     /// Evict all Resident chunks whose access epoch falls into the
-    /// `plan.is_victim` set. See `ChunkCache::purge_to_target` for the
-    /// ordering rationale (bitmap demote first, then punch).
+    /// `plan.is_victim` set, under per-slot CAS protection.
+    ///
+    /// Protocol per victim:
+    ///   1. CAS sidecar `RESIDENT → LOCKED`. If the CAS fails, the slot
+    ///      was concurrently demoted or claimed by another op — skip.
+    ///   2. Drop the in-memory `ChunkState::Resident` entry so new
+    ///      readers take the slow path.
+    ///   3. Demote the per-shard bitmap to `Unknown` (Release).
+    ///   4. punch_hole — physical reclaim.
+    ///   5. Store `MISSING` (releases the lock; pairs with reader
+    ///      Acquire loads).
+    ///   6. record_evict.
+    ///
+    /// The CAS in step (1) serializes against any concurrent
+    /// `write_atomic` on the same slot: a peer that started its CAS
+    /// from `MISSING` would have failed (we're at `RESIDENT`), and a
+    /// peer that wins our `LOCKED` claim will see LOCKED and spin
+    /// until we release in step (5). The earlier race where a peer
+    /// fetcher's pwrite could land between our `set MISSING` and
+    /// `punch_hole` is now structurally impossible.
     fn run_purge(&self, plan: PurgePlan) -> u64 {
         let sidecar = self.disk.sidecar();
         let current = self.epoch.current();
@@ -705,6 +722,7 @@ impl Inner {
             plan.freed_chunks,
         );
         let mut evicted: u64 = 0;
+        let mut skipped: u64 = 0;
 
         for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
             let lod = lod_idx as u8;
@@ -718,6 +736,18 @@ impl Inner {
                 if !plan.is_victim(ae, current) {
                     continue;
                 }
+                // (1) Claim the per-slot lock. CAS may fail if a peer
+                // op transitioned the slot between our pre-screen
+                // and here — skip and let the next purge cycle pick
+                // it up if it ends back at RESIDENT.
+                if sidecar
+                    .compare_exchange_state(lod, idx, super::sidecar::STATE_RESIDENT, super::sidecar::STATE_LOCKED)
+                    .is_err()
+                {
+                    skipped += 1;
+                    continue;
+                }
+
                 // Un-flatten linear idx to (x, y, z); raster order is
                 // `(z * ny + y) * nx + x`.
                 let x = (idx % nx) as u32;
@@ -725,15 +755,13 @@ impl Inner {
                 let z = (idx / (nx * ny)) as u32;
                 let key = ChunkKey::new(lod, x, y, z);
 
-                // (1) Drop the in-memory Resident entry so new lookups
-                // take the slow path. Existing Arc holders keep their
-                // ChunkState alive but will read zeros after the punch.
+                // (2) Drop the in-memory Resident entry. New lookups
+                // take the slow path; in-flight Arc<ChunkState>
+                // holders may transiently read zeros — that's the
+                // documented mmap glitch readers tolerate.
                 self.map.remove(&key);
 
-                // (2) Per-shard bitmap demote. Resident chunks have an
-                // open shard (write_atomic opened it); if for some
-                // reason it's not open we skip and let readers fall
-                // back to the sidecar.
+                // (3) Per-shard bitmap demote (Release).
                 if let Some((shard, in_shard_idx)) = self.disk.locate(key) {
                     if let Some(snap) = self.disk.peek_shard(lod, shard) {
                         snap.state_bits.store(in_shard_idx, ChunkBitState::Unknown);
@@ -741,18 +769,17 @@ impl Inner {
                     let _ = (shard, in_shard_idx);
                 }
 
-                // (3) Sidecar demote (Release + bumps pending so the
-                // sync thread flushes this transition).
-                sidecar.set_state(lod, idx, STATE_MISSING);
-
-                // (4) Physical reclaim. Failure here is non-fatal —
-                // the chunk is already logically evicted; the blocks
-                // just stay allocated.
+                // (4) Physical reclaim under the lock — no concurrent
+                // pwrite can interleave because peer write_atomic is
+                // either spinning on LOCKED or already failed its CAS.
                 if let Err(e) = self.disk.punch_hole(key) {
                     log::warn!(target: super::purge::LOG_TARGET, "punch_hole failed for {}: {}", key, e);
                 }
 
-                // (5) Bookkeeping.
+                // (5) Release the lock by publishing MISSING.
+                sidecar.set_state(lod, idx, super::sidecar::STATE_MISSING);
+
+                // (6) Bookkeeping.
                 self.epoch.record_evict(ae);
                 evicted += 1;
             }
@@ -760,9 +787,10 @@ impl Inner {
 
         log::info!(
             target: super::purge::LOG_TARGET,
-            "cache purge finished: volume={} evicted={} total_remaining={}",
+            "cache purge finished: volume={} evicted={} skipped_cas={} total_remaining={}",
             volume_id,
             evicted,
+            skipped,
             self.epoch.total_chunks(),
         );
         evicted
@@ -1397,25 +1425,34 @@ impl Inner {
     /// the `.empty` sentinel, `Empty`. IO failures fall back to a cooldown
     /// so paint retries.
     fn primary_state(&self, key: ChunkKey, primary: ExtractedChunk, t0: std::time::Instant) -> Arc<ChunkState> {
+        use super::disk::WriteOutcome;
         match primary {
             ExtractedChunk::Bytes(bytes) => match self.disk.write_atomic(key, &bytes) {
-                Ok(()) => {
-                    // LRU bookkeeping: record the fill in the cache-wide
-                    // epoch state and stamp the sidecar's access-epoch
-                    // column with the returned epoch byte. This is the
-                    // single chokepoint for both primary and sibling
-                    // chunk writes — see the caller in `run_extract`.
-                    let ep = self.epoch.record_fill(CHUNK_VOXELS as u64);
-                    self.disk.set_access_epoch(key, ep);
-
-                    match self.disk.try_load(key) {
-                        Some((mmap, offset)) => {
-                            log::debug!("[{}] ready ({:?})", key, t0.elapsed());
-                            Arc::new(ChunkState::Resident { mmap, offset })
-                        }
-                        None => {
-                            log::warn!("[{}] write ok but mmap reload failed", key);
-                            cooldown()
+                Ok(outcome) => {
+                    // Only the thread that actually performed the
+                    // MISSING → RESIDENT transition should record_fill —
+                    // sibling writes that lose the CAS race (slot was
+                    // already filled by a peer) must skip, otherwise
+                    // the histogram and `total_chunks` over-count by
+                    // one per redundant sibling.
+                    if matches!(outcome, WriteOutcome::Wrote) {
+                        let ep = self.epoch.record_fill(CHUNK_VOXELS as u64);
+                        self.disk.set_access_epoch(key, ep);
+                    }
+                    match outcome {
+                        WriteOutcome::Wrote | WriteOutcome::AlreadyResident => match self.disk.try_load(key) {
+                            Some((mmap, offset)) => {
+                                log::debug!("[{}] ready ({:?})", key, t0.elapsed());
+                                Arc::new(ChunkState::Resident { mmap, offset })
+                            }
+                            None => {
+                                log::warn!("[{}] write ok but mmap reload failed", key);
+                                cooldown()
+                            }
+                        },
+                        WriteOutcome::AlreadyEmpty => {
+                            log::debug!("[{}] empty (peer-marked, {:?})", key, t0.elapsed());
+                            Arc::new(ChunkState::Empty)
                         }
                     }
                 }
