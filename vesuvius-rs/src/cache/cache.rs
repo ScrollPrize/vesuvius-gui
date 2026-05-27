@@ -1912,37 +1912,93 @@ fn worker_loop(inner: Arc<Inner>) {
     }
 }
 
-/// Nearest-neighbor `2^shift`× upsample of a `(64 >> shift)³` subregion of
-/// a 64³ parent chunk into a fresh 64³ buffer. `(target_cx, target_cy,
+/// Trilinear `2^shift`× upsample of a `(64 >> shift)³` subregion of a
+/// 64³ parent chunk into a fresh 64³ buffer. `(target_cx, target_cy,
 /// target_cz)` are the *target chunk's* coordinates at its LOD; the low
 /// `shift` bits select which `(64 >> shift)³` block of the parent the
 /// target chunk corresponds to.
 ///
 /// `shift` must be in `1..=6`. `shift == 6` is the degenerate case where
-/// the target chunk maps to a single parent voxel: every output is the
-/// same byte.
+/// the target chunk maps to a single parent voxel — trilinear blending
+/// with the parent's immediate neighbors (clamped at index 63) still
+/// produces a smooth gradient across the target chunk in that case,
+/// which is the main reason to prefer trilinear over nearest-neighbor
+/// here: the preview looks like a low-pass image rather than a grid of
+/// 64³ flat-color blocks.
+///
+/// Edges of the parent are clamped (we have no access to neighboring
+/// parent chunks here). Sampling uses Q0.8 fixed point with parent
+/// voxels treated as point samples at integer coordinates; target voxel
+/// `t` on an axis with offset `o` samples parent at the continuous
+/// coordinate `o + (t + 0.5)/scale - 0.5`.
 fn upsample_from_parent(parent: &[u8], target_cx: u32, target_cy: u32, target_cz: u32, shift: u8) -> Vec<u8> {
     debug_assert_eq!(parent.len(), CHUNK_VOXELS);
     debug_assert!((1..=6).contains(&shift));
     let mask = (1u32 << shift) - 1;
-    let region = (64usize) >> shift; // sub-region size in parent-voxel units per axis
-    let scale = 1usize << shift; // replication factor per axis
+    let region = (64usize) >> shift;
+    let scale = 1usize << shift;
     let ox = ((target_cx & mask) as usize) * region;
     let oy = ((target_cy & mask) as usize) * region;
     let oz = ((target_cz & mask) as usize) * region;
+
+    // Per-axis precompute: for each of 64 target positions, derive
+    // (p0, p1, wf) where p0/p1 are the bracketing parent indices
+    // (clamped to [0, 63]) and `wf ∈ [0, 256)` is the Q0.8 weight on
+    // p1. wf is forced to 0 when pos lands outside [0, 63] so the
+    // sample collapses to the clamped boundary instead of leaking
+    // weight from a phantom neighbor.
+    fn axis(o: usize, scale: usize) -> [(u8, u8, i32); 64] {
+        let mut out = [(0u8, 0u8, 0i32); 64];
+        for t in 0..64usize {
+            // pos_q = (o + (t + 0.5)/scale - 0.5) * 256
+            //       = o*256 + ((2t+1) * 128) / scale - 128
+            let pos_q = (o as i32) * 256 + (((2 * t + 1) as i32) * 128) / (scale as i32) - 128;
+            let p0_raw = pos_q >> 8;
+            let p0 = p0_raw.clamp(0, 63);
+            let p1 = (p0 + 1).min(63);
+            let wf = if pos_q < 0 || p0_raw >= 63 { 0 } else { pos_q - (p0 << 8) };
+            out[t] = (p0 as u8, p1 as u8, wf);
+        }
+        out
+    }
+
+    let ax = axis(ox, scale);
+    let ay = axis(oy, scale);
+    let az = axis(oz, scale);
+
     let mut out = vec![0u8; CHUNK_VOXELS];
     for tz in 0..64usize {
-        let pz = oz + (tz / scale);
+        let (z0, z1, wfz) = (az[tz].0 as usize, az[tz].1 as usize, az[tz].2);
+        let wcz = 256 - wfz;
         for ty in 0..64usize {
-            let py = oy + (ty / scale);
-            let p_row = pz * 64 * 64 + py * 64 + ox;
+            let (y0, y1, wfy) = (ay[ty].0 as usize, ay[ty].1 as usize, ay[ty].2);
+            let wcy = 256 - wfy;
+            let r00 = z0 * 64 * 64 + y0 * 64;
+            let r01 = z0 * 64 * 64 + y1 * 64;
+            let r10 = z1 * 64 * 64 + y0 * 64;
+            let r11 = z1 * 64 * 64 + y1 * 64;
             let t_row = tz * 64 * 64 + ty * 64;
-            for k in 0..region {
-                let v = parent[p_row + k];
-                let base = t_row + k * scale;
-                for s in 0..scale {
-                    out[base + s] = v;
-                }
+            for tx in 0..64usize {
+                let (x0, x1, wfx) = (ax[tx].0 as usize, ax[tx].1 as usize, ax[tx].2);
+                let wcx = 256 - wfx;
+
+                let v000 = parent[r00 + x0] as i32;
+                let v001 = parent[r00 + x1] as i32;
+                let v010 = parent[r01 + x0] as i32;
+                let v011 = parent[r01 + x1] as i32;
+                let v100 = parent[r10 + x0] as i32;
+                let v101 = parent[r10 + x1] as i32;
+                let v110 = parent[r11 + x0] as i32;
+                let v111 = parent[r11 + x1] as i32;
+
+                let v00 = (v000 * wcx + v001 * wfx) >> 8;
+                let v01 = (v010 * wcx + v011 * wfx) >> 8;
+                let v10 = (v100 * wcx + v101 * wfx) >> 8;
+                let v11 = (v110 * wcx + v111 * wfx) >> 8;
+                let v0 = (v00 * wcy + v01 * wfy) >> 8;
+                let v1 = (v10 * wcy + v11 * wfy) >> 8;
+                let v = (v0 * wcz + v1 * wfz) >> 8;
+                out[t_row + tx] = v as u8;
             }
         }
     }
