@@ -198,6 +198,13 @@ impl OverlayPaintVolume {
 }
 
 impl PaintVolume for OverlayPaintVolume {
+    /// Render the overlay by reusing the inner volume's `paint` fast path:
+    /// paint the inner into a scratch `Image` (which holds the raw label u8
+    /// in `Color32::from_gray(v)`), then walk pixels once and blend the
+    /// colored result into `buffer`. This avoids the per-pixel
+    /// `VoxelVolume::get` lookup that the previous implementation did and
+    /// lets cache-backed overlays share the chunk-aware paint loop in
+    /// `UnifiedVolume::paint`.
     fn paint(
         &self,
         xyz: [i32; 3],
@@ -211,30 +218,37 @@ impl PaintVolume for OverlayPaintVolume {
         _config: &DrawingConfig,
         buffer: &mut Image,
     ) {
-        self.inner.reset_for_painting();
+        // Render the inner into a scratch buffer. `from_gray(0)` is the
+        // "no label" sentinel — every coloring mode maps value 0 to `None`,
+        // so any pixel the inner doesn't touch (chunk not resident yet,
+        // out-of-bounds, etc.) safely leaves the main buffer untouched.
+        let mut scratch = Image::new_from_color(width, height, Color32::from_gray(0));
+        // Use a default config so filters/quantization meant for grayscale
+        // CT data don't mangle discrete label values, and no debug overlay
+        // gets baked into the labels.
+        let inner_config = DrawingConfig::default();
+        self.inner.paint(
+            xyz,
+            u_coord,
+            v_coord,
+            plane_coord,
+            width,
+            height,
+            sfactor,
+            paint_zoom,
+            &inner_config,
+            &mut scratch,
+        );
 
-        let fi32 = sfactor as f64;
-
-        for im_u in 0..width {
-            for im_v in 0..height {
-                let im_rel_u = (im_u as i32 - width as i32 / 2) * paint_zoom as i32;
-                let im_rel_v = (im_v as i32 - height as i32 / 2) * paint_zoom as i32;
-
-                let mut uvw: [f64; 3] = [0.; 3];
-                uvw[u_coord] = (xyz[u_coord] + im_rel_u) as f64 / fi32;
-                uvw[v_coord] = (xyz[v_coord] + im_rel_v) as f64 / fi32;
-                uvw[plane_coord] = (xyz[plane_coord]) as f64 / fi32;
-
-                let [x, y, z] = uvw;
-
-                if x < 0.0 || y < 0.0 || z < 0.0 {
-                    continue;
-                }
-
-                let v = self.inner.get([x, y, z], sfactor as i32);
+        let mode = self.coloring.mode();
+        for im_v in 0..height {
+            let scratch_row = im_v * width;
+            let buffer_row = im_v * buffer.width;
+            for im_u in 0..width {
+                let v = scratch.data[scratch_row + im_u].r();
                 if let Some((color, strength)) = self.coloring.paint(v) {
-                    let pos = im_v * buffer.width + im_u;
-                    buffer.data[pos] = apply_blend(buffer.data[pos], color, strength, self.coloring.mode());
+                    let pos = buffer_row + im_u;
+                    buffer.data[pos] = apply_blend(buffer.data[pos], color, strength, mode);
                 }
             }
         }
