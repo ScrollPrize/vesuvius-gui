@@ -30,6 +30,62 @@ use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext, ZarrArra
 pub(crate) const ZOOM_MIN: f32 = 0.01;
 pub(crate) const ZOOM_MAX: f32 = 8.0;
 
+/// Sealed list of segment-backed surface volumes the segment-mode UI can drive.
+/// We can't simply use `Arc<dyn SegmentTrait>` because the same object also has
+/// to live in the `world: Volume` slot and the `surface_volume: Arc<dyn
+/// SurfaceVolume>` slot — those are sibling trait objects of the same concrete
+/// type, and dyn-to-dyn upcasting isn't available on the workspace MSRV.
+#[derive(Clone)]
+enum SegmentVolume {
+    Obj(Arc<ObjVolume>),
+    TifXyz(Arc<TifXyzVolume>),
+}
+
+impl SegmentVolume {
+    fn width(&self) -> usize {
+        match self {
+            SegmentVolume::Obj(v) => v.width(),
+            SegmentVolume::TifXyz(v) => v.width(),
+        }
+    }
+    fn height(&self) -> usize {
+        match self {
+            SegmentVolume::Obj(v) => v.height(),
+            SegmentVolume::TifXyz(v) => v.height(),
+        }
+    }
+    fn convert_to_volume_coords(&self, coord: [i32; 3]) -> [i32; 3] {
+        match self {
+            SegmentVolume::Obj(v) => v.convert_to_volume_coords(coord),
+            SegmentVolume::TifXyz(v) => v.convert_to_volume_coords(coord),
+        }
+    }
+    fn as_volume(&self) -> Volume {
+        match self {
+            SegmentVolume::Obj(v) => Volume::from_ref(v.clone()),
+            SegmentVolume::TifXyz(v) => Volume::from_ref(v.clone()),
+        }
+    }
+    fn as_surface(&self) -> Arc<dyn SurfaceVolume> {
+        match self {
+            SegmentVolume::Obj(v) => v.clone(),
+            SegmentVolume::TifXyz(v) => v.clone(),
+        }
+    }
+    fn with_base(
+        &self,
+        base: Volume,
+        width: usize,
+        height: usize,
+        transform: &Option<AffineTransform>,
+    ) -> SegmentVolume {
+        match self {
+            SegmentVolume::Obj(v) => SegmentVolume::Obj(Arc::new(v.with_base(base, width, height, transform))),
+            SegmentVolume::TifXyz(v) => SegmentVolume::TifXyz(Arc::new(v.with_base(base, width, height, transform))),
+        }
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct SegmentMode {
@@ -47,7 +103,7 @@ pub struct SegmentMode {
     #[serde(skip)]
     surface_volume: Arc<dyn SurfaceVolume>,
     #[serde(skip)]
-    obj_volume: Option<Arc<ObjVolume>>,
+    segment_volume: Option<SegmentVolume>,
     #[serde(skip)]
     uv_pane: VolumePane,
     #[serde(skip)]
@@ -78,7 +134,7 @@ impl Default for SegmentMode {
             ranges: [0..=1000, 0..=1000, -40..=40],
             world: EmptyVolume {}.into_volume(),
             surface_volume: Arc::new(EmptyVolume {}),
-            obj_volume: None,
+            segment_volume: None,
             uv_pane: VolumePane::new(PaneType::UV, true),
             convert_to_world_coords: Box::new(|x| x),
             segment_id: None,
@@ -106,6 +162,7 @@ pub struct ObjFileConfig {
 pub struct VesuviusConfig {
     pub data_dir: Option<String>,
     pub obj_file: Option<ObjFileConfig>,
+    pub tifxyz_dir: Option<(String, Option<AffineTransform>)>,
     pub overlay_dir: Option<String>,
     pub overlay_coloring: Option<OverlayColoring>,
     pub volume: Option<NewVolumeReference>,
@@ -359,6 +416,12 @@ impl TemplateApp {
             app.setup_segment(&obj_file, width, height, transform.as_ref(), None, projection, None);
         }
 
+        if let Some((tifxyz_dir, transform)) = config.tifxyz_dir {
+            // width/height ignored for tifxyz — grid dims come from the TIFFs. Projection
+            // is .obj-specific and doesn't apply.
+            app.setup_segment(&tifxyz_dir, 0, 0, transform.as_ref(), None, ProjectionKind::None, None);
+        }
+
         if let Some(coloring) = config.overlay_coloring {
             app.overlay_coloring = coloring;
         }
@@ -417,7 +480,67 @@ impl TemplateApp {
         projection: ProjectionKind,
         atlas_metadata: Option<(String, String)>,
     ) {
-        if segment_file.ends_with(".ppm") {
+        if std::path::Path::new(segment_file).is_dir()
+            && std::path::Path::new(segment_file).join("meta.json").is_file()
+        {
+            // tifxyz segmentation directory
+            let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
+            let base = self.world.clone();
+            let base = if let (Some(overlay), true) = (self.overlay.as_ref(), self.show_overlay) {
+                OverlayVolume::new(base, overlay.clone(), self.overlay_coloring).into_volume()
+            } else {
+                base
+            };
+            let transform_owned = transform.cloned();
+            let is_reload = segment.filename == segment_file;
+
+            let seg_vol = match (is_reload, segment.segment_volume.as_ref()) {
+                (true, Some(SegmentVolume::TifXyz(prev))) => {
+                    log::info!("TifXyzVolume::with_base reusing parsed grid for {}", segment_file);
+                    SegmentVolume::TifXyz(Arc::new(prev.with_base(
+                        base,
+                        prev.width(),
+                        prev.height(),
+                        &transform_owned,
+                    )))
+                }
+                _ => {
+                    let vol = TifXyzVolume::load_from_directory(segment_file, base, &transform_owned)
+                        .unwrap_or_else(|e| panic!("Failed to load tifxyz from {}: {:#}", segment_file, e));
+                    SegmentVolume::TifXyz(Arc::new(vol))
+                }
+            };
+
+            let width = seg_vol.width() as i32;
+            let height = seg_vol.height() as i32;
+
+            if !is_reload {
+                segment.coord = [width / 2, height / 2, 0];
+                segment.filename = segment_file.to_string();
+                segment.info = segment_file.to_string();
+            }
+            segment.width = width as usize;
+            segment.height = height as usize;
+            segment.ranges = [0..=width, 0..=height, -40..=40];
+            segment.world = seg_vol.as_volume();
+            segment.surface_volume = seg_vol.as_surface();
+            let seg_for_convert = seg_vol.clone();
+            segment.convert_to_world_coords = Box::new(move |coords| seg_for_convert.convert_to_volume_coords(coords));
+            segment.segment_volume = Some(seg_vol);
+            segment.last_transform = transform_owned.clone();
+
+            if let Some((sample_id, segment_id)) = atlas_metadata {
+                segment.sample_id = Some(sample_id);
+                segment.segment_id = Some(segment_id);
+            } else {
+                segment.sample_id = None;
+                segment.segment_id = None;
+                segment.current_base_volume_id = None;
+                segment.available_volumes.clear();
+            }
+
+            self.segment_mode = Some(segment);
+        } else if segment_file.ends_with(".ppm") {
             let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
             let old = self.world.clone();
             let base = old;
@@ -438,7 +561,7 @@ impl TemplateApp {
             segment.ranges = [0..=width, 0..=height, -40..=40];
             segment.world = Volume::from_ref(ppm.clone());
             //segment.surface_volume = ppm;
-            segment.obj_volume = None;
+            segment.segment_volume = None;
             segment.convert_to_world_coords = Box::new(move |coord| ppm2.convert_to_world_coords(coord));
 
             if let Some((sample_id, segment_id)) = atlas_metadata {
@@ -480,25 +603,27 @@ impl TemplateApp {
             let scaled_width = (width as f64 * scale) as usize;
             let scaled_height = (height as f64 * scale) as usize;
 
-            let obj_volume = match (is_reload, projection, segment.obj_volume.as_ref()) {
-                (true, ProjectionKind::None, Some(prev)) => {
+            let seg_vol = match (is_reload, projection, segment.segment_volume.as_ref()) {
+                (true, ProjectionKind::None, Some(SegmentVolume::Obj(prev))) => {
                     log::info!("ObjVolume::with_base reusing parsed mesh for {}", segment_file);
-                    prev.with_base(base, scaled_width, scaled_height, &transform_owned)
+                    SegmentVolume::Obj(Arc::new(prev.with_base(
+                        base,
+                        scaled_width,
+                        scaled_height,
+                        &transform_owned,
+                    )))
                 }
-                _ => ObjVolume::load_from_obj(
+                _ => SegmentVolume::Obj(Arc::new(ObjVolume::load_from_obj(
                     segment_file,
                     base,
                     scaled_width,
                     scaled_height,
                     &transform_owned,
                     projection,
-                ),
+                ))),
             };
-            let width = obj_volume.width() as i32;
-            let height = obj_volume.height() as i32;
-
-            let volume = Arc::new(obj_volume);
-            let obj2 = volume.clone();
+            let width = seg_vol.width() as i32;
+            let height = seg_vol.height() as i32;
 
             if is_reload {
                 segment.coord = [
@@ -516,10 +641,11 @@ impl TemplateApp {
             segment.width = width as usize;
             segment.height = height as usize;
             segment.ranges = [0..=width, 0..=height, -40..=40];
-            segment.world = Volume::from_ref(volume.clone());
-            segment.surface_volume = volume.clone();
-            segment.obj_volume = Some(volume);
-            segment.convert_to_world_coords = Box::new(move |coords| obj2.convert_to_volume_coords(coords));
+            segment.world = seg_vol.as_volume();
+            segment.surface_volume = seg_vol.as_surface();
+            let seg_for_convert = seg_vol.clone();
+            segment.convert_to_world_coords = Box::new(move |coords| seg_for_convert.convert_to_volume_coords(coords));
+            segment.segment_volume = Some(seg_vol);
             segment.last_transform = transform_owned.clone();
 
             if let Some((sample_id, segment_id)) = atlas_metadata {
@@ -551,7 +677,7 @@ impl TemplateApp {
         let Some(mut segment) = self.segment_mode.take() else {
             return;
         };
-        let Some(prev) = segment.obj_volume.as_ref() else {
+        let Some(prev) = segment.segment_volume.as_ref() else {
             self.segment_mode = Some(segment);
             return;
         };
@@ -565,13 +691,12 @@ impl TemplateApp {
             base
         };
 
-        let obj_volume = prev.with_base(base, segment.width, segment.height, &segment.last_transform);
-        let volume = Arc::new(obj_volume);
-        let obj2 = volume.clone();
-        segment.world = Volume::from_ref(volume.clone());
-        segment.surface_volume = volume.clone();
-        segment.obj_volume = Some(volume);
-        segment.convert_to_world_coords = Box::new(move |coords| obj2.convert_to_volume_coords(coords));
+        let seg_vol = prev.with_base(base, segment.width, segment.height, &segment.last_transform);
+        segment.world = seg_vol.as_volume();
+        segment.surface_volume = seg_vol.as_surface();
+        let seg_for_convert = seg_vol.clone();
+        segment.convert_to_world_coords = Box::new(move |coords| seg_for_convert.convert_to_volume_coords(coords));
+        segment.segment_volume = Some(seg_vol);
         self.segment_mode = Some(segment);
     }
 

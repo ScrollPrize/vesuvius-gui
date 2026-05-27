@@ -19,8 +19,12 @@ pub struct Args {
     data_directory: Option<String>,
 
     /// Browse segment from obj file. You need to also provide --width and --height. Provide the --volume if the segment does not target Scroll 1a / 20230205180739
-    #[clap(long)]
+    #[clap(long, conflicts_with = "tifxyz")]
     obj: Option<String>,
+
+    /// Browse segment from a vc3d tifxyz directory (containing meta.json + x/y/z.tif). Grid dimensions are read from the TIFFs, so --width/--height are not required.
+    #[clap(long, conflicts_with = "obj")]
+    tifxyz: Option<String>,
 
     /// Width of the segment file when browsing obj files
     #[clap(long)]
@@ -106,17 +110,17 @@ impl TryFrom<Args> for VesuviusConfig {
         } else {
             None
         };
-        let obj_file = if let Some(obj_file) = args.obj {
-            let transform = if let Some(transform) = args.transform {
-                let mut t = AffineTransform::from_json_array_or_path(&transform).map_err(|e| e.to_string())?;
-                if args.invert_transform {
-                    t = t.invert().map_err(|e| e.to_string())?;
-                }
-                Some(t)
-            } else {
-                None
-            };
+        let transform_opt = if let Some(transform) = args.transform.as_ref() {
+            let mut t = AffineTransform::from_json_array_or_path(transform).map_err(|e| e.to_string())?;
+            if args.invert_transform {
+                t = t.invert().map_err(|e| e.to_string())?;
+            }
+            Some(t)
+        } else {
+            None
+        };
 
+        let obj_file = if let Some(obj_file) = args.obj {
             let projection = if args.ortho_xz {
                 ProjectionKind::OrthographicXZ
             } else {
@@ -128,7 +132,7 @@ impl TryFrom<Args> for VesuviusConfig {
                     obj_file,
                     width,
                     height,
-                    transform,
+                    transform: transform_opt.clone(),
                     projection,
                 })
             } else {
@@ -138,9 +142,12 @@ impl TryFrom<Args> for VesuviusConfig {
             None
         };
 
+        let tifxyz_dir = args.tifxyz.map(|dir| (dir, transform_opt));
+
         Ok(VesuviusConfig {
             data_dir: args.data_directory,
             obj_file,
+            tifxyz_dir,
             overlay_dir: args.overlay,
             overlay_coloring: args.overlay_coloring,
             volume,

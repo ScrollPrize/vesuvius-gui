@@ -1,0 +1,728 @@
+//! vc3d tifxyz segmentation volume — alternative to `ObjVolume` for surfaces
+//! distributed as a directory of `meta.json` + `x.tif` + `y.tif` + `z.tif` (the
+//! same on-disk format volume-cartographer's `QuadSurface` reads/writes).
+//!
+//! Because tifxyz already is a regular UV→XYZ grid we never need triangle
+//! rasterization: painting is a direct bilinear lookup per output pixel. The
+//! grid implicitly triangulates as (r,c)-(r,c+1)-(r+1,c) + (r,c+1)-(r+1,c+1)-(r+1,c)
+//! if a real `paint_plane_intersection` ever needs to be implemented.
+
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::{bail, Context, Result};
+use libm::modf;
+use serde::Deserialize;
+use tiff::decoder::{Decoder, DecodingResult};
+
+use super::composition::{
+    AlphaCompositionState, AlphaHeightMapCompositionState, Compositor, MaxCompositionState, NoCompositionState,
+};
+use super::{
+    AffineTransform, CompositingMode, DrawingConfig, Image, PaintVolume, SurfaceVolume, Volume, VolumeCons,
+    VoxelPaintVolume, VoxelVolume,
+};
+
+// ---------- on-disk metadata ----------
+
+#[derive(Deserialize)]
+struct TifXyzMeta {
+    uuid: String,
+    #[serde(rename = "type")]
+    seg_type: String,
+    format: String,
+    scale: [f64; 2],
+    #[serde(default)]
+    bbox: Option<[[f64; 3]; 2]>,
+}
+
+// ---------- data ----------
+
+/// Parsed tifxyz directory, independent of base volume and affine transform.
+/// Shared via `Arc` so `with_base()` doesn't re-decode TIFFs.
+pub struct TifXyzBase {
+    pub rows: usize,
+    pub cols: usize,
+    pub uuid: String,
+    pub scale: [f64; 2],
+    pub bbox: Option<[[f64; 3]; 2]>,
+    /// `rows * cols`; sentinel `[-1, -1, -1]` for invalid cells.
+    pub pre_xyz: Vec<[f32; 3]>,
+    /// `rows * cols`; central-difference normal. Zero where any neighbor is
+    /// invalid or where the cell is on the grid border.
+    pub pre_normals: Vec<[f32; 3]>,
+    pub valid: Vec<bool>,
+}
+
+/// Per-transform projection of `TifXyzBase`. Holds the post-affine xyz/normals
+/// so the inner paint loop can skip the matrix multiply per pixel.
+pub struct TifXyzData {
+    base: Arc<TifXyzBase>,
+    xyz: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    applied_transform: Option<AffineTransform>,
+}
+
+#[derive(Clone)]
+pub struct TifXyzVolume {
+    volume: Volume,
+    data: Arc<TifXyzData>,
+    tex_width: usize,
+    tex_height: usize,
+}
+
+// ---------- loading ----------
+
+fn decode_float32_tif(path: &Path) -> Result<(usize, usize, Vec<f32>)> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut decoder = Decoder::new(BufReader::new(file)).with_context(|| format!("tiff header for {}", path.display()))?;
+    let (w, h) = decoder.dimensions().with_context(|| format!("tiff dims for {}", path.display()))?;
+    let img = decoder
+        .read_image()
+        .with_context(|| format!("tiff read for {}", path.display()))?;
+    let data = match img {
+        DecodingResult::F32(v) => v,
+        DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::U8(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DecodingResult::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+        other => bail!("unsupported tiff pixel type for {}: {}", path.display(), tiff_kind(&other)),
+    };
+    if data.len() != (w as usize) * (h as usize) {
+        bail!(
+            "{}: expected {}x{} = {} samples, got {}",
+            path.display(),
+            w,
+            h,
+            (w as usize) * (h as usize),
+            data.len()
+        );
+    }
+    Ok((w as usize, h as usize, data))
+}
+
+fn tiff_kind(d: &DecodingResult) -> &'static str {
+    match d {
+        DecodingResult::U8(_) => "u8",
+        DecodingResult::U16(_) => "u16",
+        DecodingResult::U32(_) => "u32",
+        DecodingResult::U64(_) => "u64",
+        DecodingResult::I8(_) => "i8",
+        DecodingResult::I16(_) => "i16",
+        DecodingResult::I32(_) => "i32",
+        DecodingResult::I64(_) => "i64",
+        DecodingResult::F16(_) => "f16",
+        DecodingResult::F32(_) => "f32",
+        DecodingResult::F64(_) => "f64",
+    }
+}
+
+fn transforms_equal(a: &Option<AffineTransform>, b: &Option<AffineTransform>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.matrix == y.matrix,
+        _ => false,
+    }
+}
+
+impl TifXyzBase {
+    pub fn load(dir: &Path) -> Result<Arc<Self>> {
+        let t = Instant::now();
+
+        // meta.json
+        let meta_path: PathBuf = dir.join("meta.json");
+        let meta_raw = std::fs::read_to_string(&meta_path)
+            .with_context(|| format!("reading {}", meta_path.display()))?;
+        let meta: TifXyzMeta = serde_json::from_str(&meta_raw)
+            .with_context(|| format!("parsing {}", meta_path.display()))?;
+        if meta.format != "tifxyz" {
+            bail!(
+                "{}: expected format=\"tifxyz\", got {:?}",
+                meta_path.display(),
+                meta.format
+            );
+        }
+        if meta.seg_type != "seg" {
+            log::warn!("{}: unexpected type {:?} (expected \"seg\")", meta_path.display(), meta.seg_type);
+        }
+
+        // x/y/z tifs
+        let (xw, xh, xs) = decode_float32_tif(&dir.join("x.tif"))?;
+        let (yw, yh, ys) = decode_float32_tif(&dir.join("y.tif"))?;
+        let (zw, zh, zs) = decode_float32_tif(&dir.join("z.tif"))?;
+        if (xw, xh) != (yw, yh) || (xw, xh) != (zw, zh) {
+            bail!(
+                "x/y/z.tif dimension mismatch in {}: x={}x{} y={}x{} z={}x{}",
+                dir.display(),
+                xw,
+                xh,
+                yw,
+                yh,
+                zw,
+                zh
+            );
+        }
+        let cols = xw;
+        let rows = xh;
+        let n = rows * cols;
+
+        // assemble xyz + validity (z <= 0 marks invalid, sentinel cleared to (-1,-1,-1))
+        let mut pre_xyz = vec![[-1.0f32; 3]; n];
+        let mut valid = vec![false; n];
+        for i in 0..n {
+            let z = zs[i];
+            if z > 0.0 && z.is_finite() && xs[i].is_finite() && ys[i].is_finite() {
+                pre_xyz[i] = [xs[i], ys[i], z];
+                valid[i] = true;
+            }
+        }
+
+        // central-difference normals; zero on border or where any neighbor is invalid
+        let mut pre_normals = vec![[0.0f32; 3]; n];
+        if rows >= 3 && cols >= 3 {
+            for r in 1..rows - 1 {
+                for c in 1..cols - 1 {
+                    let i = r * cols + c;
+                    let il = i - 1;
+                    let ir = i + 1;
+                    let iu = i - cols;
+                    let id = i + cols;
+                    if !(valid[i] && valid[il] && valid[ir] && valid[iu] && valid[id]) {
+                        continue;
+                    }
+                    let du = sub3(pre_xyz[ir], pre_xyz[il]);
+                    let dv = sub3(pre_xyz[id], pre_xyz[iu]);
+                    let n = cross3(du, dv);
+                    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    if len > 1e-6 {
+                        pre_normals[i] = [n[0] / len, n[1] / len, n[2] / len];
+                    }
+                }
+            }
+        }
+
+        let valid_count: usize = valid.iter().filter(|&&b| b).count();
+        log::info!(
+            "TifXyzBase::load {}x{} ({} valid / {} total) in {:?}",
+            cols,
+            rows,
+            valid_count,
+            n,
+            t.elapsed()
+        );
+
+        Ok(Arc::new(Self {
+            rows,
+            cols,
+            uuid: meta.uuid,
+            scale: meta.scale,
+            bbox: meta.bbox,
+            pre_xyz,
+            pre_normals,
+            valid,
+        }))
+    }
+}
+
+#[inline]
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline]
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+impl TifXyzData {
+    fn build(base: Arc<TifXyzBase>, transform: &Option<AffineTransform>) -> Arc<Self> {
+        let t = Instant::now();
+        let n = base.pre_xyz.len();
+
+        let (xyz, normals) = if let Some(tf) = transform {
+            let m = &tf.matrix;
+            let mut xyz = vec![[-1.0f32; 3]; n];
+            let mut normals = vec![[0.0f32; 3]; n];
+            for i in 0..n {
+                if !base.valid[i] {
+                    continue;
+                }
+                let p = base.pre_xyz[i];
+                xyz[i] = [
+                    (m[0][0] * p[0] as f64 + m[0][1] * p[1] as f64 + m[0][2] * p[2] as f64 + m[0][3]) as f32,
+                    (m[1][0] * p[0] as f64 + m[1][1] * p[1] as f64 + m[1][2] * p[2] as f64 + m[1][3]) as f32,
+                    (m[2][0] * p[0] as f64 + m[2][1] * p[1] as f64 + m[2][2] * p[2] as f64 + m[2][3]) as f32,
+                ];
+
+                let pn = base.pre_normals[i];
+                let nx = m[0][0] * pn[0] as f64 + m[0][1] * pn[1] as f64 + m[0][2] * pn[2] as f64;
+                let ny = m[1][0] * pn[0] as f64 + m[1][1] * pn[1] as f64 + m[1][2] * pn[2] as f64;
+                let nz = m[2][0] * pn[0] as f64 + m[2][1] * pn[1] as f64 + m[2][2] * pn[2] as f64;
+                let len = (nx * nx + ny * ny + nz * nz).sqrt();
+                if len > 1e-6 {
+                    normals[i] = [(nx / len) as f32, (ny / len) as f32, (nz / len) as f32];
+                }
+            }
+            (xyz, normals)
+        } else {
+            (base.pre_xyz.clone(), base.pre_normals.clone())
+        };
+
+        log::info!(
+            "TifXyzData::build (transform={}) in {:?}",
+            transform.is_some(),
+            t.elapsed()
+        );
+
+        Arc::new(Self {
+            base,
+            xyz,
+            normals,
+            applied_transform: transform.clone(),
+        })
+    }
+
+    #[inline]
+    fn idx(&self, r: usize, c: usize) -> usize {
+        r * self.base.cols + c
+    }
+}
+
+// ---------- TifXyzVolume ----------
+
+impl TifXyzVolume {
+    pub fn load_from_directory(
+        dir: impl AsRef<Path>,
+        base_volume: Volume,
+        transform: &Option<AffineTransform>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        if !dir.is_dir() {
+            bail!("tifxyz path is not a directory: {}", dir.display());
+        }
+        let base = TifXyzBase::load(dir)?;
+        let cols = base.cols;
+        let rows = base.rows;
+        let data = TifXyzData::build(base, transform);
+        Ok(Self {
+            volume: base_volume,
+            data,
+            tex_width: cols,
+            tex_height: rows,
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.tex_width
+    }
+    pub fn height(&self) -> usize {
+        self.tex_height
+    }
+    pub fn uuid(&self) -> &str {
+        &self.data.base.uuid
+    }
+
+    /// Reuse the parsed grid; only re-apply the affine if it changed.
+    pub fn with_base(
+        &self,
+        base_volume: Volume,
+        width: usize,
+        height: usize,
+        transform: &Option<AffineTransform>,
+    ) -> Self {
+        let data = if transforms_equal(&self.data.applied_transform, transform) {
+            self.data.clone()
+        } else {
+            TifXyzData::build(self.data.base.clone(), transform)
+        };
+        Self {
+            volume: base_volume,
+            data,
+            tex_width: width,
+            tex_height: height,
+        }
+    }
+
+    /// UV-pane segment-coord → world voxel coord lookup.
+    pub fn convert_to_volume_coords(&self, coord: [i32; 3]) -> [i32; 3] {
+        let u = coord[0];
+        let v = coord[1];
+        let w = coord[2] as f64;
+
+        let cols = self.data.base.cols;
+        let rows = self.data.base.rows;
+        if u < 0 || v < 0 || u as usize >= self.tex_width || v as usize >= self.tex_height {
+            return [-1, -1, -1];
+        }
+        let gc = u as f64 * (cols.saturating_sub(1)) as f64 / (self.tex_width.saturating_sub(1).max(1)) as f64;
+        let gr = v as f64 * (rows.saturating_sub(1)) as f64 / (self.tex_height.saturating_sub(1).max(1)) as f64;
+        let Some(s) = self.sample_grid(gc, gr) else {
+            return [-1, -1, -1];
+        };
+        [
+            (s.xyz[0] as f64 + w * s.n[0] as f64) as i32,
+            (s.xyz[1] as f64 + w * s.n[1] as f64) as i32,
+            (s.xyz[2] as f64 + w * s.n[2] as f64) as i32,
+        ]
+    }
+
+    /// Bilinear sample of xyz + normal at fractional grid coords. Returns None
+    /// when any of the four corners is invalid (mirrors ObjVolume's "no
+    /// triangle covers this pixel" behavior).
+    fn sample_grid(&self, gc: f64, gr: f64) -> Option<Sample> {
+        let cols = self.data.base.cols;
+        let rows = self.data.base.rows;
+        if !(gc >= 0.0 && gr >= 0.0) {
+            return None;
+        }
+        let (dc, c0_f) = modf(gc);
+        let (dr, r0_f) = modf(gr);
+        let c0 = c0_f as usize;
+        let r0 = r0_f as usize;
+        if c0 + 1 >= cols || r0 + 1 >= rows {
+            return None;
+        }
+        let i00 = self.data.idx(r0, c0);
+        let i10 = i00 + 1;
+        let i01 = i00 + cols;
+        let i11 = i01 + 1;
+        let valid = &self.data.base.valid;
+        if !(valid[i00] && valid[i10] && valid[i01] && valid[i11]) {
+            return None;
+        }
+        let xyz = bilerp4(&self.data.xyz, [i00, i10, i01, i11], dc, dr);
+        let n = bilerp4(&self.data.normals, [i00, i10, i01, i11], dc, dr);
+        Some(Sample { xyz, n })
+    }
+}
+
+struct Sample {
+    xyz: [f32; 3],
+    n: [f32; 3],
+}
+
+#[inline]
+fn bilerp4(buf: &[[f32; 3]], idx: [usize; 4], dx: f64, dy: f64) -> [f32; 3] {
+    let a = buf[idx[0]];
+    let b = buf[idx[1]];
+    let c = buf[idx[2]];
+    let d = buf[idx[3]];
+    let w00 = ((1.0 - dx) * (1.0 - dy)) as f32;
+    let w10 = (dx * (1.0 - dy)) as f32;
+    let w01 = ((1.0 - dx) * dy) as f32;
+    let w11 = (dx * dy) as f32;
+    [
+        a[0] * w00 + b[0] * w10 + c[0] * w01 + d[0] * w11,
+        a[1] * w00 + b[1] * w10 + c[1] * w01 + d[1] * w11,
+        a[2] * w00 + b[2] * w10 + c[2] * w01 + d[2] * w11,
+    ]
+}
+
+// ---------- trait impls ----------
+
+impl PaintVolume for TifXyzVolume {
+    fn paint(
+        &self,
+        xyz: [i32; 3],
+        u_coord: usize,
+        v_coord: usize,
+        plane_coord: usize,
+        width: usize,
+        height: usize,
+        sfactor: u8,
+        paint_zoom: u8,
+        config: &DrawingConfig,
+        buffer: &mut Image,
+    ) {
+        assert!(u_coord == 0);
+        assert!(v_coord == 1);
+        assert!(plane_coord == 2);
+
+        let draw_outlines = config.draw_xyz_outlines;
+        let composite = config.compositing.mode != CompositingMode::None;
+        let composite_layers_in_front = config.compositing.layers_in_front as i32;
+        let composite_layers_behind = config.compositing.layers_behind as i32;
+        let composite_total_layers = composite_layers_in_front + composite_layers_behind + 1;
+        let mut composition: Compositor = match config.compositing.mode {
+            CompositingMode::Max => Compositor::Max(MaxCompositionState::new()),
+            CompositingMode::Alpha => Compositor::Alpha(AlphaCompositionState::new(
+                config.compositing.alpha_min as f32 / 255.0,
+                config.compositing.alpha_max as f32 / 255.0,
+                config.compositing.alpha_threshold as f32 / 10000.0,
+                config.compositing.opacity as f32 / 100.0,
+            )),
+            CompositingMode::AlphaHeightMap => Compositor::HeightMap(AlphaHeightMapCompositionState::new(
+                config.compositing.alpha_min as f32 / 255.0,
+                config.compositing.alpha_max as f32 / 255.0,
+                config.compositing.alpha_threshold as f32 / 10000.0,
+                config.compositing.opacity as f32 / 100.0,
+            )),
+            CompositingMode::None => Compositor::None(NoCompositionState),
+        };
+        let composite_direction: i32 = if config.compositing.reverse_direction { -1 } else { 1 };
+
+        let real_xyz = if draw_outlines {
+            self.convert_to_volume_coords(xyz)
+        } else {
+            [0, 0, 0]
+        };
+
+        let volume = self.volume.clone();
+        let ffactor = sfactor as f64;
+        let w_factor = xyz[2] as f64;
+
+        let cols = self.data.base.cols;
+        let rows = self.data.base.rows;
+        // segment-space (u, v) → grid-cell (gc, gr) — identity when tex dims match grid dims
+        let col_scale = if self.tex_width > 1 {
+            (cols.saturating_sub(1)) as f64 / (self.tex_width - 1) as f64
+        } else {
+            0.0
+        };
+        let row_scale = if self.tex_height > 1 {
+            (rows.saturating_sub(1)) as f64 / (self.tex_height - 1) as f64
+        } else {
+            0.0
+        };
+
+        let origin_u = xyz[0] - width as i32 / 2 * paint_zoom as i32;
+        let origin_v = xyz[1] - height as i32 / 2 * paint_zoom as i32;
+
+        for by in 0..height {
+            for bx in 0..width {
+                let seg_u = origin_u + (bx as i32) * paint_zoom as i32;
+                let seg_v = origin_v + (by as i32) * paint_zoom as i32;
+                let gc = seg_u as f64 * col_scale;
+                let gr = seg_v as f64 * row_scale;
+                let Some(sample) = self.sample_grid(gc, gr) else {
+                    continue;
+                };
+                let (x, y, z) = (sample.xyz[0] as f64, sample.xyz[1] as f64, sample.xyz[2] as f64);
+                let (nx, ny, nz) = if xyz[2] == 0 && !composite {
+                    (0.0, 0.0, 0.0)
+                } else {
+                    (sample.n[0] as f64, sample.n[1] as f64, sample.n[2] as f64)
+                };
+
+                if !composite {
+                    let px = x + w_factor * nx;
+                    let py = y + w_factor * ny;
+                    let pz = z + w_factor * nz;
+
+                    let raw = if config.trilinear_interpolation {
+                        volume.get_interpolated([px / ffactor, py / ffactor, pz / ffactor], sfactor as i32)
+                    } else {
+                        volume.get([px / ffactor, py / ffactor, pz / ffactor], sfactor as i32)
+                    };
+                    let value = config.filter(raw);
+                    buffer.set_gray(bx, by, value);
+
+                    if draw_outlines {
+                        if (px - real_xyz[0] as f64).abs() < 2.0 {
+                            buffer.set_rgb(bx, by, 0, 0, 255);
+                        } else if (py - real_xyz[1] as f64).abs() < 2.0 {
+                            buffer.set_rgb(bx, by, 255, 0, 0);
+                        } else if (pz - real_xyz[2] as f64).abs() < 2.0 {
+                            buffer.set_rgb(bx, by, 0, 255, 0);
+                        }
+                    }
+                } else {
+                    let start = xyz[2] + composite_direction * composite_layers_in_front;
+                    let end = xyz[2] - composite_direction * (composite_layers_behind + 1);
+                    let step = if start < end { 1 } else { -1 };
+                    let n_samples = (end - start) / step;
+
+                    if config.trilinear_interpolation {
+                        let inv_f = 1.0 / ffactor;
+                        let base = [
+                            (x + start as f64 * nx) * inv_f,
+                            (y + start as f64 * ny) * inv_f,
+                            (z + start as f64 * nz) * inv_f,
+                        ];
+                        let dir = [step as f64 * nx * inv_f, step as f64 * ny * inv_f, step as f64 * nz * inv_f];
+                        let color = volume.composite_color_along_normal(
+                            base,
+                            dir,
+                            0.0,
+                            n_samples as f64,
+                            sfactor as i32,
+                            &mut composition,
+                            composite_total_layers as u32,
+                        );
+                        buffer.set(bx, by, color);
+                    } else {
+                        composition.reset();
+                        let mut compositor = composition.as_ref_mut();
+                        let mut w = start;
+                        while w != end {
+                            let wf = w as f64;
+                            let px = x + wf * nx;
+                            let py = y + wf * ny;
+                            let pz = z + wf * nz;
+                            let v = volume.get([px / ffactor, py / ffactor, pz / ffactor], sfactor as i32);
+                            if !compositor.update(v) {
+                                break;
+                            }
+                            w += step;
+                        }
+                        let value = composition.result(composite_total_layers as u32);
+                        buffer.set_gray(bx, by, config.filter(value));
+                    }
+                }
+            }
+        }
+    }
+
+    fn shared(&self) -> VolumeCons {
+        let data = self.data.clone();
+        let tex_width = self.tex_width;
+        let tex_height = self.tex_height;
+        let volume = self.volume.shared();
+        Box::new(move || {
+            TifXyzVolume {
+                volume: volume(),
+                data,
+                tex_width,
+                tex_height,
+            }
+            .into_volume()
+        })
+    }
+}
+
+impl VoxelVolume for TifXyzVolume {
+    fn get(&self, xyz: [f64; 3], downsampling: i32) -> u8 {
+        // Treat input as (u, v, w) in segment space (this is how PPMVolume and
+        // the UV pane traverse a surface volume).
+        let u = xyz[0];
+        let v = xyz[1];
+        let w = xyz[2];
+
+        if u <= 0.0 || v <= 0.0 || u >= self.tex_width as f64 || v >= self.tex_height as f64 || w.abs() > 45.0 {
+            return 0;
+        }
+        let cols = self.data.base.cols;
+        let rows = self.data.base.rows;
+        let col_scale = if self.tex_width > 1 {
+            (cols.saturating_sub(1)) as f64 / (self.tex_width - 1) as f64
+        } else {
+            0.0
+        };
+        let row_scale = if self.tex_height > 1 {
+            (rows.saturating_sub(1)) as f64 / (self.tex_height - 1) as f64
+        } else {
+            0.0
+        };
+        let Some(s) = self.sample_grid(u * col_scale, v * row_scale) else {
+            return 0;
+        };
+        let px = s.xyz[0] as f64 + w * s.n[0] as f64;
+        let py = s.xyz[1] as f64 + w * s.n[1] as f64;
+        let pz = s.xyz[2] as f64 + w * s.n[2] as f64;
+        self.volume.get(
+            [
+                px / downsampling as f64,
+                py / downsampling as f64,
+                pz / downsampling as f64,
+            ],
+            downsampling,
+        )
+    }
+}
+
+impl SurfaceVolume for TifXyzVolume {
+    // TODO: implement plane-crossing wireframe by walking the implicit grid
+    // triangulation (r,c)-(r,c+1)-(r+1,c) + (r,c+1)-(r+1,c+1)-(r+1,c). Stubbed
+    // for v1 — ObjVolume's implementation is broken on the current branch
+    // anyway, so XYZ panes already render without segment overlays.
+    fn paint_plane_intersection(
+        &self,
+        _xyz: [i32; 3],
+        _u_coord: usize,
+        _v_coord: usize,
+        _plane_coord: usize,
+        _width: usize,
+        _height: usize,
+        _sfactor: u8,
+        _paint_zoom: u8,
+        _highlight_uv_section: Option<[i32; 3]>,
+        _config: &DrawingConfig,
+        _buffer: &mut Image,
+    ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::volume::EmptyVolume;
+
+    const FIXTURE: &str =
+        "/home/johannes/git/scrollprize/villa/volume-cartographer/core/test/data/segments/20241113070770";
+
+    #[test]
+    fn loads_fixture() {
+        let Ok(base) = TifXyzBase::load(Path::new(FIXTURE)) else {
+            eprintln!("skipping: fixture not present at {}", FIXTURE);
+            return;
+        };
+        assert_eq!(base.cols, 129);
+        assert_eq!(base.rows, 129);
+        assert_eq!(base.uuid, "20241113070770");
+
+        let valid_count = base.valid.iter().filter(|&&b| b).count();
+        // C++ reader logs roughly 13902 valid cells; allow a little tolerance for
+        // small format/sentinel-handling differences.
+        assert!(valid_count > 13_000 && valid_count < 14_500, "valid_count={}", valid_count);
+
+        // sentinel propagation
+        for i in 0..base.pre_xyz.len() {
+            if !base.valid[i] {
+                assert_eq!(base.pre_xyz[i], [-1.0, -1.0, -1.0]);
+            }
+        }
+
+        // some interior cell should have a non-zero normal
+        let mid = base.rows / 2;
+        let any_nonzero_normal = (1..base.cols - 1).any(|c| {
+            let n = base.pre_normals[mid * base.cols + c];
+            (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) > 0.5
+        });
+        assert!(any_nonzero_normal, "no non-zero normals in middle row");
+
+        // border normals must be zero
+        for c in 0..base.cols {
+            assert_eq!(base.pre_normals[c], [0.0, 0.0, 0.0]);
+            let i = (base.rows - 1) * base.cols + c;
+            assert_eq!(base.pre_normals[i], [0.0, 0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn voxel_get_returns_zero_outside_grid() {
+        let Ok(base) = TifXyzBase::load(Path::new(FIXTURE)) else {
+            eprintln!("skipping: fixture not present");
+            return;
+        };
+        let data = TifXyzData::build(base.clone(), &None);
+        let vol = TifXyzVolume {
+            volume: EmptyVolume {}.into_volume(),
+            data,
+            tex_width: base.cols,
+            tex_height: base.rows,
+        };
+        assert_eq!(vol.get([-1.0, 5.0, 0.0], 1), 0);
+        assert_eq!(vol.get([5.0, -1.0, 0.0], 1), 0);
+        assert_eq!(vol.get([1000.0, 1000.0, 0.0], 1), 0);
+        // valid coords return 0 too because base is EmptyVolume — just exercise the path.
+        let _ = vol.get([64.0, 64.0, 0.0], 1);
+    }
+}
