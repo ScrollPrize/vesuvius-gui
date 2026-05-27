@@ -670,18 +670,27 @@ impl ChunkCache {
         if cx1 < cx0 || cy1 < cy0 || cz1 < cz0 {
             return;
         }
-        // Pass 1: parent chunks (one LOD coarser, deduped via >>1).
-        // Queued first so they're likely Resident by the time the next
-        // touch_aabb on this region runs dispatch on target chunks and
-        // checks the parent in `try_upscale_from_parent`.
-        if target_lod < max_lod {
-            let parent_lod = target_lod + 1;
-            let px0 = (cx0 as u32) >> 1;
-            let py0 = (cy0 as u32) >> 1;
-            let pz0 = (cz0 as u32) >> 1;
-            let px1 = (cx1 as u32) >> 1;
-            let py1 = (cy1 as u32) >> 1;
-            let pz1 = (cz1 as u32) >> 1;
+        // Pass 1: parent chunks at every coarser LOD up to `max_lod`,
+        // walked coarsest-first. Submitting the coarsest level last
+        // means it lands at the head of the LIFO task queue — those
+        // chunks are small, few, and likely to be persisted from prior
+        // sessions, so they're the fastest path to *some* resident
+        // ancestor that `try_upscale_from_parent` can fall back on.
+        // The geometric shrinkage (8× fewer chunks per coarser step)
+        // bounds total cost at ≈ 1.14× the LOD+1 count.
+        for parent_lod in ((target_lod + 1)..=max_lod).rev() {
+            let shift = parent_lod - target_lod;
+            // shift > 6 would map the AABB to a sub-voxel region of
+            // the parent — out of useful range for upscale; skip.
+            if shift > 6 {
+                continue;
+            }
+            let px0 = (cx0 as u32) >> shift;
+            let py0 = (cy0 as u32) >> shift;
+            let pz0 = (cz0 as u32) >> shift;
+            let px1 = (cx1 as u32) >> shift;
+            let py1 = (cy1 as u32) >> shift;
+            let pz1 = (cz1 as u32) >> shift;
             for pz in pz0..=pz1 {
                 for py in py0..=py1 {
                     for px in px0..=px1 {
@@ -741,6 +750,20 @@ fn short_cooldown() -> Arc<ChunkState> {
 }
 fn pending_state() -> Arc<ChunkState> {
     Arc::new(ChunkState::pending())
+}
+/// Construct a Pending state and stamp `preview_source_lod` to the
+/// LOD level whose bytes the caller already upsampled during dispatch
+/// (if any). `None` leaves the value at the no-preview sentinel
+/// (`u8::MAX`), so the per-frame retry walk will try to fill on the
+/// first touch.
+fn pending_state_with(preview_source_lod: Option<u8>) -> Arc<ChunkState> {
+    let state = pending_state();
+    if let Some(lod) = preview_source_lod {
+        if let ChunkState::Pending { preview_source_lod: pl, .. } = state.as_ref() {
+            pl.store(lod, Ordering::Relaxed);
+        }
+    }
+    state
 }
 
 impl PurgeTarget for Inner {
@@ -887,10 +910,25 @@ impl Inner {
             // surface rendering re-enters here per voxel, and the queue
             // mutexes inside the touch calls would otherwise serialize
             // every CPU thread on the same futex.
-            if let ChunkState::Pending { last_touched_frame } = state.as_ref() {
+            if let ChunkState::Pending { last_touched_frame, preview_source_lod } = state.as_ref() {
                 if self.claim_touch(last_touched_frame) {
                     self.task_queue.touch(key);
                     self.downloader.touch(key);
+                    // Retry the upscale-from-parent walk while there's
+                    // room to improve: any ancestor finer than the one
+                    // we previously upsampled from (recorded in
+                    // `preview_source_lod`) would yield a better
+                    // preview. Stops once we've filled from `key.lod +
+                    // 1`, the finest possible parent. Debounced via the
+                    // same claim_touch the queue bumps use, so the
+                    // disk probes happen at most once per chunk per
+                    // frame even when many triangles touch this chunk.
+                    let current_best = preview_source_lod.load(Ordering::Relaxed);
+                    if current_best > key.lod.saturating_add(1) {
+                        if let Some(new_lod) = self.try_upscale_from_parent(key, current_best) {
+                            preview_source_lod.store(new_lod, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
             if let ChunkState::CooldownMiss { until } = state.as_ref() {
@@ -988,8 +1026,9 @@ impl Inner {
             log::trace!("[{}] mark_dispatched failed: {}", key, e);
         }
 
-        // Upscale-from-parent preview. If the LOD-(target+1) parent chunk
-        // is already Resident, we synthesize a 2× upsampled fill for the
+        // Upscale-from-parent preview. Walks the LOD pyramid from
+        // `key.lod + 1` toward `max_lod`, and at the first resident
+        // ancestor synthesizes a `2^shift`× upsampled fill for the
         // target slot's shard mmap so the composite reads a sensible
         // preview while the real bytes stream in. Bytes get overwritten
         // by `write_atomic` when the real fetch lands. Serialized via the
@@ -997,7 +1036,13 @@ impl Inner {
         // is here, so we can't tear with another upscale on the same key
         // (and the real download is queued *after* this point, ordering
         // pwrites by submission).
-        self.try_upscale_from_parent(key);
+        //
+        // Result captured into `upscaled_from` (the parent LOD the
+        // bytes came from, if any) and propagated into the returned
+        // Pending state's `preview_source_lod`, so the per-frame
+        // retry loop in `state_or_fetch` can decide whether a freshly
+        // resident finer ancestor would still improve the preview.
+        let upscaled_from = self.try_upscale_from_parent(key, u8::MAX);
 
         let plan = match self.backfiller.plan(key) {
             Ok(p) => p,
@@ -1054,7 +1099,7 @@ impl Inner {
         if order.is_empty() {
             // 0-source plan: queue Extract immediately.
             return match self.task_queue.try_submit(key, Task::Extract) {
-                Ok(()) => pending_state(),
+                Ok(()) => pending_state_with(upscaled_from),
                 Err(dropped) => {
                     log::debug!("[{}] dropped: extract queue full (dispatch)", key);
                     self.chunks.remove(&key);
@@ -1092,7 +1137,7 @@ impl Inner {
                 }
             }
         }
-        pending_state()
+        pending_state_with(upscaled_from)
     }
 
     fn register_source(self: &Arc<Self>, chunk_key: ChunkKey, spec: SourceSpec) -> RegisterResult {
@@ -1610,26 +1655,95 @@ impl Inner {
         }
     }
 
-    /// If `key`'s LOD-(target+1) parent chunk is already Resident on
-    /// disk, synthesize a 2× upsampled fill (nearest neighbor) and
+    /// Walk the LOD pyramid from `key.lod + 1` toward `max_lod` and,
+    /// at the first resident ancestor finer than `current_best_lod`,
+    /// synthesize a `2^shift`× upsampled fill (nearest neighbor) and
     /// pwrite it into the target shard's mmap region. Used to show a
-    /// preview while the real bytes stream in. No-op when no parent
-    /// exists, the parent isn't Resident, or the I/O fails (we log on
-    /// failure and let the real download path be the source of truth).
-    fn try_upscale_from_parent(&self, key: ChunkKey) {
+    /// preview while the real bytes stream in.
+    ///
+    /// `current_best_lod` carries the LOD of the ancestor we last
+    /// upsampled from (or `u8::MAX` for "no preview yet"). The walk
+    /// stops as soon as `parent_lod >= current_best_lod` since
+    /// anything coarser than what we already have wouldn't improve
+    /// the preview. So on retry, only finer-than-current ancestors
+    /// can supersede the existing fill.
+    ///
+    /// Returns `Some(parent_lod)` when new preview bytes were written
+    /// from a resident ancestor at `parent_lod`, or `Some(key.lod + 1)`
+    /// when the CAS lost because the real fetch beat us (in which
+    /// case caller should record that as "done" so it stops retrying).
+    /// Returns `None` when no resident ancestor finer than
+    /// `current_best_lod` was found.
+    fn try_upscale_from_parent(&self, key: ChunkKey, current_best_lod: u8) -> Option<u8> {
         let max_lod = self.backfiller.max_lod();
         if key.lod >= max_lod {
+            return None;
+        }
+        // `shift > 6` would map a target chunk to a sub-voxel position
+        // in the parent which we can't address, so cap the walk there
+        // even if `max_lod - key.lod` would otherwise extend further.
+        let max_shift: u8 = (max_lod - key.lod).min(6);
+        for shift in 1..=max_shift {
+            let parent_lod = key.lod + shift;
+            // No improvement possible — current preview already came
+            // from an equal or finer ancestor. Subsequent shifts only
+            // get coarser, so break.
+            if parent_lod >= current_best_lod {
+                break;
+            }
+            let parent_key = ChunkKey::new(parent_lod, key.x >> shift, key.y >> shift, key.z >> shift);
+            let (mmap, offset) = match self.disk.load(parent_key) {
+                LoadOutcome::Resident { mmap, offset } => (mmap, offset),
+                _ => continue,
+            };
+            let parent_slice = &mmap[offset..offset + CHUNK_VOXELS];
+            let bytes = upsample_from_parent(parent_slice, key.x, key.y, key.z, shift);
+            match self.disk.write_unconfirmed(key, &bytes) {
+                Ok(true) => {
+                    // The source parent is now serving as a live
+                    // preview backing for this frame's composite — LRU-
+                    // bump it (CAS + histogram) so the purge sweep
+                    // keeps it warm. The target chunk's sidecar slot is
+                    // still MISSING (write_unconfirmed reset it), so
+                    // its access_epoch isn't visible to the purger, but
+                    // stamp the byte anyway so any later code that
+                    // inspects it sees this frame's epoch.
+                    self.touch_access_inline(parent_key);
+                    self.disk.set_access_epoch(key, self.epoch.current());
+                    return Some(parent_lod);
+                }
+                Ok(false) => {
+                    // CAS lost — target was already non-MISSING (real
+                    // fetch beat us, or a peer upscaler raced us
+                    // through). Still bump the parent we read. Report
+                    // `key.lod + 1` so the caller stops retrying:
+                    // there's nothing finer than the finest parent,
+                    // and we can't overwrite what's there anyway.
+                    self.touch_access_inline(parent_key);
+                    return Some(key.lod + 1);
+                }
+                Err(e) => {
+                    log::debug!("[{}] upscale-from-parent write failed: {}", key, e);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Bump `key`'s access-epoch tag to the current epoch with histogram
+    /// bookkeeping. Inline copy of `ChunkCache::touch_access`'s body for
+    /// use from `Inner` paths that can't go through `ChunkCache`.
+    fn touch_access_inline(&self, key: ChunkKey) {
+        let current = self.epoch.current();
+        let Some(old) = self.disk.get_access_epoch(key) else {
+            return;
+        };
+        if old == current {
             return;
         }
-        let parent = ChunkKey::new(key.lod + 1, key.x >> 1, key.y >> 1, key.z >> 1);
-        let (mmap, offset) = match self.disk.load(parent) {
-            LoadOutcome::Resident { mmap, offset } => (mmap, offset),
-            _ => return,
-        };
-        let parent_slice = &mmap[offset..offset + CHUNK_VOXELS];
-        let bytes = upsample_2x_subregion(parent_slice, key.x & 1, key.y & 1, key.z & 1);
-        if let Err(e) = self.disk.write_unconfirmed(key, &bytes) {
-            log::debug!("[{}] upscale-from-parent write failed: {}", key, e);
+        if let Some(Ok(_)) = self.disk.cas_access_epoch(key, old, current) {
+            self.epoch.record_access_transition(old, current);
         }
     }
 
@@ -1798,28 +1912,37 @@ fn worker_loop(inner: Arc<Inner>) {
     }
 }
 
-/// Nearest-neighbor 2× upsample of a 32³ subregion of a 64³ parent chunk
-/// into a fresh 64³ buffer. `(half_x, half_y, half_z)` ∈ {0,1} select
-/// which octant of the parent corresponds to this target chunk: the
-/// target voxel at `(tx, ty, tz)` reads from the parent voxel at
-/// `(half_x*32 + tx/2, half_y*32 + ty/2, half_z*32 + tz/2)`.
-fn upsample_2x_subregion(parent: &[u8], half_x: u32, half_y: u32, half_z: u32) -> Vec<u8> {
+/// Nearest-neighbor `2^shift`× upsample of a `(64 >> shift)³` subregion of
+/// a 64³ parent chunk into a fresh 64³ buffer. `(target_cx, target_cy,
+/// target_cz)` are the *target chunk's* coordinates at its LOD; the low
+/// `shift` bits select which `(64 >> shift)³` block of the parent the
+/// target chunk corresponds to.
+///
+/// `shift` must be in `1..=6`. `shift == 6` is the degenerate case where
+/// the target chunk maps to a single parent voxel: every output is the
+/// same byte.
+fn upsample_from_parent(parent: &[u8], target_cx: u32, target_cy: u32, target_cz: u32, shift: u8) -> Vec<u8> {
     debug_assert_eq!(parent.len(), CHUNK_VOXELS);
+    debug_assert!((1..=6).contains(&shift));
+    let mask = (1u32 << shift) - 1;
+    let region = (64usize) >> shift; // sub-region size in parent-voxel units per axis
+    let scale = 1usize << shift; // replication factor per axis
+    let ox = ((target_cx & mask) as usize) * region;
+    let oy = ((target_cy & mask) as usize) * region;
+    let oz = ((target_cz & mask) as usize) * region;
     let mut out = vec![0u8; CHUNK_VOXELS];
-    let ox = (half_x as usize) * 32;
-    let oy = (half_y as usize) * 32;
-    let oz = (half_z as usize) * 32;
     for tz in 0..64usize {
-        let pz = oz + (tz >> 1);
+        let pz = oz + (tz / scale);
         for ty in 0..64usize {
-            let py = oy + (ty >> 1);
+            let py = oy + (ty / scale);
             let p_row = pz * 64 * 64 + py * 64 + ox;
             let t_row = tz * 64 * 64 + ty * 64;
-            // Two output voxels per parent voxel along x; unroll the pair.
-            for k in 0..32usize {
+            for k in 0..region {
                 let v = parent[p_row + k];
-                out[t_row + 2 * k] = v;
-                out[t_row + 2 * k + 1] = v;
+                let base = t_row + k * scale;
+                for s in 0..scale {
+                    out[base + s] = v;
+                }
             }
         }
     }

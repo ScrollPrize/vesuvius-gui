@@ -1,6 +1,6 @@
 use memmap::Mmap;
 use std::fmt;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicU8};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -48,7 +48,20 @@ pub enum ChunkState {
     /// frame counter once per paint via `ChunkCache::advance_frame`, so
     /// this check is a pair of relaxed atomic loads rather than a
     /// `clock_gettime` per voxel.
-    Pending { last_touched_frame: AtomicU64 },
+    ///
+    /// `preview_source_lod` records the LOD level of the resident
+    /// ancestor whose bytes `try_upscale_from_parent` most recently
+    /// upsampled into this chunk's shard slot. `u8::MAX` is the
+    /// sentinel meaning "no preview yet". While this value is greater
+    /// than `key.lod + 1` (i.e. some finer ancestor could still
+    /// improve the preview), the per-frame touch path re-runs the
+    /// upscale walk — a chunk first filled from LOD 5 gets refilled
+    /// from LOD 3 the moment LOD 3 lands, so the preview tracks the
+    /// best available source rather than the first one found.
+    Pending {
+        last_touched_frame: AtomicU64,
+        preview_source_lod: AtomicU8,
+    },
     /// Loaded — bytes live at `offset..offset+CHUNK_VOXELS` inside `mmap`.
     /// The mmap is shared with every other resident chunk in the same LOD
     /// data file.
@@ -69,6 +82,7 @@ impl ChunkState {
     pub fn pending() -> Self {
         Self::Pending {
             last_touched_frame: AtomicU64::new(0),
+            preview_source_lod: AtomicU8::new(u8::MAX),
         }
     }
 
