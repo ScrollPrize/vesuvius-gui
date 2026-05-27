@@ -327,6 +327,15 @@ impl DiskStore {
             },
         });
 
+        let recovered = inner.recover_locked_slots();
+        if recovered > 0 {
+            log::info!(
+                "[cache] recovered {} LOCKED slot(s) at {} from prior session",
+                recovered,
+                inner.root.display(),
+            );
+        }
+
         let sync_inner = inner.clone();
         let sync_thread = std::thread::Builder::new()
             .name("vesuvius-cache-sync".into())
@@ -824,6 +833,58 @@ impl DiskStoreInner {
             self.sync_state.cv.notify_all();
         }
     }
+
+    /// Walk every LOD's sidecar bitmap, find slots stuck in `STATE_LOCKED`
+    /// (a process died mid-`write_atomic`), punch their byte ranges, and
+    /// demote them to `STATE_MISSING`. Returns the number of slots
+    /// recovered. Must run before any new writers can race against the
+    /// bitmap, so callers invoke it from `DiskStore::new` before the sync
+    /// thread starts.
+    ///
+    /// Leaving slots LOCKED would deadlock future `write_atomic` peers
+    /// (which spin on LOCKED) and orphan the partially-written bytes.
+    fn recover_locked_slots(&self) -> u64 {
+        let mut recovered: u64 = 0;
+        for (lod_idx, slot) in self.lods.iter().enumerate() {
+            let lod = lod_idx as u8;
+            let dims = slot.dims;
+            let nx = dims.nx;
+            let ny = dims.ny;
+            let count = dims.count();
+            for idx in 0..count {
+                if self.sidecar.get_state(lod, idx) != STATE_LOCKED {
+                    continue;
+                }
+                let x = (idx % nx as u64) as u32;
+                let y = ((idx / nx as u64) % ny as u64) as u32;
+                let z = (idx / (nx as u64 * ny as u64)) as u32;
+                let key = ChunkKey { lod, x, y, z };
+                let r = match self.resolve(key) {
+                    Some(r) => r,
+                    None => {
+                        log::warn!("[cache] LOCKED slot at {} but resolve failed; clearing", key);
+                        self.sidecar.set_state(lod, idx, STATE_MISSING);
+                        recovered += 1;
+                        continue;
+                    }
+                };
+                match self.ensure_open(lod, r.shard) {
+                    Ok(lf) => {
+                        let off = r.in_shard_idx * CHUNK_VOXELS as u64;
+                        if let Err(e) = punch_hole_at(&lf.file, off, CHUNK_VOXELS as u64) {
+                            log::warn!("[cache] punch_hole failed for {}: {}", key, e);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("[cache] ensure_open failed during LOCKED recovery for {}: {}", key, e);
+                    }
+                }
+                self.sidecar.set_state(lod, idx, STATE_MISSING);
+                recovered += 1;
+            }
+        }
+        recovered
+    }
 }
 
 impl Drop for DiskStore {
@@ -1265,6 +1326,51 @@ mod tests {
         // RESIDENT. With 4 writers vs 1 purger the writers should
         // almost always win some races.
         assert!(checked > 0, "no RESIDENT slots at end — test inconclusive");
+    }
+
+    /// Plant STATE_LOCKED bytes into the sidecar (simulating a crash
+    /// mid-`write_atomic`), reopen the store, and confirm the startup
+    /// sweep demoted them back to MISSING — and that a fresh writer
+    /// can claim the slot without spinning on the stale lock.
+    #[test]
+    fn startup_sweep_clears_locked_slots() {
+        let tmp = tempdir();
+        {
+            let store = DiskStore::new(&tmp, "v".into(), [128, 128, 128], 0);
+            // Write one chunk so the shard file gets created — recovery
+            // for that LOCKED slot will hit an already-open shard.
+            store.write_atomic(ChunkKey::new(0, 0, 0, 0), &make_chunk(1)).unwrap();
+            // Plant LOCKED bytes at two slots: one whose shard exists,
+            // one in the same shard that's never been written.
+            let sidecar = store.sidecar();
+            let dims = sidecar.header.lods[0];
+            let idx_a = dims.linear_index(1, 0, 0).unwrap();
+            let idx_b = dims.linear_index(0, 1, 0).unwrap();
+            sidecar.set_state(0, idx_a, STATE_LOCKED);
+            sidecar.set_state(0, idx_b, STATE_LOCKED);
+            store.flush();
+        }
+        let store = DiskStore::new(&tmp, "v".into(), [128, 128, 128], 0);
+        let sidecar = store.sidecar();
+        let dims = sidecar.header.lods[0];
+        let idx_a = dims.linear_index(1, 0, 0).unwrap();
+        let idx_b = dims.linear_index(0, 1, 0).unwrap();
+        assert_eq!(
+            sidecar.get_state(0, idx_a),
+            STATE_MISSING,
+            "slot A should have been swept LOCKED→MISSING"
+        );
+        assert_eq!(sidecar.get_state(0, idx_b), STATE_MISSING);
+        // The pre-existing RESIDENT slot must be untouched.
+        let idx_resident = dims.linear_index(0, 0, 0).unwrap();
+        assert_eq!(sidecar.get_state(0, idx_resident), STATE_RESIDENT);
+        // A fresh write to the recovered slot must succeed (no deadlock
+        // spinning on the cleared LOCKED).
+        let bytes = make_chunk(0x77);
+        let outcome = store.write_atomic(ChunkKey::new(0, 1, 0, 0), &bytes).unwrap();
+        assert_eq!(outcome, WriteOutcome::Wrote);
+        let (mmap, off) = store.try_load(ChunkKey::new(0, 1, 0, 0)).unwrap();
+        assert_eq!(mmap[off], bytes[0]);
     }
 
     #[test]
