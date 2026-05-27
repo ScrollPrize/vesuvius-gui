@@ -24,7 +24,7 @@
 //! the sidecar by the same sync thread.
 
 use super::disk::{punch_hole_at, shard_filename, SHARD_CHUNKS_PER_AXIS};
-use super::purge::{PurgePlan, PurgeTarget};
+use super::purge::{PurgePlan, PurgeTarget, VolumeBreakdown};
 use super::sidecar::{self, Sidecar, STATE_MISSING, STATE_RESIDENT};
 use super::CHUNK_VOXELS;
 use std::collections::{HashMap, HashSet};
@@ -67,11 +67,11 @@ pub fn cap_bytes_from_env() -> u64 {
         Ok(raw) => match raw.trim().parse::<u64>() {
             Ok(gb) if gb > 0 => gb.saturating_mul(1024 * 1024 * 1024),
             Ok(_) => {
-                log::warn!("{} must be a positive integer; using default", CAP_ENV_VAR);
+                log::warn!(target: super::purge::LOG_TARGET, "{} must be a positive integer; using default", CAP_ENV_VAR);
                 DEFAULT_CAP_BYTES
             }
             Err(e) => {
-                log::warn!("{} parse failed ({}); using default", CAP_ENV_VAR, e);
+                log::warn!(target: super::purge::LOG_TARGET, "{} parse failed ({}); using default", CAP_ENV_VAR, e);
                 DEFAULT_CAP_BYTES
             }
         },
@@ -164,11 +164,29 @@ impl EpochState {
         let Some(plan) = PurgePlan::build(self, target_chunks) else {
             return 0;
         };
-        let mut total: u64 = 0;
+        let current = self.current();
         let mut targets = self.targets.lock().unwrap();
         targets.retain(|w| w.upgrade().is_some());
         let live: Vec<Arc<dyn PurgeTarget>> = targets.iter().filter_map(Weak::upgrade).collect();
         drop(targets);
+
+        // Pre-purge breakdown: ask every live target + every on-disk
+        // sidecar what they'd contribute under this plan, then emit a
+        // single multi-line log block. Sidecar scans here duplicate the
+        // sweep's own walk; per-tick cost is one extra read per volume,
+        // and we only run on watchdog ticks (30s) so it's free in
+        // practice. Without this the operator only sees per-volume
+        // `evicted=` numbers AFTER the fact and can't tell whether a
+        // mismatch between `expected_freed` and reality came from shard
+        // sparing, an offline volume, or a races-with-fills situation.
+        let mut summaries: Vec<VolumeBreakdown> = live.iter().map(|t| t.summarize(plan, current)).collect();
+        let live_ids: HashSet<String> = summaries.iter().map(|b| b.volume_id.clone()).collect();
+        if let Some(root) = self.unified_root.get() {
+            summaries.extend(summarize_offline_volumes(plan, current, root, &live_ids));
+        }
+        log_plan(plan, current, &summaries);
+
+        let mut total: u64 = 0;
         for t in live {
             total = total.saturating_add(t.run_purge(plan));
         }
@@ -222,7 +240,7 @@ impl EpochState {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
             Err(e) => {
-                log::warn!("offline purge: read_dir {} failed: {}", unified_root.display(), e);
+                log::warn!(target: super::purge::LOG_TARGET, "offline purge: read_dir {} failed: {}", unified_root.display(), e);
                 return 0;
             }
         };
@@ -242,7 +260,7 @@ impl EpochState {
                 Ok(Some(s)) => s,
                 Ok(None) => continue,
                 Err(e) => {
-                    log::warn!("offline purge: sidecar {} failed: {}", sidecar_path.display(), e);
+                    log::warn!(target: super::purge::LOG_TARGET, "offline purge: sidecar {} failed: {}", sidecar_path.display(), e);
                     continue;
                 }
             };
@@ -293,6 +311,7 @@ impl EpochState {
                                         Ok(m) if m.len() == shard_total => e.insert(f),
                                         Ok(m) => {
                                             log::warn!(
+                                                target: super::purge::LOG_TARGET,
                                                 "offline purge: skip shard {} (len {} != expected {})",
                                                 path.display(),
                                                 m.len(),
@@ -301,7 +320,7 @@ impl EpochState {
                                             continue;
                                         }
                                         Err(err) => {
-                                            log::warn!("offline purge: stat {} failed: {}", path.display(), err);
+                                            log::warn!(target: super::purge::LOG_TARGET, "offline purge: stat {} failed: {}", path.display(), err);
                                             continue;
                                         }
                                     }
@@ -315,7 +334,7 @@ impl EpochState {
                                     continue;
                                 }
                                 Err(err) => {
-                                    log::warn!("offline purge: open {} failed: {}", path.display(), err);
+                                    log::warn!(target: super::purge::LOG_TARGET, "offline purge: open {} failed: {}", path.display(), err);
                                     continue;
                                 }
                             }
@@ -324,6 +343,7 @@ impl EpochState {
                     let off = in_shard_idx * chunk_bytes;
                     if let Err(err) = punch_hole_at(file, off, chunk_bytes) {
                         log::warn!(
+                            target: super::purge::LOG_TARGET,
                             "offline purge: punch_hole {:?}/{:?} failed: {}",
                             shard,
                             in_shard_idx,
@@ -343,9 +363,10 @@ impl EpochState {
             // current in-memory bitmaps; write_to does atomic rename.
             let snap = sidecar.snapshot();
             if let Err(e) = snap.write_to(&sidecar.header, &sidecar_path) {
-                log::warn!("offline purge: sidecar write {} failed: {}", sidecar_path.display(), e);
+                log::warn!(target: super::purge::LOG_TARGET, "offline purge: sidecar write {} failed: {}", sidecar_path.display(), e);
             }
             log::info!(
+                target: super::purge::LOG_TARGET,
                 "offline purge: volume={} evicted={}",
                 sidecar.header.volume_id,
                 evicted_here
@@ -477,6 +498,7 @@ impl EpochState {
                 // wired. In the stub we just shout — the watermark policy
                 // should make this unreachable in practice.
                 log::warn!(
+                    target: crate::cache::purge::LOG_TARGET,
                     "epoch advance into occupied slot {} ({} chunks); purge needed",
                     next,
                     s.epoch_chunks[next as usize]
@@ -631,7 +653,7 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
         Ok(Some(s)) => Arc::new(s),
         Ok(None) => Arc::new(EpochState::new(cap_bytes)),
         Err(e) => {
-            log::warn!("epoch state load failed at {}: {}; starting fresh", path.display(), e);
+            log::warn!(target: super::purge::LOG_TARGET, "epoch state load failed at {}: {}; starting fresh", path.display(), e);
             Arc::new(EpochState::new(cap_bytes))
         }
     };
@@ -652,6 +674,7 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
         s.total_chunks = 0;
         if s.cap_bytes != cap_bytes {
             log::info!(
+                target: super::purge::LOG_TARGET,
                 "epoch.idx cap override: persisted={} GiB -> using={} GiB",
                 s.cap_bytes / (1024 * 1024 * 1024),
                 cap_bytes / (1024 * 1024 * 1024),
@@ -682,6 +705,67 @@ pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<Epoch
     state
 }
 
+/// Scan `unified_root` for volumes that don't have a live target and
+/// summarize each one's contribution to `plan`. Mirrors the offline
+/// sweep's traversal but reads sidecars in passive mode (no writes, no
+/// hole-punching). Used by `purge_all_to_target` to log the per-volume
+/// breakdown before any chunks are touched.
+fn summarize_offline_volumes(
+    plan: PurgePlan,
+    current: u8,
+    unified_root: &Path,
+    live_ids: &HashSet<String>,
+) -> Vec<VolumeBreakdown> {
+    let entries = match std::fs::read_dir(unified_root) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let vol_dir = entry.path();
+        if !vol_dir.is_dir() {
+            continue;
+        }
+        let sidecar_path = sidecar::sidecar_path(&vol_dir);
+        match Sidecar::load(&sidecar_path) {
+            Ok(Some(s)) if !live_ids.contains(&s.header.volume_id) => {
+                out.push(VolumeBreakdown::from_sidecar(&s, plan, current));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Emit the multi-line per-volume plan log. Sorted by `victims`
+/// descending so the dominant volume reads first. Volumes with zero
+/// resident chunks are omitted — they say nothing the global header
+/// doesn't already cover.
+fn log_plan(plan: PurgePlan, current: u8, summaries: &[VolumeBreakdown]) {
+    let mut sorted: Vec<&VolumeBreakdown> = summaries.iter().filter(|b| b.resident > 0).collect();
+    sorted.sort_by(|a, b| b.victims.cmp(&a.victims).then_with(|| b.resident.cmp(&a.resident)));
+    let mut lines = format!(
+        "purge plan: current_epoch={} threshold={} target={} expected_freed={}",
+        current, plan.age_threshold, plan.target_chunks, plan.freed_chunks
+    );
+    for b in &sorted {
+        let pct = if b.resident > 0 {
+            b.victims.saturating_mul(100) / b.resident
+        } else {
+            0
+        };
+        let oldest = b
+            .oldest_age
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        lines.push_str(&format!(
+            "\n  vol={} resident={} oldest_age={} victims={} ({}%)",
+            b.volume_id, b.resident, oldest, b.victims, pct
+        ));
+    }
+    log::info!(target: super::purge::LOG_TARGET, "{}", lines);
+}
+
 /// Emit a one-shot info log summarizing the cache-wide state right
 /// after the registry init + disk scan. Reports global numbers (every
 /// on-disk volume under `unified_root`), not the per-volume slice that
@@ -700,6 +784,7 @@ fn log_global_stats(state: &EpochState, unified_root: &Path) {
     };
     let free_bytes = statvfs_free(unified_root);
     log::info!(
+        target: super::purge::LOG_TARGET,
         "cache stats (global): root={} cap={} GiB volumes={} resident={} chunks ({} MiB, {}% of cap) current_epoch={} bytes_per_epoch={} MiB disk_free={}",
         unified_root.display(),
         cap_bytes / (1024 * 1024 * 1024),
@@ -732,7 +817,7 @@ fn seed_from_disk(state: &EpochState, unified_root: &Path) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            log::warn!("epoch seed: read_dir {} failed: {}", unified_root.display(), e);
+            log::warn!(target: super::purge::LOG_TARGET, "epoch seed: read_dir {} failed: {}", unified_root.display(), e);
             return;
         }
     };
@@ -749,11 +834,12 @@ fn seed_from_disk(state: &EpochState, unified_root: &Path) {
                 seeded += 1;
             }
             Ok(None) => {}
-            Err(e) => log::warn!("epoch seed: sidecar {} failed to load: {}", sidecar_path.display(), e),
+            Err(e) => log::warn!(target: super::purge::LOG_TARGET, "epoch seed: sidecar {} failed to load: {}", sidecar_path.display(), e),
         }
     }
     if seeded > 0 {
         log::info!(
+            target: super::purge::LOG_TARGET,
             "epoch seed: accumulated {} volume(s) from {}",
             seeded,
             unified_root.display()
@@ -771,7 +857,7 @@ fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf) {
 
         // Save state. Failures are logged but don't kill the loop.
         if let Err(e) = state.save(&path) {
-            log::warn!("epoch state save failed at {}: {}", path.display(), e);
+            log::warn!(target: super::purge::LOG_TARGET, "epoch state save failed at {}: {}", path.display(), e);
         }
 
         // Watermark + statvfs purge.
@@ -796,6 +882,7 @@ fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf) {
                 let extra_chunks = need_bytes.div_ceil(chunk_bytes);
                 target_to_free = target_to_free.max(extra_chunks);
                 log::info!(
+                    target: super::purge::LOG_TARGET,
                     "epoch watchdog: low disk free ({} MiB < {} MiB), targeting {} chunks",
                     free_bytes / (1024 * 1024),
                     MIN_FREE_BYTES / (1024 * 1024),
@@ -807,6 +894,7 @@ fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf) {
         if target_to_free > 0 {
             let evicted = state.purge_all_to_target(target_to_free);
             log::info!(
+                target: super::purge::LOG_TARGET,
                 "epoch watchdog: purge target={} evicted={} (was {} chunks resident)",
                 target_to_free,
                 evicted,
@@ -1057,7 +1145,7 @@ mod tests {
 
     #[test]
     fn offline_sweep_skips_volumes_with_live_target() {
-        use super::super::purge::{PurgePlan, PurgeTarget};
+        use super::super::purge::{PurgePlan, PurgeTarget, VolumeBreakdown};
         use super::super::sidecar::{Header, Sidecar, STATE_RESIDENT};
 
         struct FakeTarget {
@@ -1066,6 +1154,14 @@ mod tests {
         impl PurgeTarget for FakeTarget {
             fn volume_id(&self) -> String {
                 self.vid.clone()
+            }
+            fn summarize(&self, _: PurgePlan, _: u8) -> VolumeBreakdown {
+                VolumeBreakdown {
+                    volume_id: self.vid.clone(),
+                    resident: 0,
+                    oldest_age: None,
+                    victims: 0,
+                }
             }
             fn run_purge(&self, _: PurgePlan) -> u64 {
                 0

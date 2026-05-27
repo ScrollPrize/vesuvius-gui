@@ -571,6 +571,9 @@ impl PurgeTarget for Inner {
     fn volume_id(&self) -> String {
         self.disk.sidecar().header.volume_id.clone()
     }
+    fn summarize(&self, plan: PurgePlan, current: u8) -> super::purge::VolumeBreakdown {
+        super::purge::VolumeBreakdown::from_sidecar(&self.disk.sidecar(), plan, current)
+    }
     fn run_purge(&self, plan: PurgePlan) -> u64 {
         Inner::run_purge(self, plan)
     }
@@ -590,6 +593,7 @@ impl Inner {
         let current = self.epoch.current();
         let volume_id = sidecar.header.volume_id.clone();
         log::info!(
+            target: super::purge::LOG_TARGET,
             "cache purge starting: volume={} current_epoch={} age_threshold={} target={} expected_freed={}",
             volume_id,
             current,
@@ -655,7 +659,7 @@ impl Inner {
                 // the chunk is already logically evicted; the blocks
                 // just stay allocated.
                 if let Err(e) = self.disk.punch_hole(key) {
-                    log::warn!("punch_hole failed for {}: {}", key, e);
+                    log::warn!(target: super::purge::LOG_TARGET, "punch_hole failed for {}: {}", key, e);
                 }
 
                 // (5) Bookkeeping.
@@ -665,6 +669,7 @@ impl Inner {
         }
 
         log::info!(
+            target: super::purge::LOG_TARGET,
             "cache purge finished: volume={} evicted={} shard_spared={} total_remaining={}",
             volume_id,
             evicted,

@@ -28,6 +28,14 @@
 
 use super::epoch::{EpochState, EPOCH_SLOTS};
 
+/// Shared `log` target for every purge / epoch / cache-cap message. Set
+/// to the path of this module so a single `RUST_LOG=vesuvius_rs::cache::purge=info`
+/// filter covers all cache lifecycle output (planning, sweep, watchdog,
+/// stats, offline sweep, env parse). The producers live in `cache.rs`
+/// and `epoch.rs`; routing them through this constant keeps the filter
+/// stable when code moves between files.
+pub const LOG_TARGET: &str = "vesuvius_rs::cache::purge";
+
 /// A planned purge: chunks whose age (relative to `current`) is `>= T`
 /// will be evicted. `target_chunks` is the goal; `freed_chunks` is what
 /// the histogram says we'd actually free at this threshold (may exceed
@@ -106,7 +114,65 @@ pub trait PurgeTarget: Send + Sync {
     /// Identifier matching `Sidecar::header.volume_id`. Used by the
     /// offline sweep to skip volumes already covered by a live target.
     fn volume_id(&self) -> String;
+    /// Read-only count of how this volume would contribute to `plan`.
+    /// Walks the same sidecar that `run_purge` would, but accumulates
+    /// counts instead of evicting. Called once per watchdog tick to log
+    /// the per-volume plan breakdown so the human reader can tell which
+    /// volume is dominating the eviction set.
+    fn summarize(&self, plan: PurgePlan, current: u8) -> VolumeBreakdown;
     fn run_purge(&self, plan: PurgePlan) -> u64;
+}
+
+/// One volume's contribution to a planned purge. Aggregated and logged
+/// by `EpochState::purge_all_to_target` so the operator can see *where*
+/// the planner's `expected_freed` count lives before any chunks are
+/// touched.
+#[derive(Debug, Clone)]
+pub struct VolumeBreakdown {
+    pub volume_id: String,
+    /// Total Resident chunks across every LOD.
+    pub resident: u64,
+    /// Modular age of the oldest Resident chunk. `None` when the volume
+    /// has nothing Resident.
+    pub oldest_age: Option<u16>,
+    /// Resident chunks matching `plan.is_victim(access_epoch, current)`.
+    /// Does not account for shard-level sparing — that's a sweep-time
+    /// concern; this number is the *planner's* view of available
+    /// victims in this volume.
+    pub victims: u64,
+}
+
+impl VolumeBreakdown {
+    /// Build a breakdown by walking `sidecar` once. Shared between the
+    /// live `PurgeTarget::summarize` impl and the offline path.
+    pub fn from_sidecar(sidecar: &super::sidecar::Sidecar, plan: PurgePlan, current: u8) -> Self {
+        let mut resident: u64 = 0;
+        let mut victims: u64 = 0;
+        let mut oldest_age: Option<u16> = None;
+        for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
+            let lod = lod_idx as u8;
+            for idx in 0..dims.count() {
+                if sidecar.get_state(lod, idx) != super::sidecar::STATE_RESIDENT {
+                    continue;
+                }
+                resident += 1;
+                let ae = sidecar.get_access_epoch(lod, idx);
+                let age = current.wrapping_sub(ae) as u16;
+                if oldest_age.map_or(true, |o| age > o) {
+                    oldest_age = Some(age);
+                }
+                if plan.is_victim(ae, current) {
+                    victims += 1;
+                }
+            }
+        }
+        Self {
+            volume_id: sidecar.header.volume_id.clone(),
+            resident,
+            oldest_age,
+            victims,
+        }
+    }
 }
 
 #[cfg(test)]
