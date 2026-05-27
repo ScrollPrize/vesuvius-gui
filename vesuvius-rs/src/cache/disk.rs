@@ -336,6 +336,16 @@ impl DiskStore {
             );
         }
 
+        let (reclaimed_bytes, shards_punched) = inner.reclaim_orphan_bytes();
+        if reclaimed_bytes > 0 {
+            log::info!(
+                "[cache] reclaimed {} MiB of orphan bytes across {} shard(s) at {}",
+                reclaimed_bytes / (1024 * 1024),
+                shards_punched,
+                inner.root.display(),
+            );
+        }
+
         let sync_inner = inner.clone();
         let sync_thread = std::thread::Builder::new()
             .name("vesuvius-cache-sync".into())
@@ -885,6 +895,186 @@ impl DiskStoreInner {
         }
         recovered
     }
+
+    /// Walk every shard file on disk and reclaim physical blocks that no
+    /// longer back a `STATE_RESIDENT` slot. Sources of orphan bytes:
+    ///   - `write_unconfirmed` previews (writes bytes, then resets the
+    ///     sidecar back to MISSING — the bytes linger until reclaimed).
+    ///   - Crashed `write_atomic` that wrote bytes but never published
+    ///     RESIDENT (the LOCKED slot was swept just above to MISSING).
+    ///   - Failed `punch_hole` calls from a prior purge pass.
+    ///
+    /// Cheap when clean: one `fstat` per shard, no syscalls when
+    /// physical ≤ expected + slop. Efficient when dirty: walks the
+    /// shard's chunk grid raster-ordered and emits one
+    /// `fallocate(PUNCH_HOLE)` per contiguous run of non-RESIDENT slots
+    /// — best case one syscall per shard if all chunks are evictable.
+    ///
+    /// Returns `(bytes_reclaimed, shards_punched)`.
+    fn reclaim_orphan_bytes(&self) -> (u64, u64) {
+        let chunk_bytes = CHUNK_VOXELS as u64;
+        // Slop absorbs one chunk's worth of physical noise (a single
+        // failed punch from a prior session, a single in-flight preview
+        // write) so we don't enter the per-shard bitmap walk for
+        // trivially-small discrepancies. Two or more orphan chunks
+        // (≥ 512 KiB reclaimable) triggers the sweep.
+        let threshold_bytes = chunk_bytes;
+        let sca = self.shard_chunks_per_axis;
+        let s = sca as u64;
+
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!(
+                    "[cache] orphan sweep: read_dir({}) failed: {}",
+                    self.root.display(),
+                    e
+                );
+                return (0, 0);
+            }
+        };
+
+        let mut total_reclaimed: u64 = 0;
+        let mut shards_punched: u64 = 0;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Some((lod, shard)) = parse_shard_filename(&name_str) else {
+                continue;
+            };
+            let Some(slot) = self.lods.get(lod as usize) else {
+                continue;
+            };
+            let dims = slot.dims;
+            let path = entry.path();
+
+            let physical_bytes: u64 = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    match std::fs::metadata(&path) {
+                        Ok(m) => m.blocks() * 512,
+                        Err(e) => {
+                            log::warn!(
+                                "[cache] orphan sweep: stat {} failed: {}",
+                                path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    continue;
+                }
+            };
+
+            let base_cx = shard.0 * sca;
+            let base_cy = shard.1 * sca;
+            let base_cz = shard.2 * sca;
+            if base_cx >= dims.nx || base_cy >= dims.ny || base_cz >= dims.nz {
+                continue;
+            }
+
+            // Count RESIDENT slots in this shard. Expected physical
+            // bytes = count × CHUNK_VOXELS, since CHUNK_VOXELS (256 KiB)
+            // is a multiple of every common FS block size.
+            let mut resident_count: u64 = 0;
+            let hi_cx = (base_cx + sca).min(dims.nx);
+            let hi_cy = (base_cy + sca).min(dims.ny);
+            let hi_cz = (base_cz + sca).min(dims.nz);
+            for cz in base_cz..hi_cz {
+                for cy in base_cy..hi_cy {
+                    for cx in base_cx..hi_cx {
+                        if let Some(idx) = dims.linear_index(cx, cy, cz) {
+                            if self.sidecar.get_state(lod, idx) == STATE_RESIDENT {
+                                resident_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let expected_bytes = resident_count * chunk_bytes;
+            if physical_bytes <= expected_bytes + threshold_bytes {
+                continue;
+            }
+
+            let file = match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!(
+                        "[cache] orphan sweep: open {} for punching failed: {}",
+                        path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            // Walk in raster order matching `in_shard_idx = (wz·s + wy)·s + wx`
+            // — consecutive iterations have consecutive file offsets so
+            // non-RESIDENT runs are contiguous on disk.
+            let mut shard_reclaimed: u64 = 0;
+            let mut run_start: Option<u64> = None;
+            let mut run_end: u64 = 0;
+            for wz in 0..s {
+                for wy in 0..s {
+                    for wx in 0..s {
+                        let in_shard_idx = (wz * s + wy) * s + wx;
+                        let cx = base_cx as u64 + wx;
+                        let cy = base_cy as u64 + wy;
+                        let cz = base_cz as u64 + wz;
+                        let is_resident = match dims.linear_index(cx as u32, cy as u32, cz as u32) {
+                            Some(idx) => self.sidecar.get_state(lod, idx) == STATE_RESIDENT,
+                            None => false,
+                        };
+                        if !is_resident {
+                            if run_start.is_none() {
+                                run_start = Some(in_shard_idx);
+                            }
+                            run_end = in_shard_idx + 1;
+                        } else if let Some(start) = run_start.take() {
+                            let off = start * chunk_bytes;
+                            let len = (run_end - start) * chunk_bytes;
+                            match punch_hole_at(&file, off, len) {
+                                Ok(()) => shard_reclaimed += len,
+                                Err(e) => log::warn!(
+                                    "[cache] orphan sweep punch lod={} shard={:?} off={} len={}: {}",
+                                    lod, shard, off, len, e
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(start) = run_start.take() {
+                let off = start * chunk_bytes;
+                let len = (run_end - start) * chunk_bytes;
+                match punch_hole_at(&file, off, len) {
+                    Ok(()) => shard_reclaimed += len,
+                    Err(e) => log::warn!(
+                        "[cache] orphan sweep punch lod={} shard={:?} off={} len={}: {}",
+                        lod, shard, off, len, e
+                    ),
+                }
+            }
+
+            if shard_reclaimed > 0 {
+                total_reclaimed += shard_reclaimed;
+                shards_punched += 1;
+                log::debug!(
+                    "[cache] orphan sweep: reclaimed {} bytes in lod {} shard ({},{},{}) (was {}, expected ≤ {})",
+                    shard_reclaimed, lod, shard.0, shard.1, shard.2,
+                    physical_bytes, expected_bytes
+                );
+            }
+        }
+
+        (total_reclaimed, shards_punched)
+    }
 }
 
 impl Drop for DiskStore {
@@ -980,6 +1170,24 @@ pub(crate) fn shard_filename(lod: u8, shard: ShardCoord) -> String {
         "chunks-L{:02}-X{:03}-Y{:03}-Z{:03}.dat",
         lod, shard.0, shard.1, shard.2
     )
+}
+
+/// Inverse of `shard_filename`. Returns `(lod, (sx, sy, sz))` for a
+/// recognized shard filename, `None` for anything else (including
+/// `.stale.*` siblings and the `chunks.idx` sidecar). Used by the
+/// startup orphan-byte sweep to enumerate shard files without
+/// pre-loading them.
+fn parse_shard_filename(name: &str) -> Option<(u8, ShardCoord)> {
+    let stripped = name.strip_prefix("chunks-L")?.strip_suffix(".dat")?;
+    let mut parts = stripped.split('-');
+    let lod: u8 = parts.next()?.parse().ok()?;
+    let sx: u32 = parts.next()?.strip_prefix('X')?.parse().ok()?;
+    let sy: u32 = parts.next()?.strip_prefix('Y')?.parse().ok()?;
+    let sz: u32 = parts.next()?.strip_prefix('Z')?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((lod, (sx, sy, sz)))
 }
 
 fn stale_rename_everything(root: &Path) {
@@ -1371,6 +1579,108 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::Wrote);
         let (mmap, off) = store.try_load(ChunkKey::new(0, 1, 0, 0)).unwrap();
         assert_eq!(mmap[off], bytes[0]);
+    }
+
+    /// Plant orphan bytes (pwrite into the shard outside the sidecar's
+    /// RESIDENT slots), reopen the store, and confirm the startup
+    /// orphan sweep punched them while leaving the RESIDENT slot intact.
+    #[cfg(unix)]
+    #[test]
+    fn startup_sweep_reclaims_orphan_bytes() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempdir();
+        let shard_file = tmp.join("chunks-L00-X000-Y000-Z000.dat");
+        {
+            // sca=4 → 4³ = 64 slots per shard. Extent [256, 64, 64] at
+            // LOD 0 gives 4×1×1 chunks, all in shard (0,0,0).
+            let store = DiskStore::new_with_shard_chunks_per_axis(
+                &tmp, "v".into(), [256, 64, 64], 0, 4,
+            );
+            store.write_atomic(ChunkKey::new(0, 0, 0, 0), &make_chunk(1)).unwrap();
+            // Pwrite junk into slot 1 and slot 2 without touching the
+            // sidecar — those slots stay MISSING but burn physical blocks
+            // (the orphan-bytes case `write_unconfirmed` and crashed
+            // writers produce in real workloads).
+            let f = OpenOptions::new().read(true).write(true).open(&shard_file).unwrap();
+            let junk = vec![0xee_u8; CHUNK_VOXELS];
+            pwrite_all(&f, CHUNK_VOXELS as u64, &junk).unwrap();
+            pwrite_all(&f, 2 * CHUNK_VOXELS as u64, &junk).unwrap();
+            drop(f);
+            store.flush();
+        }
+
+        let physical_before = std::fs::metadata(&shard_file).unwrap().blocks() * 512;
+        assert!(
+            physical_before >= 3 * CHUNK_VOXELS as u64,
+            "expected ≥ 3 chunks of physical blocks before sweep, got {}",
+            physical_before,
+        );
+
+        let store = DiskStore::new_with_shard_chunks_per_axis(
+            &tmp, "v".into(), [256, 64, 64], 0, 4,
+        );
+
+        // RESIDENT slot is untouched.
+        let bytes = make_chunk(1);
+        let (mmap, off) = store.try_load(ChunkKey::new(0, 0, 0, 0)).unwrap();
+        assert_eq!(mmap[off], bytes[0]);
+        assert_eq!(mmap[off + CHUNK_VOXELS - 1], bytes[CHUNK_VOXELS - 1]);
+
+        // Sidecar state of the orphan slots is unchanged (still MISSING) —
+        // the sweep only releases physical blocks.
+        let sidecar = store.sidecar();
+        let dims = sidecar.header.lods[0];
+        assert_eq!(
+            sidecar.get_state(0, dims.linear_index(1, 0, 0).unwrap()),
+            STATE_MISSING,
+        );
+        assert_eq!(
+            sidecar.get_state(0, dims.linear_index(2, 0, 0).unwrap()),
+            STATE_MISSING,
+        );
+
+        let physical_after = std::fs::metadata(&shard_file).unwrap().blocks() * 512;
+        assert!(
+            physical_after < physical_before,
+            "physical bytes did not shrink: {} → {}",
+            physical_before, physical_after,
+        );
+        // The RESIDENT slot's chunk still occupies real blocks.
+        assert!(
+            physical_after >= CHUNK_VOXELS as u64,
+            "RESIDENT chunk's bytes were also punched: {} bytes left",
+            physical_after,
+        );
+    }
+
+    /// A clean cache (no orphans, no LOCKED slots) should not trigger
+    /// any punch_hole syscalls on startup — the sweep is a no-op below
+    /// its slop threshold. We can't directly observe syscalls in a unit
+    /// test, but we can verify physical size is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn startup_sweep_leaves_clean_shards_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempdir();
+        let shard_file = tmp.join("chunks-L00-X000-Y000-Z000.dat");
+        {
+            let store = DiskStore::new_with_shard_chunks_per_axis(
+                &tmp, "v".into(), [256, 64, 64], 0, 4,
+            );
+            for cx in 0..4u32 {
+                store.write_atomic(ChunkKey::new(0, cx, 0, 0), &make_chunk(cx as u8)).unwrap();
+            }
+            store.flush();
+        }
+        let physical_before = std::fs::metadata(&shard_file).unwrap().blocks() * 512;
+        let _store = DiskStore::new_with_shard_chunks_per_axis(
+            &tmp, "v".into(), [256, 64, 64], 0, 4,
+        );
+        let physical_after = std::fs::metadata(&shard_file).unwrap().blocks() * 512;
+        assert_eq!(
+            physical_before, physical_after,
+            "clean shard's physical size changed across reopen",
+        );
     }
 
     #[test]
