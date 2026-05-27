@@ -302,6 +302,28 @@ impl UnifiedCache {
         &self.epoch
     }
 
+    /// Run the synchronous startup-time maintenance pass: if the
+    /// on-disk residency observed by the construction-time survey is
+    /// already above the high-water mark (or disk free space is below
+    /// `MIN_FREE_BYTES`), evict down to the low-water mark before
+    /// returning. Call this once at app startup, after building the
+    /// `UnifiedCache` and before opening any volumes, so the app
+    /// starts in a known good state rather than racing the
+    /// background watchdog.
+    ///
+    /// Returns the number of chunks evicted (0 if the cache was
+    /// already comfortably below water).
+    pub fn run_startup_maintenance(&self) -> u64 {
+        log::info!(
+            target: super::purge::LOG_TARGET,
+            "startup maintenance: surveying {} (cap={} GiB, resident={} chunks)",
+            self.unified_root.display(),
+            self.epoch.cap_bytes() / (1024 * 1024 * 1024),
+            self.epoch.total_chunks(),
+        );
+        self.epoch.run_purge_pass("startup")
+    }
+
     /// Get-or-create the `ChunkCache` for one volume under this
     /// unified root. The second call for the same `volume_id` reuses
     /// the same in-memory `Inner` (and therefore the same workers,

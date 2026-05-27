@@ -163,6 +163,96 @@ impl EpochState {
         guard.push(target);
     }
 
+    /// Compute the watermark- and free-space-driven purge target. Returns
+    /// 0 if the cache is below the high-water mark and disk free space
+    /// is comfortable. Otherwise returns the number of chunks to evict
+    /// to bring residency down to the low-water mark (and to leave
+    /// `MIN_FREE_BYTES` free on the volume if `unified_root` is set).
+    ///
+    /// Pure read-only — call `run_purge_pass` to actually evict.
+    pub fn compute_purge_target(&self) -> u64 {
+        let cap = self.cap_bytes();
+        if cap == 0 {
+            return 0;
+        }
+        let chunk_bytes = CHUNK_VOXELS as u64;
+        let chunks_capacity = cap / chunk_bytes;
+        let high_water = chunks_capacity.saturating_mul(HIGH_WATER_PCT) / 100;
+        let low_water = chunks_capacity.saturating_mul(LOW_WATER_PCT) / 100;
+        let total = self.total_chunks();
+        let mut target: u64 = 0;
+        if total > high_water {
+            target = total - low_water;
+        }
+        if let Some(root) = self.unified_root.get() {
+            if let Some(free_bytes) = statvfs_free(root) {
+                if free_bytes < MIN_FREE_BYTES {
+                    let need = MIN_FREE_BYTES - free_bytes;
+                    let extra = need.div_ceil(chunk_bytes);
+                    target = target.max(extra);
+                }
+            }
+        }
+        target
+    }
+
+    /// One full maintenance pass: compute the purge target and execute
+    /// it synchronously, logging the reason and outcome. `source` is a
+    /// short tag included in logs ("watchdog", "startup", "test") so
+    /// operators can tell what triggered the work.
+    ///
+    /// Returns the number of chunks evicted (0 if the pass was a
+    /// no-op).
+    pub fn run_purge_pass(&self, source: &str) -> u64 {
+        let cap = self.cap_bytes();
+        if cap == 0 {
+            return 0;
+        }
+        let chunk_bytes = CHUNK_VOXELS as u64;
+        let chunks_capacity = cap / chunk_bytes;
+        let high_water = chunks_capacity.saturating_mul(HIGH_WATER_PCT) / 100;
+        let low_water = chunks_capacity.saturating_mul(LOW_WATER_PCT) / 100;
+        let total = self.total_chunks();
+        let mut target: u64 = 0;
+        if total > high_water {
+            target = total - low_water;
+        }
+        if let Some(root) = self.unified_root.get() {
+            if let Some(free_bytes) = statvfs_free(root) {
+                if free_bytes < MIN_FREE_BYTES {
+                    let need = MIN_FREE_BYTES - free_bytes;
+                    let extra = need.div_ceil(chunk_bytes);
+                    if extra > target {
+                        log::info!(
+                            target: super::purge::LOG_TARGET,
+                            "epoch {}: low disk free ({} MiB < {} MiB), targeting {} chunks",
+                            source,
+                            free_bytes / (1024 * 1024),
+                            MIN_FREE_BYTES / (1024 * 1024),
+                            extra
+                        );
+                    }
+                    target = target.max(extra);
+                }
+            }
+        }
+        if target == 0 {
+            return 0;
+        }
+        let evicted = self.purge_all_to_target(target);
+        log::info!(
+            target: super::purge::LOG_TARGET,
+            "epoch {}: purge target={} evicted={} (was {} chunks resident, high_water={}, low_water={})",
+            source,
+            target,
+            evicted,
+            total,
+            high_water,
+            low_water,
+        );
+        evicted
+    }
+
     /// Build a purge plan against the current histogram and dispatch it
     /// to every live registered target. Returns the total chunks
     /// evicted. Used by the watchdog and by tests.
@@ -916,47 +1006,7 @@ fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf, signal: Arc<(Mut
             continue;
         }
         last_purge_check = std::time::Instant::now();
-
-        let cap = state.cap_bytes();
-        if cap == 0 {
-            continue;
-        }
-        let chunk_bytes = CHUNK_VOXELS as u64;
-        let chunks_capacity = cap / chunk_bytes;
-        let high_water_chunks = chunks_capacity.saturating_mul(HIGH_WATER_PCT) / 100;
-        let low_water_chunks = chunks_capacity.saturating_mul(LOW_WATER_PCT) / 100;
-        let total = state.total_chunks();
-
-        let mut target_to_free: u64 = 0;
-        if total > high_water_chunks {
-            target_to_free = total - low_water_chunks;
-        }
-
-        if let Some(free_bytes) = statvfs_free(&unified_root) {
-            if free_bytes < MIN_FREE_BYTES {
-                let need_bytes = MIN_FREE_BYTES - free_bytes;
-                let extra_chunks = need_bytes.div_ceil(chunk_bytes);
-                target_to_free = target_to_free.max(extra_chunks);
-                log::info!(
-                    target: super::purge::LOG_TARGET,
-                    "epoch watchdog: low disk free ({} MiB < {} MiB), targeting {} chunks",
-                    free_bytes / (1024 * 1024),
-                    MIN_FREE_BYTES / (1024 * 1024),
-                    extra_chunks
-                );
-            }
-        }
-
-        if target_to_free > 0 {
-            let evicted = state.purge_all_to_target(target_to_free);
-            log::info!(
-                target: super::purge::LOG_TARGET,
-                "epoch watchdog: purge target={} evicted={} (was {} chunks resident)",
-                target_to_free,
-                evicted,
-                total
-            );
-        }
+        state.run_purge_pass("watchdog");
     }
 }
 
