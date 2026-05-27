@@ -374,17 +374,6 @@ impl ChunkCache {
         self.inner.epoch.clone()
     }
 
-    /// Stamp `(lod, shard)` as accessed at the current epoch. Called
-    /// from the volume hot path when its local shard slot is
-    /// (re)installed — the per-voxel reads that follow don't go
-    /// through `state_or_fetch`, so without this signal purge would
-    /// see chunks in this shard at their stale per-chunk access epoch.
-    /// O(1) per call (HashMap insert + atomic write).
-    pub fn touch_shard_access(&self, lod: u8, shard: ShardCoord) {
-        let current = self.inner.epoch.current();
-        self.inner.disk.mark_shard_accessed(lod, shard, current);
-    }
-
     /// Cheap state lookup without dispatching a fetch. Returns `None` if no
     /// entry exists for `key` yet. Useful for LOD-fallback paths that only
     /// want to render whatever is already resident.
@@ -583,11 +572,6 @@ impl Inner {
     /// Evict all Resident chunks whose access epoch falls into the
     /// `plan.is_victim` set. See `ChunkCache::purge_to_target` for the
     /// ordering rationale (bitmap demote first, then punch).
-    ///
-    /// A chunk is also spared if the per-shard access map says its
-    /// shard was recently touched by the volume hot path — that path
-    /// bypasses `state_or_fetch` (so per-chunk access doesn't fire)
-    /// and signals freshness at shard granularity instead.
     fn run_purge(&self, plan: PurgePlan) -> u64 {
         let sidecar = self.disk.sidecar();
         let current = self.epoch.current();
@@ -602,7 +586,6 @@ impl Inner {
             plan.freed_chunks,
         );
         let mut evicted: u64 = 0;
-        let mut shard_spared: u64 = 0;
 
         for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
             let lod = lod_idx as u8;
@@ -622,18 +605,6 @@ impl Inner {
                 let y = ((idx / nx) % ny) as u32;
                 let z = (idx / (nx * ny)) as u32;
                 let key = ChunkKey::new(lod, x, y, z);
-
-                // Shard-level freshness protection: if the volume hot
-                // path has touched this chunk's shard since the plan
-                // threshold age, skip this chunk.
-                if let Some((shard, _)) = self.disk.locate(key) {
-                    if let Some(sa) = self.disk.get_shard_access(lod, shard) {
-                        if !plan.is_victim(sa, current) {
-                            shard_spared += 1;
-                            continue;
-                        }
-                    }
-                }
 
                 // (1) Drop the in-memory Resident entry so new lookups
                 // take the slow path. Existing Arc holders keep their
@@ -670,10 +641,9 @@ impl Inner {
 
         log::info!(
             target: super::purge::LOG_TARGET,
-            "cache purge finished: volume={} evicted={} shard_spared={} total_remaining={}",
+            "cache purge finished: volume={} evicted={} total_remaining={}",
             volume_id,
             evicted,
-            shard_spared,
             self.epoch.total_chunks(),
         );
         evicted

@@ -179,15 +179,6 @@ struct LodSlot {
     /// read — voxel access goes through the cached `Arc<Mmap>` returned
     /// from `load` and never re-enters this map.
     opened: Mutex<HashMap<ShardCoord, LodFile>>,
-    /// In-memory per-shard "last touched" epoch byte. Updated from the
-    /// volume hot path (via `mark_shard_accessed`) when a shard slot is
-    /// (re)installed in the volume reader's local cache, so a shard
-    /// being actively read protects its chunks from purge even when the
-    /// per-voxel reads bypass `state_or_fetch` (and hence the per-chunk
-    /// access bump). Not persisted: on restart, chunks fall back to
-    /// their per-chunk access epochs alone. Cheap to populate (HashMap
-    /// + atomic store).
-    shard_access: Mutex<HashMap<ShardCoord, u8>>,
 }
 
 struct SyncInner {
@@ -289,7 +280,6 @@ impl DiskStore {
             .map(|d| LodSlot {
                 dims: *d,
                 opened: Mutex::new(HashMap::new()),
-                shard_access: Mutex::new(HashMap::new()),
             })
             .collect();
 
@@ -531,25 +521,6 @@ impl DiskStore {
         if let Some(r) = self.inner.resolve(key) {
             self.inner.sidecar.set_access_epoch(key.lod, r.sidecar_idx, epoch);
         }
-    }
-
-    /// Stamp this shard with `epoch` in the in-memory per-shard access
-    /// map. Called from the volume hot path when a shard slot is
-    /// installed in the local reader cache. No-op if `lod` is out of
-    /// range. Not persisted — see `LodSlot::shard_access`.
-    pub fn mark_shard_accessed(&self, lod: u8, shard: ShardCoord, epoch: u8) {
-        let Some(slot) = self.inner.lods.get(lod as usize) else {
-            return;
-        };
-        slot.shard_access.lock().unwrap().insert(shard, epoch);
-    }
-
-    /// Look up the in-memory per-shard access epoch for `(lod, shard)`.
-    /// `None` means we haven't seen this shard accessed since process
-    /// start (no protection signal — only per-chunk access counts).
-    pub fn get_shard_access(&self, lod: u8, shard: ShardCoord) -> Option<u8> {
-        let slot = self.inner.lods.get(lod as usize)?;
-        slot.shard_access.lock().unwrap().get(&shard).copied()
     }
 
     /// Punch a hole in the matching shard file at `key`'s slot, freeing
