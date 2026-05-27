@@ -377,6 +377,36 @@ impl Sidecar {
     pub fn set_access_epoch(&self, lod: u8, idx: u64, epoch: u8) {
         self.access_epochs[lod as usize][idx as usize].store(epoch, Ordering::Relaxed);
     }
+
+    /// CAS the access-epoch byte at `(lod, idx)` from `current` to `new`.
+    /// Returns `Ok(current)` on success or `Err(observed)` on failure so
+    /// the caller can decide whether to retry or bail.
+    ///
+    /// Used by `touch_access` to arbitrate concurrent LRU bumps: only the
+    /// thread whose CAS wins is allowed to adjust the epoch histogram, so
+    /// N concurrent touchers on the same slot produce exactly one bucket
+    /// transition instead of N. Relaxed ordering matches the rest of the
+    /// access-epoch column — it's pure LRU bookkeeping, no read of other
+    /// state piggybacks on this. Bumps the pending counter on success so
+    /// the watchdog persists the new tag.
+    pub fn compare_exchange_access_epoch(
+        &self,
+        lod: u8,
+        idx: u64,
+        current: u8,
+        new: u8,
+    ) -> Result<u8, u8> {
+        let res = self.access_epochs[lod as usize][idx as usize].compare_exchange(
+            current,
+            new,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        if res.is_ok() && current != new {
+            self.pending[lod as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        res
+    }
 }
 
 pub struct Snapshot {

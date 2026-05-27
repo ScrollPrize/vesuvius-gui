@@ -545,6 +545,14 @@ impl EpochState {
     /// Account for an access to a chunk currently tagged with `old_epoch`.
     /// Returns the current epoch; if it differs from `old_epoch`, the
     /// caller should write it into the access-epoch column.
+    ///
+    /// Race note: this method is not safe against concurrent calls on the
+    /// same slot — N racing touches with the same `old_epoch` produce N
+    /// histogram transitions instead of 1. Prefer
+    /// [`record_access_transition`] in combination with
+    /// [`Sidecar::compare_exchange_access_epoch`] for runtime touches
+    /// where multiple paint threads can race on the same chunk. This
+    /// method is retained for tests and single-threaded paths.
     pub fn record_access(&self, old_epoch: u8) -> u8 {
         let mut s = self.inner.lock().unwrap();
         let cur = s.current;
@@ -556,6 +564,27 @@ impl EpochState {
             s.epoch_chunks[cur as usize] = s.epoch_chunks[cur as usize].saturating_add(1);
         }
         cur
+    }
+
+    /// Record an already-committed histogram transition from bucket
+    /// `from` to bucket `to`. Pure bookkeeping: decrements `from` (if
+    /// non-zero), increments `to`. No-op when `from == to`.
+    ///
+    /// Caller contract: the caller must have already won a CAS on the
+    /// access-epoch byte (`from → to`) before calling this. The CAS is
+    /// what guarantees exactly-one caller wins per transition; this
+    /// method just reflects that into the histogram. Does NOT advance
+    /// epoch or change `total_chunks`.
+    pub fn record_access_transition(&self, from: u8, to: u8) {
+        if from == to {
+            return;
+        }
+        let mut s = self.inner.lock().unwrap();
+        let cnt = s.epoch_chunks[from as usize];
+        if cnt > 0 {
+            s.epoch_chunks[from as usize] = cnt - 1;
+        }
+        s.epoch_chunks[to as usize] = s.epoch_chunks[to as usize].saturating_add(1);
     }
 
     /// Add one volume's residency contribution to the global histogram
@@ -1310,6 +1339,105 @@ mod tests {
         let evicted = state.purge_offline_volumes(plan, &unified);
         assert_eq!(evicted, 0);
         std::fs::remove_dir_all(&unified).ok();
+    }
+
+    /// Stress test for the CAS-arbitrated touch protocol: N threads race
+    /// to bump the same slot's access epoch. Invariant: regardless of
+    /// thread interleaving, the histogram shows exactly one chunk in the
+    /// destination bucket and zero in any intermediate bucket — N racing
+    /// touches must NOT inflate the destination by N.
+    ///
+    /// Without the CAS gating, every thread reads `old`, every thread
+    /// calls `record_access(old)`, and each call moves the histogram by
+    /// 1 — leaving the destination bucket at N. With the CAS gating,
+    /// only the winning thread reaches `record_access_transition`, so
+    /// the move is at most 1 regardless of N.
+    ///
+    /// `#[ignore]`'d for the same reason as the disk-side race test:
+    /// brief CPU saturation can starve other timing-sensitive tests in
+    /// the same `cargo test` parallel run. Run with:
+    ///   cargo test -p vesuvius-rs --lib cache::epoch::tests::cas_arbitrated_touch -- --ignored
+    #[test]
+    #[ignore]
+    fn cas_arbitrated_touch_no_histogram_drift() {
+        use super::super::sidecar::{Header, Sidecar, STATE_RESIDENT};
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::sync::Arc;
+
+        const N_THREADS: usize = 16;
+        const N_SWEEPS: usize = 200;
+        // One LOD with a small slot count; we'll race on slot 0.
+        let header = Header::new("v-touch-race".into(), [256, 256, 256], 0);
+        let sidecar = Arc::new(Sidecar::empty(header));
+        sidecar.set_state(0, 0, STATE_RESIDENT);
+
+        let epoch = Arc::new(EpochState::new(1 << 30));
+        let source_epoch = epoch.current();
+        sidecar.set_access_epoch(0, 0, source_epoch);
+        // Seed the histogram with one chunk in the source bucket
+        // (matches the sidecar tag). add_from_sidecar would do this but
+        // we want precise control.
+        {
+            let mut s = epoch.inner.lock().unwrap();
+            s.epoch_chunks[source_epoch as usize] = 1;
+            s.total_chunks = 1;
+        }
+        // Move `current` forward so racing threads have something to
+        // CAS toward.
+        epoch.force_advance(42);
+        let target_epoch = epoch.current();
+        assert_ne!(target_epoch, source_epoch);
+
+        let start = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..N_THREADS {
+            let sidecar = sidecar.clone();
+            let epoch = epoch.clone();
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                while !start.load(O::Relaxed) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..N_SWEEPS {
+                    let current = epoch.current();
+                    let old = sidecar.get_access_epoch(0, 0);
+                    if old == current {
+                        continue;
+                    }
+                    if sidecar
+                        .compare_exchange_access_epoch(0, 0, old, current)
+                        .is_ok()
+                    {
+                        epoch.record_access_transition(old, current);
+                    }
+                }
+            }));
+        }
+        start.store(true, O::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let h = epoch.epoch_chunks();
+        assert_eq!(
+            h[target_epoch as usize], 1,
+            "expected exactly 1 chunk in bucket {} after race, got {}",
+            target_epoch, h[target_epoch as usize]
+        );
+        assert_eq!(
+            h[source_epoch as usize], 0,
+            "expected 0 chunks in source bucket {} after race, got {}",
+            source_epoch, h[source_epoch as usize]
+        );
+        // No transient bumps allowed in unrelated buckets.
+        let total: u64 = h.iter().map(|&v| v as u64).sum();
+        assert_eq!(total, 1, "expected total histogram count of 1, got {}", total);
+        assert_eq!(epoch.total_chunks(), 1, "total_chunks should not change on touch");
+        assert_eq!(
+            sidecar.get_access_epoch(0, 0),
+            target_epoch,
+            "sidecar tag should reach the target epoch"
+        );
     }
 
     #[test]

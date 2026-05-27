@@ -597,6 +597,22 @@ impl DiskStore {
         }
     }
 
+    /// CAS the access-epoch tag for `key` from `current` to `new`. Returns
+    /// `None` if the key is out of bounds; otherwise the CAS result.
+    ///
+    /// `touch_access` uses this to arbitrate concurrent LRU bumps: the
+    /// winning CAS is the only thread that should adjust the histogram
+    /// (otherwise N racing touches inflate the destination bucket by N
+    /// and decrement the source bucket by N, instead of by 1).
+    pub fn cas_access_epoch(&self, key: ChunkKey, current: u8, new: u8) -> Option<Result<u8, u8>> {
+        let r = self.inner.resolve(key)?;
+        Some(
+            self.inner
+                .sidecar
+                .compare_exchange_access_epoch(key.lod, r.sidecar_idx, current, new),
+        )
+    }
+
     /// Punch a hole in the matching shard file at `key`'s slot, freeing
     /// the underlying physical blocks. The shard file's logical size is
     /// unchanged (sparse file). Returns `Ok(false)` if the shard isn't

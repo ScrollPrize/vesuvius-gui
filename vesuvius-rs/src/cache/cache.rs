@@ -448,14 +448,25 @@ impl ChunkCache {
     /// chunk in the rendering region and calls `state_or_fetch` →
     /// `touch_access` before the inner loop runs, so every Resident
     /// chunk the renderer draws gets its access-epoch bumped per paint.
+    ///
+    /// Race protocol: read `old`, read `current`, attempt CAS(old →
+    /// current) on the sidecar byte. Only the winning thread updates the
+    /// histogram via `record_access_transition`. Losers either see the
+    /// tag already at `current` (someone else won — done) or see it at
+    /// some other value (epoch advanced again mid-flight — bail; the
+    /// next paint frame will pick it up). Single-shot, no retry loop:
+    /// `touch_access` is called per-chunk per-paint, so the retry
+    /// budget is effectively the paint loop itself.
     fn touch_access(&self, key: ChunkKey) {
         let current = self.inner.epoch.current();
         let Some(old) = self.inner.disk.get_access_epoch(key) else {
             return;
         };
-        if old != current {
-            let now = self.inner.epoch.record_access(old);
-            self.inner.disk.set_access_epoch(key, now);
+        if old == current {
+            return;
+        }
+        if let Some(Ok(_)) = self.inner.disk.cas_access_epoch(key, old, current) {
+            self.inner.epoch.record_access_transition(old, current);
         }
     }
 
