@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
-use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, ChunkKey, ChunkState};
+use vesuvius_rs::cache::{ChunkBackfiller, ChunkKey, ChunkState, UnifiedCache};
 use vesuvius_zarr::OmeZarrContext;
 
 const DEFAULT_ROOT: &str =
@@ -76,7 +76,7 @@ fn main() {
     let max_lod = backfiller.max_lod();
     println!("extent_xyz={:?} max_lod={}", extent, max_lod);
 
-    let cache = ChunkCache::new(cache_dir.clone(), backfiller);
+    let cache = UnifiedCache::for_cache_dir(cache_dir.clone()).open_volume(backfiller);
 
     // 4×4×4 cache chunks at LOD 0 around a known-good voxel in the
     // companion `read_c3d_remote.rs` example: (z=20500, y=12320, x=12330).
@@ -106,8 +106,8 @@ fn main() {
         for k in &keys {
             let s = cache.state_or_fetch(*k);
             match s.as_ref() {
-                ChunkState::Resident(_) => resident += 1,
-                ChunkState::Pending => pending += 1,
+                ChunkState::Resident { .. } => resident += 1,
+                ChunkState::Pending { .. } => pending += 1,
                 ChunkState::CooldownMiss { .. } => cooldown += 1,
                 ChunkState::Empty => empty += 1,
                 ChunkState::Missing => {}

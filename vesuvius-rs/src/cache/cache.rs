@@ -50,9 +50,9 @@ use super::state::{ChunkKey, ChunkState};
 use super::{CHUNK_VOXELS, MAX_AGE};
 use dashmap::DashMap;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 const COOLDOWN: Duration = Duration::from_secs(10);
@@ -219,23 +219,131 @@ enum SatisfyResult {
     QueueFullOnExtract,
 }
 
+/// Process-wide handle to one unified cache root (`<cache_dir>/unified/`).
+///
+/// This is the first-class entry point for the cache subsystem: app
+/// startup gets-or-creates a `UnifiedCache` for the cache directory, and
+/// every `ChunkCache` opened against that directory is reachable from
+/// it. The same `UnifiedCache` owns:
+///
+///   * the cache-wide `EpochState` (shared across every volume under
+///     this root — drives LRU bookkeeping, purge plans, watchdog),
+///   * a registry of live per-volume `ChunkCache` `Inner`s so duplicate
+///     opens for the same volume collapse to a single instance instead
+///     of racing two sidecars / two purge targets / two sync threads
+///     against one on-disk directory.
+///
+/// Singleton per unified root: `for_cache_dir(d)` and
+/// `for_unified_root(d/unified)` always return clones of the same
+/// `Arc<UnifiedCache>` within a process.
+pub struct UnifiedCache {
+    unified_root: PathBuf,
+    epoch: Arc<EpochState>,
+    /// Per-volume `Inner` registry, keyed by `backfiller.volume_id()`.
+    /// `Weak` so external drop of every `ChunkCache` for a volume
+    /// allows reclamation; in practice the per-cache worker threads +
+    /// PurgeTarget registration keep the strong count > 0 for the
+    /// process lifetime, which is the intended production behavior.
+    volumes: Mutex<HashMap<String, Weak<Inner>>>,
+}
+
+fn unified_registry() -> &'static Mutex<HashMap<PathBuf, Arc<UnifiedCache>>> {
+    static R: OnceLock<Mutex<HashMap<PathBuf, Arc<UnifiedCache>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl UnifiedCache {
+    /// Resolve the cache directory passed by app config into a
+    /// `UnifiedCache`. `cache_root` is the parent of the `unified/`
+    /// subdir (the same argument that gets passed to
+    /// `ChunkCache::new`).
+    pub fn for_cache_dir(cache_root: impl AsRef<Path>) -> Arc<Self> {
+        let unified_root = cache_root.as_ref().join("unified");
+        let _ = std::fs::create_dir_all(&unified_root);
+        Self::for_unified_root(unified_root)
+    }
+
+    /// Resolve a `unified/` directory directly. Most callers want
+    /// `for_cache_dir`; this is the lower-level entry point for code
+    /// that already holds the unified path (the epoch watchdog, the
+    /// offline purge sweep).
+    pub fn for_unified_root(unified_root: impl AsRef<Path>) -> Arc<Self> {
+        let path = unified_root.as_ref();
+        // Canonicalize so two callers that pass equivalent-but-differing
+        // path strings (relative vs absolute, symlinks) still collapse.
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut reg = unified_registry().lock().unwrap();
+        if let Some(c) = reg.get(&key) {
+            return c.clone();
+        }
+        // EpochState construction has its own registry inside `epoch`;
+        // its singleton is what we expose via `epoch_state()`. The two
+        // registries collapse on the same canonicalized root, so a
+        // caller routing through either entry point sees identical
+        // state.
+        let epoch = epoch::shared_for_unified_root(&key, epoch::cap_bytes_from_env());
+        let unified = Arc::new(UnifiedCache {
+            unified_root: key.clone(),
+            epoch,
+            volumes: Mutex::new(HashMap::new()),
+        });
+        reg.insert(key, unified.clone());
+        unified
+    }
+
+    pub fn unified_root(&self) -> &Path {
+        &self.unified_root
+    }
+
+    /// The cache-wide LRU bookkeeping (epoch counter, residency
+    /// histogram, purge target registry). Use this for stats
+    /// dashboards or to register custom purge logic.
+    pub fn epoch_state(&self) -> &Arc<EpochState> {
+        &self.epoch
+    }
+
+    /// Get-or-create the `ChunkCache` for one volume under this
+    /// unified root. The second call for the same `volume_id` reuses
+    /// the same in-memory `Inner` (and therefore the same workers,
+    /// sidecar, and purge target) — duplicate opens during a volume
+    /// switch are coalesced rather than racing.
+    pub fn open_volume(&self, backfiller: Arc<dyn ChunkBackfiller>) -> ChunkCache {
+        let volume_id = backfiller.volume_id();
+        let mut volumes = self.volumes.lock().unwrap();
+        volumes.retain(|_, w| w.strong_count() > 0);
+        if let Some(w) = volumes.get(&volume_id) {
+            if let Some(inner) = w.upgrade() {
+                log::debug!(
+                    target: super::purge::LOG_TARGET,
+                    "UnifiedCache reuse: volume={} root={}",
+                    volume_id,
+                    self.unified_root.display(),
+                );
+                return ChunkCache { inner };
+            }
+        }
+        let chunks_root = self.unified_root.join(&volume_id);
+        let _ = std::fs::create_dir_all(&chunks_root);
+        let inner = ChunkCache::build_inner(
+            chunks_root,
+            backfiller,
+            DEFAULT_WORKERS,
+            Arc::new(Downloader::new()),
+            self.epoch.clone(),
+        );
+        volumes.insert(volume_id, Arc::downgrade(&inner));
+        ChunkCache { inner }
+    }
+}
+
 impl ChunkCache {
-    pub fn new(cache_root: impl Into<PathBuf>, backfiller: Arc<dyn ChunkBackfiller>) -> Self {
-        let root = cache_root.into().join("unified").join(backfiller.volume_id());
-        let _ = std::fs::create_dir_all(&root);
-        Self::new_at(root, backfiller, DEFAULT_WORKERS)
-    }
-
-    pub fn new_at(root: PathBuf, backfiller: Arc<dyn ChunkBackfiller>, workers: usize) -> Self {
-        Self::new_with_downloader(root, backfiller, workers, Arc::new(Downloader::new()))
-    }
-
-    pub fn new_with_downloader(
+    fn build_inner(
         root: PathBuf,
         backfiller: Arc<dyn ChunkBackfiller>,
         workers: usize,
         downloader: Arc<Downloader>,
-    ) -> Self {
+        epoch: Arc<EpochState>,
+    ) -> Arc<Inner> {
         let task_queue = TaskQueue::new(MAX_AGE);
         let spill_root = root.join("spill");
         let chunks_root = root;
@@ -244,15 +352,6 @@ impl ChunkCache {
         let volume_id = backfiller.volume_id();
         let extent = backfiller.voxel_extent();
         let max_lod = backfiller.max_lod();
-
-        // The unified root holds the cache-wide EpochState. Conventionally
-        // it's the parent of the per-volume chunks_root (see `new` →
-        // `cache_dir/unified/<volume_id>`); for callers that construct a
-        // ChunkCache via `new_at` with an unusual layout we fall back to
-        // chunks_root itself, which keeps the state per-volume rather
-        // than cache-wide. That's a degraded mode but still correct.
-        let unified_root = chunks_root.parent().unwrap_or(&chunks_root).to_path_buf();
-        let epoch = epoch::shared_for_unified_root(&unified_root, epoch::cap_bytes_from_env());
 
         let disk = DiskStore::new(chunks_root, volume_id, extent, max_lod);
         // Accumulate this volume's residency into the global histogram.
@@ -265,10 +364,6 @@ impl ChunkCache {
         // zero residency, but still records the volume_id so future
         // calls remain idempotent.
         epoch.add_from_sidecar(&disk.sidecar());
-        // Cache-wide stats are logged once in `shared_for_unified_root`
-        // after the disk scan completes — no per-volume stats line here
-        // (the numbers would be global but the volume= label was
-        // misleading).
 
         let inner = Arc::new(Inner {
             map: DashMap::new(),
@@ -300,7 +395,7 @@ impl ChunkCache {
         let target: Arc<dyn PurgeTarget> = inner.clone();
         inner.epoch.register_target(Arc::downgrade(&target));
 
-        Self { inner }
+        inner
     }
 
     pub fn voxel(&self, x: u32, y: u32, z: u32, lod: u8) -> u8 {
@@ -327,9 +422,11 @@ impl ChunkCache {
 
     /// Bump `key`'s access-epoch tag to the current cache epoch. Cheap
     /// no-op when the tag already matches (two atomic loads + a compare,
-    /// no histogram update). TODO: the volume hot path uses `peek_shard`
-    /// and never enters here; integrate access tracking at the shard
-    /// level (or at frame boundaries) to cover the inner-loop reads.
+    /// no histogram update). The per-voxel `get()` reads bypass this
+    /// (they peek the mmap directly), but `touch_aabb` walks every
+    /// chunk in the rendering region and calls `state_or_fetch` →
+    /// `touch_access` before the inner loop runs, so every Resident
+    /// chunk the renderer draws gets its access-epoch bumped per paint.
     fn touch_access(&self, key: ChunkKey) {
         let current = self.inner.epoch.current();
         let Some(old) = self.inner.disk.get_access_epoch(key) else {

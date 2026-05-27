@@ -675,7 +675,7 @@ pub fn epoch_state_path(unified_root: &Path) -> PathBuf {
 /// env / default is the source of truth, the file is just a snapshot.
 /// Subsequent calls within the same process return the existing `Arc`
 /// and ignore `cap_bytes` (no resize-while-running).
-pub fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<EpochState> {
+pub(crate) fn shared_for_unified_root(unified_root: &Path, cap_bytes: u64) -> Arc<EpochState> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<EpochState>>>> = OnceLock::new();
     let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = reg.lock().unwrap();

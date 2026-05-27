@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vesuvius_rs::cache::backfillers::synthetic::SyntheticBackfiller;
-use vesuvius_rs::cache::{ChunkCache, ChunkKey, UnifiedVolume, CHUNK_SIDE};
+use vesuvius_rs::cache::{ChunkKey, UnifiedCache, UnifiedVolume, CHUNK_SIDE};
 use vesuvius_rs::volume::{Volume, VoxelVolume};
 
 fn env_usize(k: &str, default: usize) -> usize {
@@ -68,7 +68,7 @@ fn main() {
     ));
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cache = ChunkCache::new(tmp.path(), backfiller);
+    let cache = UnifiedCache::for_cache_dir(tmp.path()).open_volume(backfiller);
 
     // Pre-warm: dispatch all chunks first (so worker threads can fan out),
     // then wait_for each one. With max_lod=0 there's only one LOD.

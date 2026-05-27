@@ -22,7 +22,7 @@ use vesuvius_rs::catalog::Catalog;
 use vesuvius_rs::catalog::Segment;
 use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
 use vesuvius_rs::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
-use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, UnifiedVolume};
+use vesuvius_rs::cache::{ChunkBackfiller, UnifiedCache, UnifiedVolume};
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
 use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext, ZarrArray};
@@ -384,7 +384,7 @@ impl TemplateApp {
                     let native: Arc<dyn ChunkBackfiller> =
                         Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
                     let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
-                    let cache = ChunkCache::new(cache_root, backfiller);
+                    let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
                     UnifiedVolume::new(cache).into_volume()
                 } else if segment_file.starts_with("http") {
                     log::info!("Loading zarr overlay from url: {}", segment_file);

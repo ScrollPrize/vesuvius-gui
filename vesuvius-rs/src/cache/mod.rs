@@ -29,7 +29,7 @@ pub mod backfillers;
 mod tests;
 
 pub use backfiller::{BackfillError, BackfillPlan, ChunkBackfiller, SourceOutcome, SourcePayload, SourceSpec};
-pub use cache::ChunkCache;
+pub use cache::{ChunkCache, UnifiedCache};
 pub use disk::{ChunkBitState, ChunkStateBits, ShardCoord, ShardSnapshot};
 pub use downloader::{DownloadError, Downloader};
 pub use state::{ChunkKey, ChunkState};

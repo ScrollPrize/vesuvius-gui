@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
-use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, ChunkKey, ChunkState};
+use vesuvius_rs::cache::{ChunkBackfiller, ChunkKey, ChunkState, UnifiedCache};
 use vesuvius_zarr::{default_cache_dir_for_url, OmeZarrContext};
 
 const URL: &str = "https://volumes.aws.ash2txt.org/dls/remasked/PHercParis4-20230205180739_masked.zarr";
@@ -32,7 +32,7 @@ fn main() {
     println!("extent_xyz={:?} max_lod={}", extent, max_lod);
 
     let cache_root = std::path::PathBuf::from(default_cache_dir_for_url(URL));
-    let cache = ChunkCache::new(cache_root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
 
     // Burst-request a 4×4×4 grid of cache chunks at LOD 2 centred in the
     // volume. With the bounded task queue (size 4), most of these dispatches
@@ -65,7 +65,7 @@ fn main() {
             match s.as_ref() {
                 ChunkState::Resident { .. } => resident += 1,
                 ChunkState::Empty => empty += 1,
-                ChunkState::Pending => pending += 1,
+                ChunkState::Pending { .. } => pending += 1,
                 ChunkState::CooldownMiss { .. } => cooldown += 1,
                 ChunkState::Missing => {}
             }

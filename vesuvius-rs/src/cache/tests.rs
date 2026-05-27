@@ -27,7 +27,7 @@ fn miss_then_fetch_then_resident() {
     let backfiller = Arc::new(SyntheticBackfiller::new("test", [128, 128, 128], 0, |x, y, z, _| {
         (x ^ y ^ z) as u8
     }));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
 
     let key = ChunkKey::new(0, 0, 0, 0);
     // First touch returns Pending (or already Resident if the worker is
@@ -99,7 +99,7 @@ fn all_absent_sources_transition_to_empty_and_persist() {
         extent: [128, 128, 128],
         fetch_count: counter.clone(),
     });
-    let cache = ChunkCache::new(&root, backfiller.clone());
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller.clone());
 
     let key = ChunkKey::new(0, 0, 0, 0);
     let state = cache.wait_for(key, Duration::from_secs(2));
@@ -121,7 +121,7 @@ fn all_absent_sources_transition_to_empty_and_persist() {
         extent: [128, 128, 128],
         fetch_count: counter.clone(),
     });
-    let cache2 = ChunkCache::new(&root, backfiller2);
+    let cache2 = UnifiedCache::for_cache_dir(&root).open_volume(backfiller2);
     let state2 = cache2.state_or_fetch(key);
     assert!(matches!(state2.as_ref(), ChunkState::Empty), "expected Empty on reload, got {:?}", state2);
     assert_eq!(
@@ -222,7 +222,7 @@ fn extract_writes_sibling_chunks_so_subsequent_dispatches_skip_fetch() {
         fetch_count: fetch_counter.clone(),
         extract_count: extract_counter.clone(),
     });
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
 
     // Dispatch ONE primary chunk and wait for it to land.
     let primary = ChunkKey::new(0, 0, 0, 0);
@@ -276,7 +276,7 @@ fn extract_writes_sibling_chunks_so_subsequent_dispatches_skip_fetch() {
 fn out_of_bounds_short_circuits() {
     let root = tmp_root("oob");
     let backfiller = Arc::new(SyntheticBackfiller::new("test", [64, 64, 64], 0, |_, _, _, _| 7));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
 
     // (chunk_x=2) at LOD 0 covers voxels 128..192 — past the extent.
     let key = ChunkKey::new(0, 2, 0, 0);
@@ -291,7 +291,7 @@ fn paint_renders_synthetic_pattern() {
     let backfiller = Arc::new(SyntheticBackfiller::new("test", [128, 128, 128], 0, |x, _, _, _| {
         (x & 0xff) as u8
     }));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
     let volume = UnifiedVolume::new(cache.clone());
 
     // Warm: explicitly wait for the chunk we'll paint from.
@@ -321,7 +321,7 @@ fn paint_no_gaps_with_pzoom_misaligned_at_chunk_edge() {
     // dropped because u_px_hi used floor.
     let root = tmp_root("paint-gridlines");
     let backfiller = Arc::new(SyntheticBackfiller::new("test", [512, 512, 512], 2, |_, _, _, _| 0xab));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
     let volume = UnifiedVolume::new(cache.clone());
 
     for cx in 0..3 {
@@ -353,7 +353,7 @@ fn paint_no_gaps_at_higher_lod() {
         // Pattern: constant non-zero so any "skipped" pixel stands out.
         |_, _, _, _| 0x42,
     ));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
     let volume = UnifiedVolume::new(cache.clone());
 
     for cx in 0..2 {
@@ -410,7 +410,7 @@ fn paint_falls_back_to_coarser_lod_when_target_missing() {
 
     let root = tmp_root("paint-lod-fallback");
     let backfiller = Arc::new(LodGated { extent: [256, 256, 256], max_lod: 2 });
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
     let volume = UnifiedVolume::new(cache.clone());
 
     // Pre-warm the LOD-1 chunk covering the viewport.
@@ -461,7 +461,7 @@ fn get_falls_back_to_coarser_lod_when_target_missing() {
     }
 
     let root = tmp_root("get-lod-fallback");
-    let cache = ChunkCache::new(&root, Arc::new(LodGated));
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(Arc::new(LodGated));
     let volume = UnifiedVolume::new(cache.clone());
 
     // No manual pre-warm: `get()` itself must kick the coarser-LOD fetch.
@@ -521,7 +521,7 @@ fn get_uses_downsampled_xyz_convention_at_sfactor_gt_1() {
     }
 
     let root = tmp_root("get-coord-convention");
-    let cache = ChunkCache::new(&root, Arc::new(PositionMarked));
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(Arc::new(PositionMarked));
     let volume = UnifiedVolume::new(cache.clone());
 
     // sfactor=2 → target_lod=1. xyz=[200, 5, 5] is in LOD-1 coords:
@@ -584,7 +584,7 @@ fn synth_lod_one_level_above_native_averages_children() {
     let root = tmp_root("synth-l1");
     let inner: Arc<dyn ChunkBackfiller> = Arc::new(PerChunkConst);
     let synth = Arc::new(SynthesizedLodBackfiller::with_extra_levels(inner, 1));
-    let cache = ChunkCache::new(&root, synth);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(synth);
     assert_eq!(cache.max_lod(), 1);
 
     let state = cache.wait_for(ChunkKey::new(1, 0, 0, 0), Duration::from_secs(5));
@@ -642,7 +642,7 @@ fn synth_lod_two_levels_above_native_recurses() {
     let root = tmp_root("synth-l2");
     let inner: Arc<dyn ChunkBackfiller> = Arc::new(Const(123));
     let synth = Arc::new(SynthesizedLodBackfiller::with_extra_levels(inner, 2));
-    let cache = ChunkCache::new(&root, synth);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(synth);
     assert_eq!(cache.max_lod(), 2);
 
     let state = cache.wait_for(ChunkKey::new(2, 0, 0, 0), Duration::from_secs(10));
@@ -686,7 +686,7 @@ fn unified_volume_renders_at_target_lod_above_native_max() {
     let root = tmp_root("synth-volume-get");
     let inner: Arc<dyn ChunkBackfiller> = Arc::new(Const(200));
     let synth = Arc::new(SynthesizedLodBackfiller::with_extra_levels(inner, 1));
-    let cache = ChunkCache::new(&root, synth);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(synth);
     let volume = UnifiedVolume::new(cache.clone());
 
     // sfactor=2 → target_lod=1, which is exactly cache.max_lod(). xyz is in
@@ -727,7 +727,7 @@ fn synth_gate_disables_when_source_has_too_many_native_chunks() {
     let root = tmp_root("synth-gate-off");
     let inner: Arc<dyn ChunkBackfiller> = Arc::new(WideSingleLod);
     let synth = Arc::new(SynthesizedLodBackfiller::new(inner, 32));
-    let cache = ChunkCache::new(&root, synth);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(synth);
     assert_eq!(cache.max_lod(), 0, "budget exceeded → no synth levels added");
 
     // LOD 1 is genuinely out of bounds when synth is disabled — the cache's
@@ -778,7 +778,7 @@ fn synth_gate_enables_when_source_is_pyramidal_enough() {
     let root = tmp_root("synth-gate-on");
     let inner: Arc<dyn ChunkBackfiller> = Arc::new(SmallPyramid);
     let synth = Arc::new(SynthesizedLodBackfiller::new(inner, 32));
-    let cache = ChunkCache::new(&root, synth);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(synth);
     assert_eq!(cache.max_lod(), 4, "8 native chunks ≤ 32 → 1 synth level added");
 
     let state = cache.wait_for(ChunkKey::new(4, 0, 0, 0), Duration::from_secs(5));
@@ -800,7 +800,7 @@ fn get_interpolated_blends_corners_within_a_chunk() {
         0,
         |x, _, _, _| (x & 0xff) as u8,
     ));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
     let volume = UnifiedVolume::new(cache.clone());
     cache.wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(2));
 
@@ -833,7 +833,7 @@ fn get_interpolated_crosses_chunk_boundary() {
         0,
         |x, _, _, _| (x & 0xff) as u8,
     ));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
     let volume = UnifiedVolume::new(cache.clone());
     cache.wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(2));
     cache.wait_for(ChunkKey::new(0, 1, 0, 0), Duration::from_secs(2));
@@ -899,7 +899,7 @@ fn get_interpolated_at_coarser_lod_blends_distinct_coarse_voxels() {
     }
 
     let root = tmp_root("interp-coarse-blend");
-    let cache = ChunkCache::new(&root, Arc::new(LodGated));
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(Arc::new(LodGated));
     let volume = UnifiedVolume::new(cache.clone());
     cache.wait_for(ChunkKey::new(1, 0, 0, 0), Duration::from_secs(2));
 
@@ -961,7 +961,7 @@ fn get_interpolated_walks_lod_pyramid_when_target_missing() {
     }
 
     let root = tmp_root("interp-lod-fallback");
-    let cache = ChunkCache::new(&root, Arc::new(LodGated));
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(Arc::new(LodGated));
     let volume = UnifiedVolume::new(cache.clone());
 
     // Spin until LOD-1 fallback resolves (no explicit pre-warm — the get
@@ -1002,7 +1002,7 @@ fn max_along_normal_matches_naive_baseline() {
             (h >> 24) as u8
         },
     ));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
 
     // Pre-warm all the chunks the rays below touch.
     for cz in 0..4 {
@@ -1074,7 +1074,7 @@ fn second_open_picks_up_disk_cache() {
 
     {
         let backfiller = Arc::new(SyntheticBackfiller::new("vol", [64, 64, 64], 0, |_, _, _, _| 42));
-        let cache = ChunkCache::new(&root, backfiller);
+        let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
         cache.wait_for(key, Duration::from_secs(2));
         assert_eq!(cache.voxel(0, 0, 0, 0), 42);
         cache.flush();
@@ -1082,7 +1082,7 @@ fn second_open_picks_up_disk_cache() {
 
     // New cache, same volume_id + root → should hit the disk without a fetch.
     let backfiller = Arc::new(SyntheticBackfiller::new("vol", [64, 64, 64], 0, |_, _, _, _| 99));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
     let state = cache.state_or_fetch(key);
     // It should already be resident from disk (no worker dispatch).
     assert!(state.as_resident().is_some());
@@ -1106,7 +1106,7 @@ fn purge_evicts_oldest_and_preserves_survivors() {
         0,
         |x, y, z, _| ((x as u32 ^ y as u32 ^ z as u32) & 0xff) as u8,
     ));
-    let cache = ChunkCache::new(&root, backfiller);
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume(backfiller);
 
     // Fill all four chunks (chunk_x = 0..4, chunk_y/z = 0).
     let keys: Vec<ChunkKey> = (0..4).map(|cx| ChunkKey::new(0, cx, 0, 0)).collect();

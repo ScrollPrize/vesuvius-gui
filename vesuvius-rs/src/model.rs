@@ -1,7 +1,7 @@
 use crate::{
     cache::{
         backfillers::ome_zarr::OmeZarrBackfiller, backfillers::synthesized_lod::SynthesizedLodBackfiller,
-        ChunkBackfiller, ChunkCache, UnifiedVolume,
+        ChunkBackfiller, UnifiedCache, UnifiedVolume,
     },
     downloader::SimpleDownloader,
     volume::{LayersMappedVolume, Volume, VolumeGrid500Mapped, VolumeGrid64x4Mapped, VoxelPaintVolume},
@@ -317,7 +317,7 @@ impl NewVolumeReference {
                 // Use the single process-global cache base so every
                 // zarr store ends up under one `<base>/unified/` dir
                 // and shares one epoch counter / purge plan.
-                // ChunkCache::new appends `/unified/<volume_id>` so we
+                // UnifiedCache::for_cache_dir appends `/unified/` so we
                 // pass the base, not the unified subdir directly.
                 let cache_root = base_cache_dir();
                 // Embed the source's sha256 into the on-disk volume
@@ -334,7 +334,7 @@ impl NewVolumeReference {
                 let native: Arc<dyn ChunkBackfiller> =
                     Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
                 let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
-                let cache = ChunkCache::new(cache_root, backfiller);
+                let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
                 UnifiedVolume::new(cache).into_volume()
             }
             NewVolumeReference::Zarr { location, .. } => match location {
