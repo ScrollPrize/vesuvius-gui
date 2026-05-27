@@ -6,11 +6,25 @@
 //! count, and per-LOD dimensions so the offset math can be reconstructed on
 //! reopen.
 //!
-//! In memory each LOD's bytes are wrapped in a `Vec<AtomicU8>`; transitions
-//! are single-producer (the dispatch claim in `cache.rs` guarantees one
-//! writer per chunk), so a plain `store(Release)` is sufficient — no CAS.
+//! The sidecar file is `mmap(MAP_SHARED, PROT_READ|PROT_WRITE)`'d once at
+//! open. State transitions write directly into the mapping via atomic
+//! byte ops; the kernel's writeback flushes dirty pages on its own
+//! schedule (typically every few seconds), so even an externally killed
+//! process (`SIGKILL`) leaves a mostly-up-to-date sidecar on disk. The
+//! periodic `do_sync` watchdog still fsyncs the data files for crash
+//! ordering and calls `msync` to bound the dirty window, and the on-exit
+//! `UnifiedCache::shutdown` path calls `flush()` to force a synchronous
+//! msync before the process leaves.
+//!
+//! On-disk layout (unchanged from the previous Vec-backed format, so
+//! existing caches load without migration): `header_bytes | bitmap LOD 0
+//! | bitmap LOD 1 | … | access_epoch LOD 0 | access_epoch LOD 1 | …`.
+//! Each per-LOD column is `nx * ny * nz` contiguous bytes.
 
-use std::io::{Read, Write};
+use memmap::{MmapMut, MmapOptions};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
@@ -61,7 +75,7 @@ impl LodDims {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Header {
     pub volume_id: String,
     pub chunk_side: u8,
@@ -106,6 +120,12 @@ impl Header {
             out.extend_from_slice(&lod.ny.to_le_bytes());
             out.extend_from_slice(&lod.nz.to_le_bytes());
         }
+    }
+
+    /// Byte length of `write_to`'s output. Used by `Sidecar` to compute
+    /// the offset where bitmap data starts in the mmap.
+    fn serialized_size(&self) -> usize {
+        8 + 2 + self.volume_id.len() + 1 + 1 + 12 + 12 * self.lods.len()
     }
 
     fn read_from<R: Read>(r: &mut R) -> std::io::Result<Self> {
@@ -155,150 +175,176 @@ impl Header {
     }
 }
 
-/// In-memory chunk-state index. Owns one `Vec<AtomicU8>` per LOD plus a
-/// per-LOD counter of transitions since last sync. Files are managed by
-/// `DiskStore`; this struct is just the bookkeeping.
+/// Mmap-backed chunk-state index. The bitmap + access-epoch bytes live
+/// in a `MmapMut` (anonymous for `Sidecar::empty`, file-backed for
+/// `Sidecar::open_or_create`). State transitions are atomic byte ops on
+/// `&AtomicU8` slices computed by `bytes_at` from per-LOD byte ranges
+/// into the mapping.
 ///
-/// The `access_epochs` column is a parallel `Vec<AtomicU8>` per LOD,
-/// indexed identically to `bitmaps`. Each byte is the cache-wide epoch
-/// (see `epoch.rs`) at which the chunk was last accessed. Initialized to
-/// 0 on a fresh sidecar; the persisted file format hasn't been extended
-/// yet, so on reload everything resets to 0 (TODO: write-back). That's
-/// safe — purge interprets "epoch 0 with current=N" as the oldest
-/// possible chunk, which biases reloaded volumes to be evicted first.
-/// Acceptable as a starting point.
+/// Durability model: writes hit the mmap (and therefore the kernel page
+/// cache) immediately. The kernel flushes dirty pages on its own
+/// writeback schedule, so even an external `SIGKILL` typically leaves
+/// most recent transitions on disk. The watchdog `do_sync` calls
+/// `flush()` periodically (msync) to bound the dirty window and to
+/// fsync data files first for the "RESIDENT implies durable bytes"
+/// ordering invariant. `UnifiedCache::shutdown` calls `flush()` for a
+/// synchronous final msync on graceful exit.
+///
+/// `pending` is the per-LOD count of transitions since the last
+/// watchdog tick. It is in-memory only (never persisted) and used to
+/// (a) drive wake-up of the sync watchdog and (b) decide which LODs'
+/// data files actually need fsync before the next msync.
 pub struct Sidecar {
     pub header: Header,
-    bitmaps: Vec<Vec<AtomicU8>>,
-    access_epochs: Vec<Vec<AtomicU8>>,
+    mmap: MmapMut,
+    /// `bitmap_ranges[lod]` is the half-open byte range of LOD `lod`'s
+    /// state bitmap inside `mmap`.
+    bitmap_ranges: Vec<Range<usize>>,
+    /// `ae_ranges[lod]` is the half-open byte range of LOD `lod`'s
+    /// access-epoch column inside `mmap`.
+    ae_ranges: Vec<Range<usize>>,
     pending: Vec<AtomicU64>,
 }
 
 impl Sidecar {
-    /// Fresh sidecar with every chunk Missing.
+    /// In-memory (anonymous mmap) sidecar with every chunk Missing.
+    /// Used by tests that don't want to touch disk.
     pub fn empty(header: Header) -> Self {
-        let bitmaps = header
-            .lods
-            .iter()
-            .map(|d| {
-                let n = d.count() as usize;
-                let mut v = Vec::with_capacity(n);
-                v.resize_with(n, || AtomicU8::new(STATE_MISSING));
-                v
-            })
-            .collect();
-        let access_epochs = header
-            .lods
-            .iter()
-            .map(|d| {
-                let n = d.count() as usize;
-                let mut v = Vec::with_capacity(n);
-                v.resize_with(n, || AtomicU8::new(0));
-                v
-            })
-            .collect();
-        let pending = (0..header.lods.len()).map(|_| AtomicU64::new(0)).collect();
-        Self {
-            header,
-            bitmaps,
-            access_epochs,
-            pending,
-        }
+        let layout = SidecarLayout::for_header(&header);
+        let mmap = MmapOptions::new()
+            .len(layout.total_size)
+            .map_anon()
+            .expect("anon mmap for sidecar");
+        let mut s = Self::from_mapped(header, mmap, layout);
+        // Anon mmaps are zero-filled by the kernel; STATE_MISSING == 0 and
+        // access_epoch default == 0 so we don't need to initialize bytes.
+        // We do still write the header into the prefix so any future
+        // `flush_header` / debugging dump sees a coherent file.
+        s.write_header_prefix();
+        s
     }
 
-    /// Load an existing sidecar from `path`. Returns `Ok(None)` if the file
-    /// doesn't exist; returns `Err` on any other failure (caller decides to
-    /// treat as missing or to bail). The returned Sidecar's header must
-    /// still be checked for layout-compatibility via `header.matches`.
+    /// Open or create the on-disk sidecar at `path` with the given
+    /// expected layout. If the file exists and its header matches, the
+    /// existing state is preserved (we just remap it). If it's shorter
+    /// than the expected layout (old format with no access-epoch
+    /// column, or a fresh `set_len(0)`), the file is extended; new
+    /// bytes are zero-filled by the OS (STATE_MISSING / epoch 0). If
+    /// the file's header does NOT match, returns `Ok(None)` so the
+    /// caller can rename-aside and retry; returns `Err` on real I/O
+    /// failures.
+    pub fn open_or_create(path: &Path, expected: Header) -> std::io::Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+
+        let on_disk_len = file.metadata()?.len();
+        let layout = SidecarLayout::for_header(&expected);
+        let needed = layout.total_size as u64;
+
+        if on_disk_len == 0 {
+            // Brand-new (or zero-length) file: size it, write the
+            // header prefix, mmap it.
+            file.set_len(needed)?;
+            let mmap = unsafe { MmapOptions::new().len(layout.total_size).map_mut(&file)? };
+            let mut s = Self::from_mapped(expected, mmap, layout);
+            s.write_header_prefix();
+            return Ok(Some(s));
+        }
+
+        // File exists. Validate the header against `expected` before we
+        // do anything destructive. Header read is short — we don't mmap
+        // for this; we use a fresh File handle to get a Read cursor at
+        // the start.
+        let mut hdr_file = std::fs::File::open(path)?;
+        let on_disk_header = Header::read_from(&mut hdr_file)?;
+        if !on_disk_header.matches(&expected) {
+            return Ok(None);
+        }
+
+        // Header matches. Make sure the file is big enough to hold both
+        // bitmaps and the access-epoch column; if not, extend (zero-fill).
+        if on_disk_len < needed {
+            file.set_len(needed)?;
+        }
+        let mmap = unsafe { MmapOptions::new().len(layout.total_size).map_mut(&file)? };
+        let s = Self::from_mapped(expected, mmap, layout);
+        Ok(Some(s))
+    }
+
+    /// Load an existing sidecar from `path`. Returns `Ok(None)` if the
+    /// file doesn't exist (lets callers treat absent and present
+    /// uniformly). Returns the loaded sidecar without doing the
+    /// header-match check — callers (`DiskStore::new`) compare
+    /// `loaded.header.matches(expected)` and rebuild on mismatch.
     ///
-    /// The access-epoch column is read from trailing bytes after the state
-    /// bitmaps. Old sidecars (written before that column existed) lack
-    /// those trailing bytes — we hit EOF and default every chunk's access
-    /// epoch to 0, which puts them at the front of the eviction queue
-    /// until they're touched. See `epoch.rs` for the LRU semantics.
+    /// On old-format files (no access-epoch column), the file is
+    /// extended (zero-filled) to the full layout size, so on-disk
+    /// access epochs default to 0 — the LRU treats those chunks as
+    /// "oldest possible" and evicts them first, which is the desired
+    /// migration behavior.
     pub fn load(path: &Path) -> std::io::Result<Option<Self>> {
-        let mut file = match std::fs::File::open(path) {
+        let file = match OpenOptions::new().read(true).write(true).open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let header = Header::read_from(&mut file)?;
-        let mut bitmaps = Vec::with_capacity(header.lods.len());
-        for lod in &header.lods {
-            let n = lod.count() as usize;
-            let mut bytes = vec![0u8; n];
-            file.read_exact(&mut bytes)?;
-            let atoms: Vec<AtomicU8> = bytes.into_iter().map(AtomicU8::new).collect();
-            bitmaps.push(atoms);
+
+        let mut hdr_file = std::fs::File::open(path)?;
+        let header = Header::read_from(&mut hdr_file)?;
+        let layout = SidecarLayout::for_header(&header);
+        let needed = layout.total_size as u64;
+        let on_disk_len = file.metadata()?.len();
+        if on_disk_len < needed {
+            file.set_len(needed)?;
         }
+        let mmap = unsafe { MmapOptions::new().len(layout.total_size).map_mut(&file)? };
+        Ok(Some(Self::from_mapped(header, mmap, layout)))
+    }
+
+    fn from_mapped(header: Header, mmap: MmapMut, layout: SidecarLayout) -> Self {
         let pending = (0..header.lods.len()).map(|_| AtomicU64::new(0)).collect();
-
-        // Read trailing bytes for the access-epoch column. EOF (old
-        // format) → fall back to all-zero. Partial → also fall back
-        // (mismatched file means we can't trust the data).
-        //
-        // TODO: when we fall back to all-zero on an old cache, every
-        // chunk lands in epoch 0 and becomes a first-class eviction
-        // candidate together. Nicer would be to infer per-shard epochs
-        // from shard-file mtimes: sort shards by mtime, map oldest →
-        // epoch ≈0 and newest → epoch ≈current, then stamp each chunk
-        // with its shard's bucket. That preserves rough recency
-        // ordering across an upgrade. Needs the shard layout, which
-        // lives in DiskStore — likely a post-load pass driven from
-        // there rather than from inside Sidecar.
-        let mut tail = Vec::new();
-        file.read_to_end(&mut tail)?;
-        let expected: usize = header.lods.iter().map(|d| d.count() as usize).sum();
-        let access_epochs: Vec<Vec<AtomicU8>> = if tail.len() == expected {
-            let mut p = 0;
-            header
-                .lods
-                .iter()
-                .map(|d| {
-                    let n = d.count() as usize;
-                    let atoms: Vec<AtomicU8> =
-                        tail[p..p + n].iter().map(|&b| AtomicU8::new(b)).collect();
-                    p += n;
-                    atoms
-                })
-                .collect()
-        } else {
-            if !tail.is_empty() {
-                log::warn!(
-                    "sidecar access-epoch column size mismatch ({} bytes, expected {}); resetting",
-                    tail.len(),
-                    expected
-                );
-            }
-            header
-                .lods
-                .iter()
-                .map(|d| {
-                    let n = d.count() as usize;
-                    let mut v = Vec::with_capacity(n);
-                    v.resize_with(n, || AtomicU8::new(0));
-                    v
-                })
-                .collect()
-        };
-
-        Ok(Some(Self {
+        Self {
             header,
-            bitmaps,
-            access_epochs,
+            mmap,
+            bitmap_ranges: layout.bitmap_ranges,
+            ae_ranges: layout.ae_ranges,
             pending,
-        }))
+        }
+    }
+
+    fn write_header_prefix(&mut self) {
+        let mut buf = Vec::with_capacity(self.header.serialized_size());
+        self.header.write_to(&mut buf);
+        debug_assert_eq!(buf.len(), self.header.serialized_size());
+        self.mmap[..buf.len()].copy_from_slice(&buf);
+    }
+
+    /// View `range` as a slice of `&AtomicU8`. Sound because `AtomicU8`
+    /// has the same in-memory representation as `u8` (per std docs).
+    /// Concurrent shared `&AtomicU8` slices into the same mmap region
+    /// are the expected access pattern.
+    #[inline]
+    fn atoms_at(&self, range: &Range<usize>) -> &[AtomicU8] {
+        let bytes = &self.mmap[range.start..range.end];
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<AtomicU8>(), bytes.len()) }
     }
 
     pub fn get_state(&self, lod: u8, idx: u64) -> u8 {
-        self.bitmaps[lod as usize][idx as usize].load(Ordering::Acquire)
+        self.atoms_at(&self.bitmap_ranges[lod as usize])[idx as usize].load(Ordering::Acquire)
     }
 
     /// Publish a new state for `idx` and bump the per-LOD pending counter.
     /// Returns the previous state (for callers that want to detect duplicate
     /// writes; current callers ignore).
     pub fn set_state(&self, lod: u8, idx: u64, state: u8) -> u8 {
-        let prev = self.bitmaps[lod as usize][idx as usize].swap(state, Ordering::Release);
+        let prev = self.atoms_at(&self.bitmap_ranges[lod as usize])[idx as usize]
+            .swap(state, Ordering::Release);
         if prev != state {
             self.pending[lod as usize].fetch_add(1, Ordering::Relaxed);
         }
@@ -312,7 +358,7 @@ impl Sidecar {
     /// path; Acquire on failure ensures the failed CAS doesn't reorder
     /// later loads. Bumps the pending counter only on success.
     pub fn compare_exchange_state(&self, lod: u8, idx: u64, current: u8, new: u8) -> Result<u8, u8> {
-        let res = self.bitmaps[lod as usize][idx as usize].compare_exchange(
+        let res = self.atoms_at(&self.bitmap_ranges[lod as usize])[idx as usize].compare_exchange(
             current,
             new,
             Ordering::AcqRel,
@@ -324,58 +370,50 @@ impl Sidecar {
         res
     }
 
-    /// Snapshot the bitmap, access-epoch column, and the pending counters.
-    /// The snapshot is taken with `Acquire` loads, then the counters are
-    /// atomically reset to zero (returning the prior count). Caller must
-    /// `fsync` data files for every LOD whose returned `pending` is
-    /// non-zero **before** writing the snapshot to disk, so the persisted
-    /// sidecar is always a strict subset of durable bytes.
-    ///
-    /// The access-epoch column is captured with `Relaxed` loads since
-    /// it's pure LRU bookkeeping — losing the last few accesses on a
-    /// crash just means those chunks look slightly older next session.
-    pub fn snapshot(&self) -> Snapshot {
-        let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
-        for lod in &self.bitmaps {
-            let mut bytes = Vec::with_capacity(lod.len());
-            for a in lod {
-                bytes.push(a.load(Ordering::Acquire));
-            }
-            bitmaps.push(bytes);
-        }
-        let mut access_epochs = Vec::with_capacity(self.access_epochs.len());
-        for lod in &self.access_epochs {
-            let mut bytes = Vec::with_capacity(lod.len());
-            for a in lod {
-                bytes.push(a.load(Ordering::Relaxed));
-            }
-            access_epochs.push(bytes);
-        }
-        let pending: Vec<u64> = self.pending.iter().map(|c| c.swap(0, Ordering::AcqRel)).collect();
-        Snapshot {
-            bitmaps,
-            access_epochs,
-            pending,
-        }
+    /// Reset the per-LOD pending counters and return their prior
+    /// values. Used by the sync watchdog to decide which LODs' data
+    /// files need fsync before the next msync.
+    pub fn take_pending(&self) -> Vec<u64> {
+        self.pending
+            .iter()
+            .map(|c| c.swap(0, Ordering::AcqRel))
+            .collect()
     }
 
-    /// Total transitions across all LODs since the last snapshot.
+    /// Total transitions across all LODs since the last `take_pending`.
     pub fn total_pending(&self) -> u64 {
         self.pending.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Synchronously flush dirty mmap pages to disk (msync(MS_SYNC)).
+    /// No-op for anonymous mmaps (memmap returns Ok). Callers should
+    /// `fsync` the underlying data files BEFORE invoking this so the
+    /// invariant "any RESIDENT slot in the persisted sidecar has its
+    /// bytes already durable" holds across a crash.
+    pub fn flush(&self) -> std::io::Result<()> {
+        self.mmap.flush()
+    }
+
+    /// Asynchronously hint to the kernel to schedule writeback of dirty
+    /// pages (msync(MS_ASYNC)). Returns immediately; durability is not
+    /// guaranteed on return. Used as a low-cost periodic nudge.
+    #[allow(dead_code)]
+    pub fn flush_async(&self) -> std::io::Result<()> {
+        self.mmap.flush_async()
     }
 
     /// Read the access epoch tagged on `(lod, idx)`. Returns 0 for slots
     /// that have never been touched (or were reloaded from an older
     /// sidecar format).
     pub fn get_access_epoch(&self, lod: u8, idx: u64) -> u8 {
-        self.access_epochs[lod as usize][idx as usize].load(Ordering::Relaxed)
+        self.atoms_at(&self.ae_ranges[lod as usize])[idx as usize].load(Ordering::Relaxed)
     }
 
     /// Stamp `(lod, idx)` with `epoch`. Called by the cache on transitions
     /// (the read fast path's `!=` filter ensures this is only called when
     /// the value would actually change).
     pub fn set_access_epoch(&self, lod: u8, idx: u64, epoch: u8) {
-        self.access_epochs[lod as usize][idx as usize].store(epoch, Ordering::Relaxed);
+        self.atoms_at(&self.ae_ranges[lod as usize])[idx as usize].store(epoch, Ordering::Relaxed);
     }
 
     /// CAS the access-epoch byte at `(lod, idx)` from `current` to `new`.
@@ -396,7 +434,7 @@ impl Sidecar {
         current: u8,
         new: u8,
     ) -> Result<u8, u8> {
-        let res = self.access_epochs[lod as usize][idx as usize].compare_exchange(
+        let res = self.atoms_at(&self.ae_ranges[lod as usize])[idx as usize].compare_exchange(
             current,
             new,
             Ordering::Relaxed,
@@ -409,43 +447,36 @@ impl Sidecar {
     }
 }
 
-pub struct Snapshot {
-    bitmaps: Vec<Vec<u8>>,
-    access_epochs: Vec<Vec<u8>>,
-    /// Per-LOD count of transitions captured in this snapshot. Caller uses
-    /// it to decide which data files actually need `fsync` before the
-    /// sidecar is renamed into place.
-    pub pending: Vec<u64>,
+/// Precomputed byte offsets for the body of a sidecar mmap, given a
+/// header. `header_size` is the byte length of `Header::write_to`;
+/// bitmap and access-epoch columns follow contiguously per-LOD.
+struct SidecarLayout {
+    total_size: usize,
+    bitmap_ranges: Vec<Range<usize>>,
+    ae_ranges: Vec<Range<usize>>,
 }
 
-impl Snapshot {
-    pub fn write_to(&self, header: &Header, dest: &Path) -> std::io::Result<()> {
-        let parent = dest.parent().expect("sidecar path has parent");
-        std::fs::create_dir_all(parent)?;
-        let tmp = parent.join(format!("{}.tmp", dest.file_name().unwrap().to_string_lossy()));
-
-        let total: usize =
-            self.bitmaps.iter().map(|b| b.len()).sum::<usize>() + self.access_epochs.iter().map(|b| b.len()).sum::<usize>();
-        let mut buf = Vec::with_capacity(4096 + total);
-        header.write_to(&mut buf);
-        for bm in &self.bitmaps {
-            buf.extend_from_slice(bm);
+impl SidecarLayout {
+    fn for_header(header: &Header) -> Self {
+        let header_size = header.serialized_size();
+        let mut cursor = header_size;
+        let mut bitmap_ranges = Vec::with_capacity(header.lods.len());
+        for d in &header.lods {
+            let n = d.count() as usize;
+            bitmap_ranges.push(cursor..cursor + n);
+            cursor += n;
         }
-        // Access-epoch column trails the state bitmaps. Older binaries
-        // reading this file stop after the bitmaps and ignore the rest;
-        // newer binaries reading old files hit EOF here and default
-        // every access-epoch to 0.
-        for ae in &self.access_epochs {
-            buf.extend_from_slice(ae);
+        let mut ae_ranges = Vec::with_capacity(header.lods.len());
+        for d in &header.lods {
+            let n = d.count() as usize;
+            ae_ranges.push(cursor..cursor + n);
+            cursor += n;
         }
-
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&buf)?;
-            f.sync_all()?;
+        Self {
+            total_size: cursor,
+            bitmap_ranges,
+            ae_ranges,
         }
-        std::fs::rename(&tmp, dest)?;
-        Ok(())
     }
 }
 
@@ -484,13 +515,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_resets_pending() {
+    fn take_pending_resets_counter() {
         let h = Header::new("v".into(), [64, 64, 64], 0);
         let s = Sidecar::empty(h);
         s.set_state(0, 0, STATE_RESIDENT);
         assert_eq!(s.total_pending(), 1);
-        let snap = s.snapshot();
-        assert_eq!(snap.pending[0], 1);
+        let pending = s.take_pending();
+        assert_eq!(pending[0], 1);
         assert_eq!(s.total_pending(), 0);
     }
 
@@ -498,14 +529,22 @@ mod tests {
     fn sidecar_file_roundtrip() {
         let dir = tempdir();
         let h = Header::new("vol".into(), [256, 128, 64], 1);
-        let s = Sidecar::empty(h);
-        s.set_state(0, 0, STATE_RESIDENT);
-        s.set_state(0, 3, STATE_EMPTY);
         let path = sidecar_path(&dir);
-        s.snapshot().write_to(&s.header, &path).unwrap();
+        {
+            let s = Sidecar::open_or_create(&path, h)
+                .unwrap()
+                .expect("fresh file accepts header");
+            s.set_state(0, 0, STATE_RESIDENT);
+            s.set_state(0, 3, STATE_EMPTY);
+            // msync so the next process-equivalent open via load() sees
+            // the bytes (same-process opens already share the page cache,
+            // but flush exercises the production path).
+            s.flush().unwrap();
+        }
 
+        let expected = Header::new("vol".into(), [256, 128, 64], 1);
         let loaded = Sidecar::load(&path).unwrap().expect("file should exist");
-        assert!(loaded.header.matches(&s.header));
+        assert!(loaded.header.matches(&expected));
         assert_eq!(loaded.get_state(0, 0), STATE_RESIDENT);
         assert_eq!(loaded.get_state(0, 1), STATE_MISSING);
         assert_eq!(loaded.get_state(0, 3), STATE_EMPTY);
@@ -516,16 +555,20 @@ mod tests {
         // 256³ at LOD 0 = 4*4*4 = 64 slots; plenty of room for several
         // tagged slots without going out of bounds.
         let dir = tempdir();
-        let h = Header::new("vol".into(), [256, 256, 256], 1);
-        let s = Sidecar::empty(h);
-        s.set_state(0, 0, STATE_RESIDENT);
-        s.set_access_epoch(0, 0, 42);
-        s.set_state(0, 17, STATE_RESIDENT);
-        s.set_access_epoch(0, 17, 199);
-        s.set_state(1, 0, STATE_RESIDENT);
-        s.set_access_epoch(1, 0, 7);
         let path = sidecar_path(&dir);
-        s.snapshot().write_to(&s.header, &path).unwrap();
+        let h = Header::new("vol".into(), [256, 256, 256], 1);
+        {
+            let s = Sidecar::open_or_create(&path, h)
+                .unwrap()
+                .expect("fresh file accepts header");
+            s.set_state(0, 0, STATE_RESIDENT);
+            s.set_access_epoch(0, 0, 42);
+            s.set_state(0, 17, STATE_RESIDENT);
+            s.set_access_epoch(0, 17, 199);
+            s.set_state(1, 0, STATE_RESIDENT);
+            s.set_access_epoch(1, 0, 7);
+            s.flush().unwrap();
+        }
 
         let loaded = Sidecar::load(&path).unwrap().expect("file should exist");
         assert_eq!(loaded.get_access_epoch(0, 0), 42);
@@ -536,7 +579,9 @@ mod tests {
 
     #[test]
     fn sidecar_old_format_loads_with_zero_access_epochs() {
-        // Simulate an old sidecar file: header + state bitmaps only.
+        // Simulate an old sidecar file: header + state bitmaps only,
+        // no trailing access-epoch column. load() must extend the file
+        // (zero-fill) and present access epochs as all-zero.
         let dir = tempdir();
         let h = Header::new("vol".into(), [128, 128, 64], 0);
         let mut buf = Vec::new();
@@ -549,7 +594,8 @@ mod tests {
         let loaded = Sidecar::load(&path).unwrap().expect("file should exist");
         assert_eq!(loaded.get_state(0, 0), STATE_RESIDENT);
         assert_eq!(loaded.get_state(0, 2), STATE_RESIDENT);
-        // Access epochs all default to 0 — old format had no column.
+        // Access epochs all default to 0 — old format had no column,
+        // file was extended (zero-fill) on load.
         for i in 0..4 {
             assert_eq!(loaded.get_access_epoch(0, i), 0);
         }

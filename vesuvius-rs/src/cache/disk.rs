@@ -267,28 +267,38 @@ impl DiskStore {
         let expected = sidecar::Header::new(volume_id, extent, max_lod);
         let sidecar_path = sidecar::sidecar_path(&root);
 
-        let sidecar = match Sidecar::load(&sidecar_path) {
-            Ok(Some(s)) if s.header.matches(&expected) => Arc::new(s),
-            Ok(Some(other)) => {
+        // open_or_create maps the file RW: existing data is preserved
+        // (and the file extended if shorter than the new layout); a
+        // brand-new file is sized and seeded with the header prefix.
+        // It returns Ok(None) when an existing file's header does NOT
+        // match `expected`, and Err on real I/O failure — both fall
+        // back to "rename aside + rebuild fresh".
+        let sidecar = match Sidecar::open_or_create(&sidecar_path, expected.clone()) {
+            Ok(Some(s)) => Arc::new(s),
+            Ok(None) => {
                 log::warn!(
-                    "[cache] sidecar mismatch (have vol={} extent={:?} max_lod={} chunk_side={}; want vol={} extent={:?} max_lod={} chunk_side={}); rebuilding",
-                    other.header.volume_id,
-                    other.header.extent,
-                    other.header.max_lod,
-                    other.header.chunk_side,
-                    expected.volume_id,
-                    expected.extent,
-                    expected.max_lod,
-                    expected.chunk_side,
+                    "[cache] sidecar header mismatch at {}; renaming aside and rebuilding",
+                    sidecar_path.display(),
                 );
                 stale_rename_everything(&root);
-                Arc::new(Sidecar::empty(expected))
+                Arc::new(
+                    Sidecar::open_or_create(&sidecar_path, expected)
+                        .expect("rebuilt sidecar create succeeded")
+                        .expect("rebuilt sidecar present on fresh file"),
+                )
             }
-            Ok(None) => Arc::new(Sidecar::empty(expected)),
             Err(e) => {
-                log::warn!("[cache] sidecar load failed ({}); treating as empty + renaming aside", e);
+                log::warn!(
+                    "[cache] sidecar open failed at {} ({}); renaming aside and rebuilding",
+                    sidecar_path.display(),
+                    e
+                );
                 stale_rename_everything(&root);
-                Arc::new(Sidecar::empty(expected))
+                Arc::new(
+                    Sidecar::open_or_create(&sidecar_path, expected)
+                        .expect("rebuilt sidecar create succeeded")
+                        .expect("rebuilt sidecar present on fresh file"),
+                )
             }
         };
 
@@ -854,8 +864,8 @@ fn sync_loop(inner: Arc<DiskStoreInner>) {
 }
 
 fn do_sync(inner: &DiskStoreInner) {
-    let snap = inner.sidecar.snapshot();
-    if snap.pending.iter().all(|&p| p == 0) {
+    let pending = inner.sidecar.take_pending();
+    if pending.iter().all(|&p| p == 0) {
         // Nothing changed since the last sync; nothing to flush.
         return;
     }
@@ -864,7 +874,7 @@ fn do_sync(inner: &DiskStoreInner) {
     // open for that LOD. A write-path shard is always open here (its
     // pwrite happened-before the Release that bumped pending). fsync on
     // read-only / clean shards is harmless — essentially a no-op.
-    for (lod_idx, &count) in snap.pending.iter().enumerate() {
+    for (lod_idx, &count) in pending.iter().enumerate() {
         if count == 0 {
             continue;
         }
@@ -894,8 +904,13 @@ fn do_sync(inner: &DiskStoreInner) {
             }
         }
     }
-    if let Err(e) = snap.write_to(&inner.sidecar.header, &sidecar::sidecar_path(&inner.root)) {
-        log::warn!("[cache] sync: sidecar write failed: {}", e);
+    // Data files are durable above; now flush the sidecar mmap so the
+    // RESIDENT/EMPTY bits and access-epoch tags reach the disk too.
+    // Ordering matters: any RESIDENT bit visible on disk must point at
+    // already-durable chunk bytes. msync(MS_SYNC) here pairs with the
+    // per-LOD `sync_data` above to honor that invariant.
+    if let Err(e) = inner.sidecar.flush() {
+        log::warn!("[cache] sync: sidecar msync failed: {}", e);
     }
 }
 

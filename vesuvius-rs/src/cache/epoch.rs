@@ -462,11 +462,11 @@ impl EpochState {
             if evicted_here == 0 {
                 continue;
             }
-            // Persist the demoted state column. Snapshot reads the
-            // current in-memory bitmaps; write_to does atomic rename.
-            let snap = sidecar.snapshot();
-            if let Err(e) = snap.write_to(&sidecar.header, &sidecar_path) {
-                log::warn!(target: super::purge::LOG_TARGET, "offline purge: sidecar write {} failed: {}", sidecar_path.display(), e);
+            // Force the demoted bytes out of the mmap's dirty pages
+            // now, rather than waiting for the kernel writeback timer.
+            // The data-file holes are already punched above.
+            if let Err(e) = sidecar.flush() {
+                log::warn!(target: super::purge::LOG_TARGET, "offline purge: sidecar msync {} failed: {}", sidecar_path.display(), e);
             }
             log::info!(
                 target: super::purge::LOG_TARGET,
@@ -1182,13 +1182,14 @@ mod tests {
             let vol_dir = unified.join(vid);
             std::fs::create_dir_all(&vol_dir).unwrap();
             let h = Header::new(vid.into(), [256, 256, 256], 0);
-            let s = Sidecar::empty(h);
+            let s = Sidecar::open_or_create(&sidecar::sidecar_path(&vol_dir), h)
+                .unwrap()
+                .expect("header matches on fresh file");
             for idx in 0..n as u64 {
                 s.set_state(0, idx, STATE_RESIDENT);
                 s.set_access_epoch(0, idx, ae);
             }
-            let snap = s.snapshot();
-            snap.write_to(&s.header, &sidecar::sidecar_path(&vol_dir)).unwrap();
+            s.flush().unwrap();
         }
 
         // Build EpochState directly and run the scan (avoids the
@@ -1233,15 +1234,14 @@ mod tests {
         let stale_dir = unified.join("vol-stale");
         std::fs::create_dir_all(&stale_dir).unwrap();
         let stale_header = Header::new("vol-stale".into(), [256, 256, 256], 0);
-        let stale = Sidecar::empty(stale_header);
+        let stale = Sidecar::open_or_create(&sidecar::sidecar_path(&stale_dir), stale_header)
+            .unwrap()
+            .expect("header matches on fresh file");
         for idx in 0..3u64 {
             stale.set_state(0, idx, STATE_RESIDENT);
             stale.set_access_epoch(0, idx, 10);
         }
-        stale
-            .snapshot()
-            .write_to(&stale.header, &sidecar::sidecar_path(&stale_dir))
-            .unwrap();
+        stale.flush().unwrap();
 
         // Build EpochState by hand and seed from the disk scan.
         let state = EpochState::new(1 << 30);
@@ -1315,12 +1315,12 @@ mod tests {
         let vol_dir = unified.join("vol-live");
         std::fs::create_dir_all(&vol_dir).unwrap();
         let h = Header::new("vol-live".into(), [256, 256, 256], 0);
-        let s = Sidecar::empty(h);
+        let s = Sidecar::open_or_create(&sidecar::sidecar_path(&vol_dir), h)
+            .unwrap()
+            .expect("header matches on fresh file");
         s.set_state(0, 0, STATE_RESIDENT);
         s.set_access_epoch(0, 0, 10);
-        s.snapshot()
-            .write_to(&s.header, &sidecar::sidecar_path(&vol_dir))
-            .unwrap();
+        s.flush().unwrap();
 
         let state = EpochState::new(1 << 30);
         state.unified_root.set(unified.clone()).unwrap();
