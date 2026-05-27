@@ -5,7 +5,8 @@
 //! Because tifxyz already is a regular UV→XYZ grid we never need triangle
 //! rasterization: painting is a direct bilinear lookup per output pixel. The
 //! grid implicitly triangulates as (r,c)-(r,c+1)-(r+1,c) + (r,c+1)-(r+1,c+1)-(r+1,c)
-//! if a real `paint_plane_intersection` ever needs to be implemented.
+//! — the same triangulation `paint_plane_intersection` walks to draw the
+//! segment outline on the orthogonal XYZ panes.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -641,24 +642,200 @@ impl VoxelVolume for TifXyzVolume {
 }
 
 impl SurfaceVolume for TifXyzVolume {
-    // TODO: implement plane-crossing wireframe by walking the implicit grid
-    // triangulation (r,c)-(r,c+1)-(r+1,c) + (r,c+1)-(r+1,c+1)-(r+1,c). Stubbed
-    // for v1 — ObjVolume's implementation is broken on the current branch
-    // anyway, so XYZ panes already render without segment overlays.
+    /// Walk the implicit grid triangulation and draw a line for every triangle
+    /// that crosses the current plane. Mirrors `ObjVolume::paint_plane_intersection`
+    /// pixel-for-pixel (same colors, same `highlight_uv_section` handling, same
+    /// optional vertex markers) so the segment outline overlay is identical on
+    /// the XYZ panes whether the segment came from .obj or .tifxyz.
     fn paint_plane_intersection(
         &self,
-        _xyz: [i32; 3],
-        _u_coord: usize,
-        _v_coord: usize,
-        _plane_coord: usize,
-        _width: usize,
-        _height: usize,
+        xyz: [i32; 3],
+        u_coord: usize,
+        v_coord: usize,
+        plane_coord: usize,
+        width: usize,
+        height: usize,
         _sfactor: u8,
-        _paint_zoom: u8,
-        _highlight_uv_section: Option<[i32; 3]>,
-        _config: &DrawingConfig,
-        _buffer: &mut Image,
+        paint_zoom: u8,
+        highlight_uv_section: Option<[i32; 3]>,
+        config: &DrawingConfig,
+        buffer: &mut Image,
     ) {
+        let u = xyz[u_coord];
+        let v = xyz[v_coord];
+        let w = xyz[plane_coord];
+
+        let min_u = u - width as i32 / 2 * paint_zoom as i32;
+        let max_u = u + width as i32 / 2 * paint_zoom as i32;
+        let min_v = v - height as i32 / 2 * paint_zoom as i32;
+        let max_v = v + height as i32 / 2 * paint_zoom as i32;
+
+        let (uv_section_min, uv_section_max) = if let Some(h) = highlight_uv_section {
+            (
+                [
+                    (h[0] as f64 - width as f64 / 2. * paint_zoom as f64) / self.tex_width as f64,
+                    (h[1] as f64 - height as f64 / 2. * paint_zoom as f64) / self.tex_height as f64,
+                ],
+                [
+                    (h[0] as f64 + width as f64 / 2. * paint_zoom as f64) / self.tex_width as f64,
+                    (h[1] as f64 + height as f64 / 2. * paint_zoom as f64) / self.tex_height as f64,
+                ],
+            )
+        } else {
+            ([0f64, 0f64], [0f64, 0f64])
+        };
+
+        let draw_outline_vertices = config.draw_outline_vertices;
+
+        let mut mins = [0.0f64; 3];
+        let mut maxs = [0.0f64; 3];
+        mins[u_coord] = min_u as f64;
+        maxs[u_coord] = max_u as f64;
+        mins[v_coord] = min_v as f64;
+        maxs[v_coord] = max_v as f64;
+        mins[plane_coord] = w as f64;
+        maxs[plane_coord] = w as f64;
+
+        let cols = self.data.base.cols;
+        let rows = self.data.base.rows;
+        if rows < 2 || cols < 2 {
+            return;
+        }
+
+        let valid = &self.data.base.valid;
+        let xyz_grid = &self.data.xyz;
+        let inv_cols = 1.0 / cols as f64;
+        let inv_rows = 1.0 / rows as f64;
+
+        for r in 0..rows - 1 {
+            for c in 0..cols - 1 {
+                let i00 = r * cols + c;
+                let i10 = i00 + 1;
+                let i01 = i00 + cols;
+                let i11 = i01 + 1;
+                if !(valid[i00] && valid[i10] && valid[i01] && valid[i11]) {
+                    continue;
+                }
+                let p00 = xyz_grid[i00];
+                let p10 = xyz_grid[i10];
+                let p01 = xyz_grid[i01];
+                let p11 = xyz_grid[i11];
+
+                // quad 3D AABB
+                let minx = p00[0].min(p10[0]).min(p01[0]).min(p11[0]) as f64;
+                let maxx = p00[0].max(p10[0]).max(p01[0]).max(p11[0]) as f64;
+                let miny = p00[1].min(p10[1]).min(p01[1]).min(p11[1]) as f64;
+                let maxy = p00[1].max(p10[1]).max(p01[1]).max(p11[1]) as f64;
+                let minz = p00[2].min(p10[2]).min(p01[2]).min(p11[2]) as f64;
+                let maxz = p00[2].max(p10[2]).max(p01[2]).max(p11[2]) as f64;
+                if minx > maxs[0] || maxx < mins[0]
+                    || miny > maxs[1] || maxy < mins[1]
+                    || minz > maxs[2] || maxz < mins[2]
+                {
+                    continue;
+                }
+
+                let should_highlight = if highlight_uv_section.is_some() {
+                    // normalized UV bbox of this quad (one cell wide/tall)
+                    let u_min = c as f64 * inv_cols;
+                    let u_max = (c + 1) as f64 * inv_cols;
+                    let v_min = r as f64 * inv_rows;
+                    let v_max = (r + 1) as f64 * inv_rows;
+                    u_min <= uv_section_max[0]
+                        && u_max >= uv_section_min[0]
+                        && v_min <= uv_section_max[1]
+                        && v_max >= uv_section_min[1]
+                } else {
+                    false
+                };
+
+                // triangle 1: p00, p10, p01 ; triangle 2: p10, p11, p01
+                draw_tri_plane_intersection(
+                    p00, p10, p01,
+                    u_coord, v_coord, plane_coord,
+                    w, min_u, min_v, paint_zoom,
+                    should_highlight, draw_outline_vertices,
+                    width, height, buffer,
+                );
+                draw_tri_plane_intersection(
+                    p10, p11, p01,
+                    u_coord, v_coord, plane_coord,
+                    w, min_u, min_v, paint_zoom,
+                    should_highlight, draw_outline_vertices,
+                    width, height, buffer,
+                );
+            }
+        }
+    }
+}
+
+#[inline]
+fn draw_tri_plane_intersection(
+    v1: [f32; 3],
+    v2: [f32; 3],
+    v3: [f32; 3],
+    u_coord: usize,
+    v_coord: usize,
+    plane_coord: usize,
+    w: i32,
+    min_u: i32,
+    min_v: i32,
+    paint_zoom: u8,
+    should_highlight: bool,
+    draw_outline_vertices: bool,
+    width: usize,
+    height: usize,
+    buffer: &mut Image,
+) {
+    let w_f = w as f64;
+    let pc = plane_coord;
+
+    let mut points: [[f64; 3]; 2] = [[0.0; 3]; 2];
+    let mut n_points = 0usize;
+
+    let add_intersection = |a: [f32; 3], b: [f32; 3], n: &mut usize, pts: &mut [[f64; 3]; 2]| {
+        if *n >= 2 {
+            return;
+        }
+        let da = a[pc] as f64 - w_f;
+        let db = b[pc] as f64 - w_f;
+        if da.signum() == db.signum() {
+            return;
+        }
+        let t = da / (da - db);
+        let mut coords = [0.0f64; 3];
+        coords[u_coord] = a[u_coord] as f64 + t * (b[u_coord] as f64 - a[u_coord] as f64);
+        coords[v_coord] = a[v_coord] as f64 + t * (b[v_coord] as f64 - a[v_coord] as f64);
+        coords[plane_coord] = w_f;
+        pts[*n] = coords;
+        *n += 1;
+    };
+
+    add_intersection(v1, v2, &mut n_points, &mut points);
+    add_intersection(v2, v3, &mut n_points, &mut points);
+    add_intersection(v3, v1, &mut n_points, &mut points);
+
+    if n_points != 2 {
+        return;
+    }
+
+    let p1 = points[0];
+    let p2 = points[1];
+    let x0 = ((p1[u_coord] - min_u as f64) / paint_zoom as f64) as i32;
+    let y0 = ((p1[v_coord] - min_v as f64) / paint_zoom as f64) as i32;
+    let x1 = ((p2[u_coord] - min_u as f64) / paint_zoom as f64) as i32;
+    let y1 = ((p2[v_coord] - min_v as f64) / paint_zoom as f64) as i32;
+
+    let (r, g, b, rp, gp, bp) = if should_highlight {
+        (0xff, 0xaa, 0, 0, 0xff, 0)
+    } else {
+        (0xff, 0, 0xff, 0, 0, 0xff)
+    };
+
+    super::objvolume::line(x0, y0, x1, y1, buffer, width, height, r, g, b);
+    if draw_outline_vertices {
+        super::objvolume::point(x0, y0, buffer, 4, rp, gp, bp);
+        super::objvolume::point(x1, y1, buffer, 4, rp, gp, bp);
     }
 }
 
@@ -730,6 +907,47 @@ mod tests {
         let mid_u = (tex_w / 2) as f64;
         let mid_v = (tex_h / 2) as f64;
         let _ = vol.get([mid_u, mid_v, 0.0], 1);
+    }
+
+    #[test]
+    fn paint_plane_intersection_draws_lines_through_segment() {
+        let Ok(base) = TifXyzBase::load(Path::new(FIXTURE)) else {
+            eprintln!("skipping: fixture not present");
+            return;
+        };
+        // fixture bbox z range ≈ [4307, 5593]; pick a plane near the middle.
+        let z_plane = 4950i32;
+        let (tex_w, tex_h) = nominal_dims(&base);
+        let data = TifXyzData::build(base, &None);
+        let vol = TifXyzVolume {
+            volume: EmptyVolume {}.into_volume(),
+            data,
+            tex_width: tex_w,
+            tex_height: tex_h,
+        };
+        let mut image = crate::volume::Image::new_from_color(256, 256, ecolor::Color32::TRANSPARENT);
+        // XY pane: u_coord=0, v_coord=1, plane_coord=2. Center around the
+        // approximate xy midpoint of the bbox, 32 voxels per pixel to span the
+        // whole segment within 256 px.
+        vol.paint_plane_intersection(
+            [4500, 2800, z_plane],
+            0,
+            1,
+            2,
+            256,
+            256,
+            1,
+            32,
+            None,
+            &DrawingConfig::default(),
+            &mut image,
+        );
+        let drawn = image
+            .data
+            .iter()
+            .filter(|c| **c != ecolor::Color32::TRANSPARENT)
+            .count();
+        assert!(drawn > 0, "expected paint_plane_intersection to draw at least one pixel");
     }
 
     #[test]

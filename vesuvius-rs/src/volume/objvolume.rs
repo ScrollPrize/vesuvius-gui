@@ -1255,7 +1255,7 @@ fn paint_zoom_align_up(v: i32, paint_zoom: u8) -> i32 {
 }
 
 #[allow(dead_code)] // useful for debugging triangle shapes
-fn line(x0: i32, y0: i32, x1: i32, y1: i32, buffer: &mut Image, width: usize, height: usize, r: u8, g: u8, b: u8) {
+pub(super) fn line(x0: i32, y0: i32, x1: i32, y1: i32, buffer: &mut Image, width: usize, height: usize, r: u8, g: u8, b: u8) {
     // simple bresenham algorithm from https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
 
     let dx = (x1 as i32 - x0 as i32).abs();
@@ -1285,7 +1285,7 @@ fn line(x0: i32, y0: i32, x1: i32, y1: i32, buffer: &mut Image, width: usize, he
     }
 }
 
-fn point(x0: i32, y0: i32, buffer: &mut Image, width: usize, r: u8, g: u8, b: u8) {
+pub(super) fn point(x0: i32, y0: i32, buffer: &mut Image, width: usize, r: u8, g: u8, b: u8) {
     let halfw = width as i32 / 2;
     for x in x0 - halfw..x0 + halfw {
         for y in y0 - halfw..y0 + halfw {
