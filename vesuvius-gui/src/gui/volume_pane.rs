@@ -288,6 +288,17 @@ pub struct VolumePane {
 
 const MAX_DOWNSAMPLE: u8 = 32;
 
+/// Snap a continuous zoom factor to a power-of-two `paint_zoom` (1, 2, 4, …, MAX_DOWNSAMPLE).
+/// Anything in `[1.0, ∞)` paints at native resolution; `[0.5, 1.0)` → 2, `[0.25, 0.5)` → 4, etc.
+/// Power-of-two stepping keeps adjacent-zoom tile grids aligned so cross-mip lookups are trivial.
+fn paint_zoom_for(zoom: f32) -> u8 {
+    if zoom >= 1.0 {
+        return 1;
+    }
+    let downsample = ((1.0 / zoom).ceil() as u32).clamp(1, MAX_DOWNSAMPLE as u32);
+    downsample.next_power_of_two().min(MAX_DOWNSAMPLE as u32) as u8
+}
+
 impl VolumePane {
     pub const fn new(pane_type: PaneType, is_segment_pane: bool) -> Self {
         Self {
@@ -305,13 +316,7 @@ impl VolumePane {
     ) -> Vec<(i32, i32, egui::Rect)> {
         let (u_coord, v_coord, _) = self.pane_type.coordinates();
 
-        // Calculate paint_zoom to determine effective tile size
-        let paint_zoom = if zoom >= 1.0 {
-            1u8
-        } else {
-            let downsample_factor = (1.0 / zoom).ceil() as u8;
-            downsample_factor.clamp(1, MAX_DOWNSAMPLE)
-        };
+        let paint_zoom = paint_zoom_for(zoom);
 
         // When paint_zoom > 1, the effective tile size in world coordinates is larger
         let effective_tile_size = TILE_SIZE as f32 * paint_zoom as f32;
@@ -367,13 +372,7 @@ impl VolumePane {
     ) -> egui::Rect {
         let (u_coord, v_coord, _) = self.pane_type.coordinates();
 
-        // Calculate paint_zoom to account for scaling
-        let paint_zoom = if zoom >= 1.0 {
-            1u8
-        } else {
-            let downsample_factor = (1.0 / zoom).ceil() as u8;
-            downsample_factor.clamp(1, MAX_DOWNSAMPLE)
-        };
+        let paint_zoom = paint_zoom_for(zoom);
 
         // When paint_zoom > 1, the effective tile size in world coordinates is larger
         let effective_tile_size = TILE_SIZE as f32 * paint_zoom as f32;
@@ -459,13 +458,7 @@ impl VolumePane {
         if let (Some(surface_vol), Some(outlines_coord)) = (surface_volume, segment_outlines_coord) {
             // paint segment outline on a new texture that is not cached or tiled
             let (u_coord, v_coord, d_coord) = self.pane_type.coordinates();
-            let paint_zoom = if *zoom >= 1.0 {
-                1u8
-            } else {
-                let downsample_factor = ((1.0 / *zoom).ceil() as u8).clamp(1, MAX_DOWNSAMPLE);
-
-                downsample_factor
-            };
+            let paint_zoom = paint_zoom_for(*zoom);
 
             if !self.is_segment_pane && drawing_config.show_segment_outlines {
                 let scaling = *zoom * paint_zoom as f32;
@@ -578,13 +571,7 @@ impl VolumePane {
         budget: &FrameBudget,
     ) -> Vec<(egui::TextureHandle, egui::Rect)> {
         let visible_tiles = self.calculate_visible_tiles(coord, zoom, frame_width, frame_height);
-        let paint_zoom = if zoom >= 1.0 {
-            1u8
-        } else {
-            // For zoom < 1.0, use integer downsampling
-            let downsample_factor = (1.0 / zoom).ceil() as u8;
-            downsample_factor.clamp(1, MAX_DOWNSAMPLE) // Reasonable limits
-        };
+        let paint_zoom = paint_zoom_for(zoom);
 
         let keys_and_rects = visible_tiles
             .iter()
