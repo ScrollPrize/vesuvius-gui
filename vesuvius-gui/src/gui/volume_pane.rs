@@ -299,6 +299,10 @@ fn paint_zoom_for(zoom: f32) -> u8 {
     downsample.next_power_of_two().min(MAX_DOWNSAMPLE as u32) as u8
 }
 
+fn full_uv() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(1.0))
+}
+
 impl VolumePane {
     pub const fn new(pane_type: PaneType, is_segment_pane: bool) -> Self {
         Self {
@@ -441,17 +445,12 @@ impl VolumePane {
         let (response, painter) = ui.allocate_painter(cell_size, egui::Sense::drag());
 
         // Paint all tiles on the allocated space - tiles should use response.rect coordinate system
-        for (texture, tile_rect) in tiles {
+        for (texture, tile_rect, uv) in tiles {
             // Adjust tile_rect to be relative to response.rect
             let adjusted_rect =
                 egui::Rect::from_min_size(response.rect.min + tile_rect.min.to_vec2(), tile_rect.size());
 
-            painter.image(
-                texture.id(),
-                adjusted_rect,
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(1.0)),
-                egui::Color32::WHITE,
-            );
+            painter.image(texture.id(), adjusted_rect, uv, egui::Color32::WHITE);
         }
 
         // Add segment outlines if configured
@@ -569,7 +568,7 @@ impl VolumePane {
         extra_resolutions: u32,
         segment_outlines_coord: Option<[i32; 3]>,
         budget: &FrameBudget,
-    ) -> Vec<(egui::TextureHandle, egui::Rect)> {
+    ) -> Vec<(egui::TextureHandle, egui::Rect, egui::Rect)> {
         let visible_tiles = self.calculate_visible_tiles(coord, zoom, frame_width, frame_height);
         let paint_zoom = paint_zoom_for(zoom);
 
@@ -599,8 +598,8 @@ impl VolumePane {
 
         let mut ready_tiles = Vec::new();
         for (key, tile_rect) in keys_and_rects {
-            if let Some(texture) = self.get_or_create_tile_async(ui, key, world, overlay, budget) {
-                ready_tiles.push((texture, tile_rect));
+            if let Some((texture, uv)) = self.get_or_create_tile_async(ui, key, world, overlay, budget) {
+                ready_tiles.push((texture, tile_rect, uv));
             }
         }
         ready_tiles
@@ -642,7 +641,7 @@ impl VolumePane {
         world: &Volume,
         overlay: Option<&Volume>,
         budget: &FrameBudget,
-    ) -> Option<egui::TextureHandle> {
+    ) -> Option<(egui::TextureHandle, egui::Rect)> {
         // Calculate paint_zoom for cache key (same logic as in create_tile)
 
         // Check if tile exists in cache
@@ -692,7 +691,7 @@ impl VolumePane {
                     // Refresh cache entry to keep it alive
                     set(ui, key, async_tex);
                 }
-                Some(texture)
+                Some((texture, full_uv()))
             }
 
             Some(AsyncTexture::ReadyRecalculating {
@@ -716,7 +715,7 @@ impl VolumePane {
                         },
                     );
                     ui.ctx().request_repaint();
-                    return Some(texture);
+                    return Some((texture, full_uv()));
                 }
                 // Poll the recalculation future briefly (non-blocking check)
                 // Use minimal timeout since we don't want to block UI
@@ -755,7 +754,7 @@ impl VolumePane {
                                 backoff_factor: new_backoff,
                             },
                         );
-                        Some(new_texture)
+                        Some((new_texture, full_uv()))
                     }
                     Poll::Pending => {
                         // Still recalculating - keep showing old texture
@@ -771,7 +770,7 @@ impl VolumePane {
                             },
                         );
                         ui.ctx().request_repaint(); // Check again next frame
-                        Some(texture)
+                        Some((texture, full_uv()))
                     }
                 }
             }
@@ -781,9 +780,13 @@ impl VolumePane {
                 // budget has run out for this frame, skip polling entirely and
                 // try again next frame.
                 let Some(timeout) = budget.next_poll_timeout() else {
-                    set(ui, key, AsyncTexture::Loading { future, started_at });
+                    set(ui, key.clone(), AsyncTexture::Loading { future, started_at });
                     ui.ctx().request_repaint();
-                    return None;
+                    log::info!(
+                        "cross-mip: trigger=loading_no_budget pane={:?} tile=({},{}) paint_zoom={}",
+                        self.pane_type, key.tile_u, key.tile_v, key.paint_zoom
+                    );
+                    return self.try_cross_mip_fallback(ui, &key);
                 };
                 match poll_tile_future(future.clone(), timeout) {
                     Poll::Ready(image) => {
@@ -810,20 +813,24 @@ impl VolumePane {
                                 backoff_factor: 1, // Initial backoff
                             },
                         );
-                        return Some(texture);
+                        return Some((texture, full_uv()));
                     }
                     Poll::Pending => {
                         // Deadline exceeded, still loading
                         set(
                             ui,
-                            key,
+                            key.clone(),
                             AsyncTexture::Loading {
                                 future: future.clone(),
                                 started_at,
                             },
                         );
                         ui.ctx().request_repaint();
-                        None
+                        log::info!(
+                            "cross-mip: trigger=loading_pending pane={:?} tile=({},{}) paint_zoom={}",
+                            self.pane_type, key.tile_u, key.tile_v, key.paint_zoom
+                        );
+                        self.try_cross_mip_fallback(ui, &key)
                     }
                 }
             }
@@ -834,15 +841,109 @@ impl VolumePane {
 
                 set(
                     ui,
-                    key,
+                    key.clone(),
                     AsyncTexture::Loading {
                         future: handle,
                         started_at: quanta::Instant::now(),
                     },
                 );
                 ui.ctx().request_repaint();
-                None
+                log::info!(
+                    "cross-mip: trigger=fresh pane={:?} tile=({},{}) paint_zoom={}",
+                    self.pane_type, key.tile_u, key.tile_v, key.paint_zoom
+                );
+                self.try_cross_mip_fallback(ui, &key)
             }
+        }
+    }
+
+    /// Try to find a cached tile at a coarser `paint_zoom` covering the same world region as
+    /// `key`, for use as a placeholder while the real tile is still loading. Returns the coarser
+    /// texture plus the UV sub-rect within it that corresponds to the target tile's world bounds.
+    ///
+    /// Re-publishes the fallback entry into the `FramePublisher` cache so it survives the
+    /// per-frame eviction sweep and stays available for the rest of the user's zoom gesture.
+    fn try_cross_mip_fallback(&self, ui: &Ui, key: &TileCacheKey) -> Option<(egui::TextureHandle, egui::Rect)> {
+        let target_zoom = key.paint_zoom;
+        let mut level: u32 = 1;
+        loop {
+            let probe_zoom = (target_zoom as u32) << level;
+            if probe_zoom > MAX_DOWNSAMPLE as u32 {
+                log::info!(
+                    "cross-mip: MISS pane={:?} tile=({},{}) paint_zoom={} min_level={} (no parent up to MAX_DOWNSAMPLE)",
+                    self.pane_type, key.tile_u, key.tile_v, key.paint_zoom, key.min_level
+                );
+                return None;
+            }
+            // `paint_zoom` is always a power of two, so log2 == trailing_zeros. The natural
+            // `min_level` for a tile at paint_zoom=2^p is p (so sfactor = 1 << p == paint_zoom);
+            // the +1 candidate covers the off-by-one at exact zoom boundaries (e.g. zoom=1/16
+            // gives min_level=5 while the rest of the paint_zoom=16 band gives min_level=4).
+            let natural_min_level = probe_zoom.trailing_zeros();
+            let parent_u = key.tile_u >> level;
+            let parent_v = key.tile_v >> level;
+            let mut hit_min_level: Option<u32> = None;
+            let texture = {
+                let mut found = None;
+                for candidate_min_level in [natural_min_level, natural_min_level + 1] {
+                    let probe_key = TileCacheKey {
+                        tile_u: parent_u,
+                        tile_v: parent_v,
+                        paint_zoom: probe_zoom as u8,
+                        min_level: candidate_min_level,
+                        ..key.clone()
+                    };
+                    let outcome = ui.memory_mut(|mem| -> (Option<egui::TextureHandle>, &'static str) {
+                        let cache: &mut TileCache = mem.caches.cache::<TileCache>();
+                        let Some(entry) = cache.get(&probe_key).cloned() else {
+                            return (None, "absent");
+                        };
+                        let (tex, kind) = match &entry {
+                            AsyncTexture::Ready { texture, .. } => (texture.clone(), "ready"),
+                            AsyncTexture::ReadyRecalculating { texture, .. } => (texture.clone(), "recalc"),
+                            AsyncTexture::Loading { .. } => return (None, "loading"),
+                        };
+                        cache.set(probe_key.clone(), entry);
+                        (Some(tex), kind)
+                    });
+                    match outcome {
+                        (Some(tex), kind) => {
+                            log::info!(
+                                "cross-mip: probe pane={:?} tile=({},{}) paint_zoom={} parent=({},{}) paint_zoom={} min_level={} -> {} HIT",
+                                self.pane_type, key.tile_u, key.tile_v, key.paint_zoom,
+                                parent_u, parent_v, probe_zoom, candidate_min_level, kind
+                            );
+                            found = Some(tex);
+                            hit_min_level = Some(candidate_min_level);
+                            break;
+                        }
+                        (None, kind) => {
+                            log::info!(
+                                "cross-mip: probe pane={:?} tile=({},{}) paint_zoom={} parent=({},{}) paint_zoom={} min_level={} -> {}",
+                                self.pane_type, key.tile_u, key.tile_v, key.paint_zoom,
+                                parent_u, parent_v, probe_zoom, candidate_min_level, kind
+                            );
+                        }
+                    }
+                }
+                found
+            };
+
+            if let Some(texture) = texture {
+                let mask = (1i32 << level) - 1;
+                let inv = 1.0 / (1u32 << level) as f32;
+                let local_u = (key.tile_u & mask) as f32 * inv;
+                let local_v = (key.tile_v & mask) as f32 * inv;
+                let uv = egui::Rect::from_min_size(egui::pos2(local_u, local_v), egui::vec2(inv, inv));
+                log::info!(
+                    "cross-mip: HIT pane={:?} tile=({},{}) paint_zoom={} -> parent=({},{}) paint_zoom={} min_level={} level={} uv={:?}",
+                    self.pane_type, key.tile_u, key.tile_v, key.paint_zoom,
+                    parent_u, parent_v, probe_zoom, hit_min_level.unwrap(), level, uv
+                );
+                return Some((texture, uv));
+            }
+
+            level += 1;
         }
     }
 
