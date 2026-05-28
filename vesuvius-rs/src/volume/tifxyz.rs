@@ -64,6 +64,10 @@ pub struct TifXyzData {
     base: Arc<TifXyzBase>,
     xyz: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
+    /// `(rows-1) * (cols-1)` post-affine quad AABBs as `[min_x, min_y, min_z, max_x, max_y, max_z]`.
+    /// Invalid quads (any corner invalid, or grid too small) use sentinel
+    /// `[+inf, +inf, +inf, -inf, -inf, -inf]` so any plane test rejects them in one branch.
+    quad_aabb: Vec<[f32; 6]>,
     applied_transform: Option<AffineTransform>,
 }
 
@@ -243,6 +247,49 @@ fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// Build post-affine per-quad AABBs once per `TifXyzData::build`. Invalid quads
+/// (any corner invalid, or grid smaller than 2x2) get sentinel `[+inf; 3, -inf; 3]`
+/// so the plane-axis cull in `paint_plane_intersection` rejects them with a single
+/// comparison instead of four `valid[]` loads + four `xyz[]` loads + six min/max.
+fn build_quad_aabb(base: &TifXyzBase, xyz: &[[f32; 3]]) -> Vec<[f32; 6]> {
+    let cols = base.cols;
+    let rows = base.rows;
+    if rows < 2 || cols < 2 {
+        return Vec::new();
+    }
+    let qcols = cols - 1;
+    let qrows = rows - 1;
+    let sentinel = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let mut aabb = vec![sentinel; qrows * qcols];
+    let valid = &base.valid;
+    for r in 0..qrows {
+        let row_base = r * cols;
+        let qrow_base = r * qcols;
+        for c in 0..qcols {
+            let i00 = row_base + c;
+            let i10 = i00 + 1;
+            let i01 = i00 + cols;
+            let i11 = i01 + 1;
+            if !(valid[i00] && valid[i10] && valid[i01] && valid[i11]) {
+                continue;
+            }
+            let p00 = xyz[i00];
+            let p10 = xyz[i10];
+            let p01 = xyz[i01];
+            let p11 = xyz[i11];
+            aabb[qrow_base + c] = [
+                p00[0].min(p10[0]).min(p01[0]).min(p11[0]),
+                p00[1].min(p10[1]).min(p01[1]).min(p11[1]),
+                p00[2].min(p10[2]).min(p01[2]).min(p11[2]),
+                p00[0].max(p10[0]).max(p01[0]).max(p11[0]),
+                p00[1].max(p10[1]).max(p01[1]).max(p11[1]),
+                p00[2].max(p10[2]).max(p01[2]).max(p11[2]),
+            ];
+        }
+    }
+    aabb
+}
+
 impl TifXyzData {
     fn build(base: Arc<TifXyzBase>, transform: &Option<AffineTransform>) -> Arc<Self> {
         let t = Instant::now();
@@ -277,6 +324,8 @@ impl TifXyzData {
             (base.pre_xyz.clone(), base.pre_normals.clone())
         };
 
+        let quad_aabb = build_quad_aabb(&base, &xyz);
+
         log::info!(
             "TifXyzData::build (transform={}) in {:?}",
             transform.is_some(),
@@ -287,6 +336,7 @@ impl TifXyzData {
             base,
             xyz,
             normals,
+            quad_aabb,
             applied_transform: transform.clone(),
         })
     }
@@ -687,53 +737,53 @@ impl SurfaceVolume for TifXyzVolume {
 
         let draw_outline_vertices = config.draw_outline_vertices;
 
-        let mut mins = [0.0f64; 3];
-        let mut maxs = [0.0f64; 3];
-        mins[u_coord] = min_u as f64;
-        maxs[u_coord] = max_u as f64;
-        mins[v_coord] = min_v as f64;
-        maxs[v_coord] = max_v as f64;
-        mins[plane_coord] = w as f64;
-        maxs[plane_coord] = w as f64;
-
         let cols = self.data.base.cols;
         let rows = self.data.base.rows;
         if rows < 2 || cols < 2 {
             return;
         }
+        let qcols = cols - 1;
 
-        let valid = &self.data.base.valid;
         let xyz_grid = &self.data.xyz;
+        let quad_aabb = &self.data.quad_aabb;
         let inv_cols = 1.0 / cols as f64;
         let inv_rows = 1.0 / rows as f64;
 
+        // f32 versions of the paint-area bounds for the per-quad cull. Voxel coords
+        // stay well within f32 precision, and the cache is f32, so this avoids
+        // mixing widths in the hot loop.
+        let w_f32 = w as f32;
+        let min_u_f32 = min_u as f32;
+        let max_u_f32 = max_u as f32;
+        let min_v_f32 = min_v as f32;
+        let max_v_f32 = max_v as f32;
+
         for r in 0..rows - 1 {
+            let qrow_base = r * qcols;
+            let row_base = r * cols;
             for c in 0..cols - 1 {
-                let i00 = r * cols + c;
+                let bb = quad_aabb[qrow_base + c];
+                // Plane-axis first: invalid quads use a `+inf/-inf` sentinel that
+                // also fails this test, so one branch covers both "invalid" and
+                // "doesn't cross the plane" — by far the common reject paths.
+                if bb[plane_coord] > w_f32 || bb[3 + plane_coord] < w_f32 {
+                    continue;
+                }
+                if bb[3 + u_coord] < min_u_f32 || bb[u_coord] > max_u_f32 {
+                    continue;
+                }
+                if bb[3 + v_coord] < min_v_f32 || bb[v_coord] > max_v_f32 {
+                    continue;
+                }
+
+                let i00 = row_base + c;
                 let i10 = i00 + 1;
                 let i01 = i00 + cols;
                 let i11 = i01 + 1;
-                if !(valid[i00] && valid[i10] && valid[i01] && valid[i11]) {
-                    continue;
-                }
                 let p00 = xyz_grid[i00];
                 let p10 = xyz_grid[i10];
                 let p01 = xyz_grid[i01];
                 let p11 = xyz_grid[i11];
-
-                // quad 3D AABB
-                let minx = p00[0].min(p10[0]).min(p01[0]).min(p11[0]) as f64;
-                let maxx = p00[0].max(p10[0]).max(p01[0]).max(p11[0]) as f64;
-                let miny = p00[1].min(p10[1]).min(p01[1]).min(p11[1]) as f64;
-                let maxy = p00[1].max(p10[1]).max(p01[1]).max(p11[1]) as f64;
-                let minz = p00[2].min(p10[2]).min(p01[2]).min(p11[2]) as f64;
-                let maxz = p00[2].max(p10[2]).max(p01[2]).max(p11[2]) as f64;
-                if minx > maxs[0] || maxx < mins[0]
-                    || miny > maxs[1] || maxy < mins[1]
-                    || minz > maxs[2] || maxz < mins[2]
-                {
-                    continue;
-                }
 
                 let should_highlight = if highlight_uv_section.is_some() {
                     // normalized UV bbox of this quad (one cell wide/tall)
