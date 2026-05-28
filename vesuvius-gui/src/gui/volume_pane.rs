@@ -303,6 +303,13 @@ fn full_uv() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(1.0))
 }
 
+/// A single textured draw contributing to a tile slot.
+/// - `tile_sub_rect`: where within the target tile (in `[0,1]^2`) this draw lands.
+///   `full_uv()` means "covers the whole tile" (real tile or zoom-in upscale).
+///   A quadrant like `(0..0.5, 0..0.5)` means "covers the top-left quarter" (zoom-out child).
+/// - `uv`: which part of the texture to sample (in `[0,1]^2`). `full_uv()` for whole texture.
+type TileDraw = (egui::TextureHandle, egui::Rect, egui::Rect);
+
 impl VolumePane {
     pub const fn new(pane_type: PaneType, is_segment_pane: bool) -> Self {
         Self {
@@ -598,8 +605,14 @@ impl VolumePane {
 
         let mut ready_tiles = Vec::new();
         for (key, tile_rect) in keys_and_rects {
-            if let Some((texture, uv)) = self.get_or_create_tile_async(ui, key, world, overlay, budget) {
-                ready_tiles.push((texture, tile_rect, uv));
+            for (texture, sub_rect, uv) in self.get_or_create_tile_async(ui, key, world, overlay, budget) {
+                // sub_rect is in [0,1]^2 tile-local space; map it into the on-screen tile_rect.
+                let screen_rect = egui::Rect::from_min_size(
+                    tile_rect.min
+                        + egui::vec2(sub_rect.min.x * tile_rect.width(), sub_rect.min.y * tile_rect.height()),
+                    egui::vec2(sub_rect.width() * tile_rect.width(), sub_rect.height() * tile_rect.height()),
+                );
+                ready_tiles.push((texture, screen_rect, uv));
             }
         }
         ready_tiles
@@ -641,7 +654,7 @@ impl VolumePane {
         world: &Volume,
         overlay: Option<&Volume>,
         budget: &FrameBudget,
-    ) -> Option<(egui::TextureHandle, egui::Rect)> {
+    ) -> Vec<TileDraw> {
         // Calculate paint_zoom for cache key (same logic as in create_tile)
 
         // Check if tile exists in cache
@@ -691,7 +704,7 @@ impl VolumePane {
                     // Refresh cache entry to keep it alive
                     set(ui, key, async_tex);
                 }
-                Some((texture, full_uv()))
+                vec![(texture, full_uv(), full_uv())]
             }
 
             Some(AsyncTexture::ReadyRecalculating {
@@ -715,7 +728,7 @@ impl VolumePane {
                         },
                     );
                     ui.ctx().request_repaint();
-                    return Some((texture, full_uv()));
+                    return vec![(texture, full_uv(), full_uv())];
                 }
                 // Poll the recalculation future briefly (non-blocking check)
                 // Use minimal timeout since we don't want to block UI
@@ -754,7 +767,7 @@ impl VolumePane {
                                 backoff_factor: new_backoff,
                             },
                         );
-                        Some((new_texture, full_uv()))
+                        vec![(new_texture, full_uv(), full_uv())]
                     }
                     Poll::Pending => {
                         // Still recalculating - keep showing old texture
@@ -770,7 +783,7 @@ impl VolumePane {
                             },
                         );
                         ui.ctx().request_repaint(); // Check again next frame
-                        Some((texture, full_uv()))
+                        vec![(texture, full_uv(), full_uv())]
                     }
                 }
             }
@@ -813,7 +826,7 @@ impl VolumePane {
                                 backoff_factor: 1, // Initial backoff
                             },
                         );
-                        return Some((texture, full_uv()));
+                        return vec![(texture, full_uv(), full_uv())];
                     }
                     Poll::Pending => {
                         // Deadline exceeded, still loading
@@ -857,94 +870,137 @@ impl VolumePane {
         }
     }
 
-    /// Try to find a cached tile at a coarser `paint_zoom` covering the same world region as
-    /// `key`, for use as a placeholder while the real tile is still loading. Returns the coarser
-    /// texture plus the UV sub-rect within it that corresponds to the target tile's world bounds.
+    /// Try to find cached tiles at a different `paint_zoom` covering the same world region as
+    /// `key`, for use as a placeholder while the real tile is still loading.
     ///
-    /// Re-publishes the fallback entry into the `FramePublisher` cache so it survives the
-    /// per-frame eviction sweep and stays available for the rest of the user's zoom gesture.
-    fn try_cross_mip_fallback(&self, ui: &Ui, key: &TileCacheKey) -> Option<(egui::TextureHandle, egui::Rect)> {
+    /// Strategy: zoom-in (use a coarser cached parent, blurry but complete) is preferred because
+    /// one cached tile fills the entire missing slot. If no zoom-in fallback exists, fall back to
+    /// zoom-out (composite from finer cached children — sharp where covered but may have gaps).
+    fn try_cross_mip_fallback(&self, ui: &Ui, key: &TileCacheKey) -> Vec<TileDraw> {
+        if let Some(draw) = self.try_cross_mip_zoom_in(ui, key) {
+            return vec![draw];
+        }
+        self.try_cross_mip_zoom_out(ui, key)
+    }
+
+    /// Probe coarser `paint_zoom` keys for a single tile that covers the target's region.
+    /// Returns one `TileDraw` with the whole tile area mapped to a UV sub-rect of the parent.
+    fn try_cross_mip_zoom_in(&self, ui: &Ui, key: &TileCacheKey) -> Option<TileDraw> {
         let target_zoom = key.paint_zoom;
         let mut level: u32 = 1;
         loop {
             let probe_zoom = (target_zoom as u32) << level;
             if probe_zoom > MAX_DOWNSAMPLE as u32 {
                 log::info!(
-                    "cross-mip: MISS pane={:?} tile=({},{}) paint_zoom={} min_level={} (no parent up to MAX_DOWNSAMPLE)",
+                    "cross-mip: zoom-in MISS pane={:?} tile=({},{}) paint_zoom={} min_level={}",
                     self.pane_type, key.tile_u, key.tile_v, key.paint_zoom, key.min_level
                 );
                 return None;
             }
-            // `paint_zoom` is always a power of two, so log2 == trailing_zeros. The natural
-            // `min_level` for a tile at paint_zoom=2^p is p (so sfactor = 1 << p == paint_zoom);
-            // the +1 candidate covers the off-by-one at exact zoom boundaries (e.g. zoom=1/16
-            // gives min_level=5 while the rest of the paint_zoom=16 band gives min_level=4).
-            let natural_min_level = probe_zoom.trailing_zeros();
             let parent_u = key.tile_u >> level;
             let parent_v = key.tile_v >> level;
-            let mut hit_min_level: Option<u32> = None;
-            let texture = {
-                let mut found = None;
-                for candidate_min_level in [natural_min_level, natural_min_level + 1] {
-                    let probe_key = TileCacheKey {
-                        tile_u: parent_u,
-                        tile_v: parent_v,
-                        paint_zoom: probe_zoom as u8,
-                        min_level: candidate_min_level,
-                        ..key.clone()
-                    };
-                    let outcome = ui.memory_mut(|mem| -> (Option<egui::TextureHandle>, &'static str) {
-                        let cache: &mut TileCache = mem.caches.cache::<TileCache>();
-                        let Some(entry) = cache.get(&probe_key).cloned() else {
-                            return (None, "absent");
-                        };
-                        let (tex, kind) = match &entry {
-                            AsyncTexture::Ready { texture, .. } => (texture.clone(), "ready"),
-                            AsyncTexture::ReadyRecalculating { texture, .. } => (texture.clone(), "recalc"),
-                            AsyncTexture::Loading { .. } => return (None, "loading"),
-                        };
-                        cache.set(probe_key.clone(), entry);
-                        (Some(tex), kind)
-                    });
-                    match outcome {
-                        (Some(tex), kind) => {
-                            log::info!(
-                                "cross-mip: probe pane={:?} tile=({},{}) paint_zoom={} parent=({},{}) paint_zoom={} min_level={} -> {} HIT",
-                                self.pane_type, key.tile_u, key.tile_v, key.paint_zoom,
-                                parent_u, parent_v, probe_zoom, candidate_min_level, kind
-                            );
-                            found = Some(tex);
-                            hit_min_level = Some(candidate_min_level);
-                            break;
-                        }
-                        (None, kind) => {
-                            log::info!(
-                                "cross-mip: probe pane={:?} tile=({},{}) paint_zoom={} parent=({},{}) paint_zoom={} min_level={} -> {}",
-                                self.pane_type, key.tile_u, key.tile_v, key.paint_zoom,
-                                parent_u, parent_v, probe_zoom, candidate_min_level, kind
-                            );
-                        }
-                    }
-                }
-                found
-            };
-
-            if let Some(texture) = texture {
+            if let Some((texture, hit_min_level)) = self.probe_cache(ui, key, parent_u, parent_v, probe_zoom as u8) {
                 let mask = (1i32 << level) - 1;
                 let inv = 1.0 / (1u32 << level) as f32;
                 let local_u = (key.tile_u & mask) as f32 * inv;
                 let local_v = (key.tile_v & mask) as f32 * inv;
                 let uv = egui::Rect::from_min_size(egui::pos2(local_u, local_v), egui::vec2(inv, inv));
                 log::info!(
-                    "cross-mip: HIT pane={:?} tile=({},{}) paint_zoom={} -> parent=({},{}) paint_zoom={} min_level={} level={} uv={:?}",
+                    "cross-mip: zoom-in HIT pane={:?} tile=({},{}) paint_zoom={} -> parent=({},{}) paint_zoom={} min_level={} level={} uv={:?}",
                     self.pane_type, key.tile_u, key.tile_v, key.paint_zoom,
-                    parent_u, parent_v, probe_zoom, hit_min_level.unwrap(), level, uv
+                    parent_u, parent_v, probe_zoom, hit_min_level, level, uv
                 );
-                return Some((texture, uv));
+                return Some((texture, full_uv(), uv));
             }
-
             level += 1;
         }
+    }
+
+    /// Probe finer `paint_zoom` keys for tiles whose union covers the target's region.
+    /// Returns up to `(2^L)^2` draws (one per available child), each painting into a sub-rect of
+    /// the target tile. Gaps where no child is cached are simply not drawn.
+    ///
+    /// Walks `level = 1, 2, …` and returns the first level with at least one cached child.
+    fn try_cross_mip_zoom_out(&self, ui: &Ui, key: &TileCacheKey) -> Vec<TileDraw> {
+        let target_zoom = key.paint_zoom as u32;
+        // Bound how deep we composite — at level 3 we'd be probing 64 child slots per tile.
+        const MAX_ZOOM_OUT_LEVEL: u32 = 3;
+        for level in 1u32..=MAX_ZOOM_OUT_LEVEL {
+            let child_zoom = target_zoom >> level;
+            if child_zoom == 0 {
+                break;
+            }
+            let span = 1i32 << level;
+            let inv = 1.0 / span as f32;
+            let mut draws = Vec::new();
+            for cy in 0..span {
+                for cx in 0..span {
+                    let child_u = (key.tile_u << level) + cx;
+                    let child_v = (key.tile_v << level) + cy;
+                    if let Some((texture, _)) = self.probe_cache(ui, key, child_u, child_v, child_zoom as u8) {
+                        let sub_rect = egui::Rect::from_min_size(
+                            egui::pos2(cx as f32 * inv, cy as f32 * inv),
+                            egui::vec2(inv, inv),
+                        );
+                        draws.push((texture, sub_rect, full_uv()));
+                    }
+                }
+            }
+            if !draws.is_empty() {
+                log::info!(
+                    "cross-mip: zoom-out HIT pane={:?} tile=({},{}) paint_zoom={} -> {}/{} children at paint_zoom={} level={}",
+                    self.pane_type, key.tile_u, key.tile_v, key.paint_zoom,
+                    draws.len(), span * span, child_zoom, level
+                );
+                return draws;
+            }
+        }
+        log::info!(
+            "cross-mip: zoom-out MISS pane={:?} tile=({},{}) paint_zoom={} min_level={}",
+            self.pane_type, key.tile_u, key.tile_v, key.paint_zoom, key.min_level
+        );
+        Vec::new()
+    }
+
+    /// Look up a tile at `(probe_u, probe_v, probe_zoom)` in the cache, trying both the natural
+    /// `min_level` for that `paint_zoom` and the +1 boundary case. On hit, re-publishes the entry
+    /// so it survives `FramePublisher`'s per-frame eviction. Returns the texture and which
+    /// `min_level` matched.
+    fn probe_cache(
+        &self,
+        ui: &Ui,
+        key: &TileCacheKey,
+        probe_u: i32,
+        probe_v: i32,
+        probe_zoom: u8,
+    ) -> Option<(egui::TextureHandle, u32)> {
+        // paint_zoom is always pow2; log2 == trailing_zeros. sfactor = 1 << min_level matches
+        // paint_zoom at the natural min_level. +1 covers the off-by-one at zoom boundaries.
+        let natural_min_level = (probe_zoom as u32).trailing_zeros();
+        for candidate_min_level in [natural_min_level, natural_min_level + 1] {
+            let probe_key = TileCacheKey {
+                tile_u: probe_u,
+                tile_v: probe_v,
+                paint_zoom: probe_zoom,
+                min_level: candidate_min_level,
+                ..key.clone()
+            };
+            let outcome = ui.memory_mut(|mem| -> Option<egui::TextureHandle> {
+                let cache: &mut TileCache = mem.caches.cache::<TileCache>();
+                let entry = cache.get(&probe_key)?.clone();
+                let tex = match &entry {
+                    AsyncTexture::Ready { texture, .. }
+                    | AsyncTexture::ReadyRecalculating { texture, .. } => texture.clone(),
+                    AsyncTexture::Loading { .. } => return None,
+                };
+                cache.set(probe_key.clone(), entry);
+                Some(tex)
+            });
+            if let Some(texture) = outcome {
+                return Some((texture, candidate_min_level));
+            }
+        }
+        None
     }
 
     fn create_tile_async(
