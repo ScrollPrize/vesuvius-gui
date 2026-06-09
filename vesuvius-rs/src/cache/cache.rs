@@ -910,25 +910,20 @@ impl Inner {
             // surface rendering re-enters here per voxel, and the queue
             // mutexes inside the touch calls would otherwise serialize
             // every CPU thread on the same futex.
-            if let ChunkState::Pending { last_touched_frame, preview_source_lod } = state.as_ref() {
+            if let ChunkState::Pending { last_touched_frame, .. } = state.as_ref() {
                 if self.claim_touch(last_touched_frame) {
                     self.task_queue.touch(key);
                     self.downloader.touch(key);
-                    // Retry the upscale-from-parent walk while there's
-                    // room to improve: any ancestor finer than the one
-                    // we previously upsampled from (recorded in
-                    // `preview_source_lod`) would yield a better
-                    // preview. Stops once we've filled from `key.lod +
-                    // 1`, the finest possible parent. Debounced via the
-                    // same claim_touch the queue bumps use, so the
-                    // disk probes happen at most once per chunk per
-                    // frame even when many triangles touch this chunk.
-                    let current_best = preview_source_lod.load(Ordering::Relaxed);
-                    if current_best > key.lod.saturating_add(1) {
-                        if let Some(new_lod) = self.try_upscale_from_parent(key, current_best) {
-                            preview_source_lod.store(new_lod, Ordering::Relaxed);
-                        }
-                    }
+                    // NB: the upscale-from-parent preview is synthesized
+                    // exactly once, at dispatch (see `dispatch_chunk`). We
+                    // deliberately do NOT re-run it here per frame to
+                    // "improve" the preview from a finer ancestor: the
+                    // composite reads the target-LOD shard mmap directly,
+                    // so once the real bytes land `write_atomic` overwrites
+                    // the preview in place and the next paint picks them up
+                    // with no paint-path work. Re-synthesizing every frame
+                    // was a 262k-voxel trilinear pass + 256 KB alloc per
+                    // visible Pending chunk per touching tile — pure churn.
                 }
             }
             if let ChunkState::CooldownMiss { until } = state.as_ref() {
