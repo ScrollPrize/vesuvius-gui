@@ -751,21 +751,6 @@ fn short_cooldown() -> Arc<ChunkState> {
 fn pending_state() -> Arc<ChunkState> {
     Arc::new(ChunkState::pending())
 }
-/// Construct a Pending state and stamp `preview_source_lod` to the
-/// LOD level whose bytes the caller already upsampled during dispatch
-/// (if any). `None` leaves the value at the no-preview sentinel
-/// (`u8::MAX`), so the per-frame retry walk will try to fill on the
-/// first touch.
-fn pending_state_with(preview_source_lod: Option<u8>) -> Arc<ChunkState> {
-    let state = pending_state();
-    if let Some(lod) = preview_source_lod {
-        if let ChunkState::Pending { preview_source_lod: pl, .. } = state.as_ref() {
-            pl.store(lod, Ordering::Relaxed);
-        }
-    }
-    state
-}
-
 impl PurgeTarget for Inner {
     fn volume_id(&self) -> String {
         self.disk.sidecar().header.volume_id.clone()
@@ -1017,9 +1002,22 @@ impl Inner {
         // "never tried" without ever consulting the DashMap once we've
         // primed it here — the bitmap is the single source of truth for
         // per-chunk presence going forward.
-        if let Err(e) = self.disk.mark_dispatched(key) {
-            log::trace!("[{}] mark_dispatched failed: {}", key, e);
-        }
+        // `mark_dispatched` flips the bitmap cell `Unknown→Dispatched` and
+        // returns `true` only on that first transition. The in-memory shard
+        // bitmap outlives this chunk's DashMap entry: purge demotes a
+        // *Resident* cell back to `Unknown` when it reclaims the bytes, but a
+        // preview-only cell (sidecar still MISSING, never Resident) keeps its
+        // `Dispatched` bit. So `first_dispatch` means precisely "no preview
+        // has been synthesized for this slot yet this session (or the real
+        // data it held was purged)" — which is exactly when we want to fill
+        // the preview.
+        let first_dispatch = match self.disk.mark_dispatched(key) {
+            Ok(transitioned) => transitioned,
+            Err(e) => {
+                log::trace!("[{}] mark_dispatched failed: {}", key, e);
+                false
+            }
+        };
 
         // Upscale-from-parent preview. Walks the LOD pyramid from
         // `key.lod + 1` toward `max_lod`, and at the first resident
@@ -1032,12 +1030,14 @@ impl Inner {
         // (and the real download is queued *after* this point, ordering
         // pwrites by submission).
         //
-        // Result captured into `upscaled_from` (the parent LOD the
-        // bytes came from, if any) and propagated into the returned
-        // Pending state's `preview_source_lod`, so the per-frame
-        // retry loop in `state_or_fetch` can decide whether a freshly
-        // resident finer ancestor would still improve the preview.
-        let upscaled_from = self.try_upscale_from_parent(key, u8::MAX);
+        // Gated on `first_dispatch` so the preview is synthesized at most
+        // once per slot per session — never re-run per frame (Step 1) nor
+        // on re-dispatch after DashMap eviction. Overlapping/adjacent tiles
+        // that re-enter dispatch for the same chunk reuse the existing
+        // preview bytes instead of re-running the 262k-voxel trilinear pass.
+        if first_dispatch {
+            self.try_upscale_from_parent(key);
+        }
 
         let plan = match self.backfiller.plan(key) {
             Ok(p) => p,
@@ -1094,7 +1094,7 @@ impl Inner {
         if order.is_empty() {
             // 0-source plan: queue Extract immediately.
             return match self.task_queue.try_submit(key, Task::Extract) {
-                Ok(()) => pending_state_with(upscaled_from),
+                Ok(()) => pending_state(),
                 Err(dropped) => {
                     log::debug!("[{}] dropped: extract queue full (dispatch)", key);
                     self.chunks.remove(&key);
@@ -1132,7 +1132,7 @@ impl Inner {
                 }
             }
         }
-        pending_state_with(upscaled_from)
+        pending_state()
     }
 
     fn register_source(self: &Arc<Self>, chunk_key: ChunkKey, spec: SourceSpec) -> RegisterResult {
@@ -1650,29 +1650,21 @@ impl Inner {
         }
     }
 
-    /// Walk the LOD pyramid from `key.lod + 1` toward `max_lod` and,
-    /// at the first resident ancestor finer than `current_best_lod`,
-    /// synthesize a `2^shift`× upsampled fill (nearest neighbor) and
-    /// pwrite it into the target shard's mmap region. Used to show a
-    /// preview while the real bytes stream in.
+    /// Walk the LOD pyramid from `key.lod + 1` toward `max_lod` and, at
+    /// the first resident ancestor, synthesize a `2^shift`× trilinear
+    /// upsampled fill and pwrite it into the target shard's mmap region
+    /// so the composite reads a sensible preview while the real bytes
+    /// stream in. The eventual `write_atomic` overwrites these bytes.
     ///
-    /// `current_best_lod` carries the LOD of the ancestor we last
-    /// upsampled from (or `u8::MAX` for "no preview yet"). The walk
-    /// stops as soon as `parent_lod >= current_best_lod` since
-    /// anything coarser than what we already have wouldn't improve
-    /// the preview. So on retry, only finer-than-current ancestors
-    /// can supersede the existing fill.
-    ///
-    /// Returns `Some(parent_lod)` when new preview bytes were written
-    /// from a resident ancestor at `parent_lod`, or `Some(key.lod + 1)`
-    /// when the CAS lost because the real fetch beat us (in which
-    /// case caller should record that as "done" so it stops retrying).
-    /// Returns `None` when no resident ancestor finer than
-    /// `current_best_lod` was found.
-    fn try_upscale_from_parent(&self, key: ChunkKey, current_best_lod: u8) -> Option<u8> {
+    /// Called exactly once per slot per session, from `dispatch_chunk`
+    /// gated on the bitmap's first `Unknown→Dispatched` transition — the
+    /// preview is never re-synthesized per frame or on re-dispatch (see
+    /// the call site). The walk takes the *finest* resident ancestor
+    /// (shifts ascend, so the first hit is finest) and stops there.
+    fn try_upscale_from_parent(&self, key: ChunkKey) {
         let max_lod = self.backfiller.max_lod();
         if key.lod >= max_lod {
-            return None;
+            return;
         }
         // `shift > 6` would map a target chunk to a sub-voxel position
         // in the parent which we can't address, so cap the walk there
@@ -1680,12 +1672,6 @@ impl Inner {
         let max_shift: u8 = (max_lod - key.lod).min(6);
         for shift in 1..=max_shift {
             let parent_lod = key.lod + shift;
-            // No improvement possible — current preview already came
-            // from an equal or finer ancestor. Subsequent shifts only
-            // get coarser, so break.
-            if parent_lod >= current_best_lod {
-                break;
-            }
             let parent_key = ChunkKey::new(parent_lod, key.x >> shift, key.y >> shift, key.z >> shift);
             let (mmap, offset) = match self.disk.load(parent_key) {
                 LoadOutcome::Resident { mmap, offset } => (mmap, offset),
@@ -1695,35 +1681,29 @@ impl Inner {
             let bytes = upsample_from_parent(parent_slice, key.x, key.y, key.z, shift);
             match self.disk.write_unconfirmed(key, &bytes) {
                 Ok(true) => {
-                    // The source parent is now serving as a live
-                    // preview backing for this frame's composite — LRU-
-                    // bump it (CAS + histogram) so the purge sweep
-                    // keeps it warm. The target chunk's sidecar slot is
-                    // still MISSING (write_unconfirmed reset it), so
-                    // its access_epoch isn't visible to the purger, but
-                    // stamp the byte anyway so any later code that
-                    // inspects it sees this frame's epoch.
+                    // The source parent is now serving as a live preview
+                    // backing for the composite — LRU-bump it (CAS +
+                    // histogram) so the purge sweep keeps it warm. The
+                    // target chunk's sidecar slot is still MISSING
+                    // (write_unconfirmed reset it), so its access_epoch
+                    // isn't visible to the purger, but stamp the byte
+                    // anyway so any later code that inspects it sees this
+                    // frame's epoch.
                     self.touch_access_inline(parent_key);
                     self.disk.set_access_epoch(key, self.epoch.current());
-                    return Some(parent_lod);
                 }
                 Ok(false) => {
                     // CAS lost — target was already non-MISSING (real
-                    // fetch beat us, or a peer upscaler raced us
-                    // through). Still bump the parent we read. Report
-                    // `key.lod + 1` so the caller stops retrying:
-                    // there's nothing finer than the finest parent,
-                    // and we can't overwrite what's there anyway.
+                    // fetch beat us, or a peer raced us through). Still
+                    // bump the parent we read.
                     self.touch_access_inline(parent_key);
-                    return Some(key.lod + 1);
                 }
                 Err(e) => {
                     log::debug!("[{}] upscale-from-parent write failed: {}", key, e);
-                    return None;
                 }
             }
+            return;
         }
-        None
     }
 
     /// Bump `key`'s access-epoch tag to the current epoch with histogram
