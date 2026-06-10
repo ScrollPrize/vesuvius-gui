@@ -43,16 +43,17 @@ use super::backfiller::{
 use super::disk::{ChunkBitState, DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone};
 use super::epoch::{self, EpochState};
+use super::lifo::{LifoQueue, QueueEntry};
 use super::purge::{PurgePlan, PurgeTarget};
 use super::spill::SpillStore;
 use super::state::{ChunkKey, ChunkState};
 use super::{CHUNK_VOXELS, MAX_AGE};
 use dashmap::DashMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, SystemTime};
 
 const COOLDOWN: Duration = Duration::from_secs(10);
 const SHORT_COOLDOWN: Duration = Duration::from_millis(150);
@@ -96,7 +97,11 @@ struct Inner {
     /// child chunk lands here — multiple parents waiting on the same child
     /// all attach as waiters on the same source state.
     pending_chunk_sources: DashMap<ChunkKey, Vec<String>>,
-    task_queue: TaskQueue,
+    /// Pure-LIFO queue for cache-side `Task`s (see `lifo.rs` for the
+    /// ordering + age-cull model). Dedup happens at this layer:
+    /// source-key uniqueness for FetchSource, at most one Extract per
+    /// chunk via `satisfy`.
+    task_queue: LifoQueue<Task>,
     downloader: Arc<Downloader>,
     /// Frame counter that gates per-Pending touch debouncing. Bumped by
     /// `ChunkCache::advance_frame` (called from `reset_for_painting` at
@@ -151,49 +156,6 @@ enum Task {
         fetch: Box<dyn FnOnce() -> SourceOutcome + Send + 'static>,
     },
     Extract,
-}
-
-/// Pure-LIFO queue for cache-side `Task`s. BTreeMap keyed by `!seq` so the
-/// most recently submitted (or re-touched) entry pops first. Earlier
-/// iterations split work across LOD-rank and viewport-distance tiers, but
-/// in practice that let coarse-LOD work outrank current-viewport work and
-/// stall painting. The simpler model: paint always asks for what it wants
-/// right now, and "right now" wins. Older requests slide toward the tail
-/// and either get processed in LIFO order when workers catch up, or culled
-/// by `MAX_AGE`.
-///
-/// `chunk_index` mirrors `entries` keyed by `ChunkKey` for the O(1) lookup
-/// `touch` needs to refresh seq + `added_at` on in-flight entries.
-///
-/// Unbounded; dedup happens at the cache layer (source-key + chunk-key
-/// uniqueness). The only staleness check is age — see the module docs.
-struct TaskQueue {
-    inner: Mutex<TaskQueueInner>,
-    not_empty: Condvar,
-    max_age: Duration,
-}
-
-struct TaskQueueInner {
-    entries: BTreeMap<u64, TaskEntry>,
-    /// Reverse lookup: every queue key currently registered for a given
-    /// chunk. A chunk can have several (its sources' FetchSource tasks,
-    /// plus an Extract task once sources resolve). Maintained in lockstep
-    /// with `entries`.
-    chunk_index: HashMap<ChunkKey, Vec<u64>>,
-    next_seq: u64,
-}
-
-/// Encode `seq` so that **larger** seq sorts BEFORE smaller (BTreeMap pops
-/// smallest key first → LIFO). `seq` is monotonically increasing so `!seq`
-/// is monotonically decreasing.
-fn rev_seq(seq: u64) -> u64 {
-    !seq
-}
-
-struct TaskEntry {
-    chunk: ChunkKey,
-    added_at: Instant,
-    task: Task,
 }
 
 enum RegisterResult {
@@ -410,7 +372,7 @@ impl ChunkCache {
         downloader: Arc<Downloader>,
         epoch: Arc<EpochState>,
     ) -> Arc<Inner> {
-        let task_queue = TaskQueue::new(MAX_AGE);
+        let task_queue = LifoQueue::new(MAX_AGE);
         let spill_root = root.join("spill");
         let chunks_root = root;
         let _ = std::fs::create_dir_all(&spill_root);
@@ -1596,12 +1558,12 @@ impl Inner {
         }
     }
 
-    /// Handle a `TaskEntry` that the queue culled by age. Acts
+    /// Handle a task entry that the queue culled by age. Acts
     /// as if the task ran and failed transiently:
     /// `FetchSource` resolves with a Transient error so waiters back off;
     /// `Extract` just cleans up progress and reverts the chunk to cooldown.
-    fn cancel_dropped_task(self: &Arc<Self>, entry: TaskEntry, reason: &str) {
-        match entry.task {
+    fn cancel_dropped_task(self: &Arc<Self>, entry: QueueEntry<Task>, reason: &str) {
+        match entry.item {
             Task::FetchSource { key, fetch: _ } => {
                 log::trace!("[{}] cancel: {}", key, reason);
                 self.complete_source(key, Err(BackfillError::Transient(reason.into())));
@@ -1726,96 +1688,6 @@ impl Inner {
     }
 }
 
-impl TaskQueue {
-    fn new(max_age: Duration) -> Self {
-        Self {
-            inner: Mutex::new(TaskQueueInner {
-                entries: BTreeMap::new(),
-                chunk_index: HashMap::new(),
-                next_seq: 0,
-            }),
-            not_empty: Condvar::new(),
-            max_age,
-        }
-    }
-
-    /// Submit a task. The queue is unbounded — cache-layer dedup ensures
-    /// we don't queue duplicate Fetch/Extract tasks for the same key —
-    /// so submission always succeeds; the only way a task dies
-    /// unprocessed is the MAX_AGE cull at pop.
-    fn submit(&self, chunk: ChunkKey, task: Task) {
-        let mut q = self.inner.lock().unwrap();
-        q.next_seq += 1;
-        let key = rev_seq(q.next_seq);
-        q.entries.insert(
-            key,
-            TaskEntry {
-                chunk,
-                added_at: Instant::now(),
-                task,
-            },
-        );
-        q.chunk_index.entry(chunk).or_default().push(key);
-        self.not_empty.notify_one();
-    }
-
-    /// Refresh every queued entry for `chunk`: bump its seq (moving it
-    /// to the head of the LIFO order) and reset `added_at` so MAX_AGE
-    /// re-counts from now. No-op when the chunk has no queued entries.
-    fn touch(&self, chunk: ChunkKey) {
-        let mut q = self.inner.lock().unwrap();
-        let old_keys = match q.chunk_index.remove(&chunk) {
-            Some(v) if !v.is_empty() => v,
-            _ => return,
-        };
-        let mut new_keys = Vec::with_capacity(old_keys.len());
-        let now = Instant::now();
-        for old_key in old_keys {
-            let Some(mut entry) = q.entries.remove(&old_key) else {
-                continue;
-            };
-            entry.added_at = now;
-            q.next_seq += 1;
-            let new_key = rev_seq(q.next_seq);
-            q.entries.insert(new_key, entry);
-            new_keys.push(new_key);
-        }
-        if !new_keys.is_empty() {
-            q.chunk_index.insert(chunk, new_keys);
-            self.not_empty.notify_one();
-        }
-    }
-
-    /// Block until a non-stale entry is available. Entries dropped along
-    /// the way (older than `max_age`) are surfaced as `dropped` so the
-    /// caller can run their cancellation paths.
-    fn pop(&self) -> (TaskEntry, Vec<TaskEntry>) {
-        let mut q = self.inner.lock().unwrap();
-        let mut dropped: Vec<TaskEntry> = Vec::new();
-        loop {
-            let Some((key, entry)) = q.entries.pop_first() else {
-                q = self.not_empty.wait(q).unwrap();
-                continue;
-            };
-            forget_chunk_key(&mut q.chunk_index, entry.chunk, key);
-            if entry.added_at.elapsed() > self.max_age {
-                dropped.push(entry);
-                continue;
-            }
-            return (entry, dropped);
-        }
-    }
-}
-
-fn forget_chunk_key(index: &mut HashMap<ChunkKey, Vec<u64>>, chunk: ChunkKey, key: u64) {
-    if let Some(keys) = index.get_mut(&chunk) {
-        keys.retain(|k| *k != key);
-        if keys.is_empty() {
-            index.remove(&chunk);
-        }
-    }
-}
-
 fn worker_loop(inner: Arc<Inner>) {
     loop {
         let (entry, dropped) = inner.task_queue.pop();
@@ -1826,7 +1698,7 @@ fn worker_loop(inner: Arc<Inner>) {
         // leave stale work in the queue. Drop it instead of doing
         // redundant disk + decode work.
         let chunk = entry.chunk;
-        match &entry.task {
+        match &entry.item {
             Task::Extract => {
                 if inner.is_chunk_done(chunk) {
                     log::trace!("[{}] skip extract (already terminal)", chunk);
@@ -1841,7 +1713,7 @@ fn worker_loop(inner: Arc<Inner>) {
                 }
             }
         }
-        match entry.task {
+        match entry.item {
             Task::FetchSource { key, fetch } => inner.fetch_source(key, fetch),
             Task::Extract => inner.extract_chunk(chunk),
         }

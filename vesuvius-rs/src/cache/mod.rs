@@ -16,6 +16,7 @@ mod backfiller;
 mod cache;
 mod disk;
 mod downloader;
+mod lifo;
 pub mod epoch;
 pub mod purge;
 mod sidecar;
