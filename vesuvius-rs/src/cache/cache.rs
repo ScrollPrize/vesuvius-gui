@@ -1353,7 +1353,10 @@ impl Inner {
                             Ok(mmap) => Ok(Some(Arc::new(mmap) as SourcePayload)),
                             Err(e) => {
                                 log::warn!("[{}] spill failed ({}); falling back to in-memory", key_for_done, e);
-                                Ok(Some(Arc::new(bytes) as SourcePayload))
+                                // Rare path: materialize as Vec<u8> so the
+                                // extract closures' downcast arms stay
+                                // unchanged.
+                                Ok(Some(Arc::new(bytes.to_vec()) as SourcePayload))
                             }
                         },
                         Ok(None) => Ok(None),

@@ -13,6 +13,7 @@ resolver = "2"
 anyhow          = { version = "1" }
 async-recursion = { version = "1" }
 base64          = { version = "0.22" }
+bytes           = { version = "1" }
 cc              = { version = "1" }
 clap            = { version = "4", features = [ "derive" ] }
 dashmap         = { version = "6" }

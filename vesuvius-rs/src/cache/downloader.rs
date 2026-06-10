@@ -33,7 +33,10 @@ pub enum DownloadError {
     Transient(String),
 }
 
-pub type DownloadResult = Result<Option<Vec<u8>>, DownloadError>;
+/// Successful bodies are delivered as `bytes::Bytes` — the zero-copy
+/// buffer `reqwest` already produced. Converting to `Vec<u8>` here would
+/// copy every multi-MB shard read a second time before the spill write.
+pub type DownloadResult = Result<Option<bytes::Bytes>, DownloadError>;
 
 pub type OnDone = Box<dyn FnOnce(DownloadResult) + Send + 'static>;
 
@@ -323,7 +326,7 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
                     match resp.bytes() {
                         Ok(bytes) => {
                             log::trace!("[{}] {} ({} bytes, {:?})", entry.url, code, bytes.len(), t0.elapsed());
-                            Ok(Some(bytes.to_vec()))
+                            Ok(Some(bytes))
                         }
                         Err(e) => Err(DownloadError::Transient(format!("read body: {}", e))),
                     }
