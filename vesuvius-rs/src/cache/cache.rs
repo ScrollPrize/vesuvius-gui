@@ -41,7 +41,7 @@ use super::backfiller::{
     BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, SourceOutcome, SourcePayload, SourceSpec,
 };
 use super::disk::{ChunkBitState, DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
-use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone, SubmitResult};
+use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone};
 use super::epoch::{self, EpochState};
 use super::purge::{PurgePlan, PurgeTarget};
 use super::spill::SpillStore;
@@ -181,7 +181,6 @@ struct TaskQueueInner {
     /// with `entries`.
     chunk_index: HashMap<ChunkKey, Vec<u64>>,
     next_seq: u64,
-    closed: bool,
 }
 
 /// Encode `seq` so that **larger** seq sorts BEFORE smaller (BTreeMap pops
@@ -204,18 +203,6 @@ enum RegisterResult {
     AttachedPending,
     /// Source already resolved; outcome is returned for the caller to apply.
     AlreadyDone(SourceOutcome),
-    /// Task / download queue is full; nothing was registered.
-    QueueFull,
-}
-
-enum SatisfyResult {
-    /// Either: progress updated and we're still waiting on other sources,
-    /// or: all sources done and the Extract task was queued successfully,
-    /// or: chunk progress was already evicted.
-    Ok,
-    /// All sources done but the Extract task couldn't be enqueued. Caller
-    /// should put the chunk into a short cooldown so paint retries.
-    QueueFullOnExtract,
 }
 
 /// Process-wide handle to one unified cache root (`<cache_dir>/unified/`).
@@ -1142,44 +1129,26 @@ impl Inner {
 
         if order.is_empty() {
             // 0-source plan: queue Extract immediately.
-            return match self.task_queue.try_submit(key, Task::Extract) {
-                Ok(()) => pending_state(),
-                Err(dropped) => {
-                    log::debug!("[{}] dropped: extract queue full (dispatch)", key);
-                    self.chunks.remove(&key);
-                    drop(dropped);
-                    short_cooldown()
-                }
-            };
+            self.task_queue.submit(key, Task::Extract);
+            return pending_state();
         }
 
         // Register sources. Track immediate Dones so we can satisfy them
         // after the loop (avoids deep recursion through self.satisfy during
-        // dispatch, and lets us bail on queue-full cleanly).
+        // dispatch).
         let mut immediates: Vec<(String, SourceOutcome)> = Vec::new();
         for spec in sources {
             let source_key = spec.key().to_string();
             match self.register_source(key, spec) {
                 RegisterResult::Queued | RegisterResult::AttachedPending => {}
                 RegisterResult::AlreadyDone(outcome) => immediates.push((source_key, outcome)),
-                RegisterResult::QueueFull => {
-                    log::debug!("[{}] dropped: source queue full (dispatch)", key);
-                    self.chunks.remove(&key);
-                    return short_cooldown();
-                }
             }
         }
 
-        // Apply immediates. If they push the chunk to Extract-ready, queue
-        // Extract here.
+        // Apply immediates. If they push the chunk to Extract-ready, the
+        // Extract task is queued inside `satisfy`.
         for (sk, outcome) in immediates {
-            match self.satisfy(key, &sk, outcome) {
-                SatisfyResult::Ok => {}
-                SatisfyResult::QueueFullOnExtract => {
-                    log::debug!("[{}] dropped: extract queue full (immediate)", key);
-                    return short_cooldown();
-                }
-            }
+            self.satisfy(key, &sk, outcome);
         }
         pending_state()
     }
@@ -1191,11 +1160,11 @@ impl Inner {
         // an existing source or install a fresh `Pending` placeholder for
         // this source key.
         //
-        // We MUST NOT call `downloader.try_submit` or `task_queue.try_submit`
-        // while holding this lock. Both can fire callbacks synchronously
-        // (downloader on queue-full / eviction). Those callbacks re-enter
-        // `complete_source`, which locks `self.sources` again on the same
-        // thread — a self-deadlock that wedged the cache after a few frames.
+        // We MUST NOT call `downloader.submit` or `task_queue.submit`
+        // while holding this lock — submission can synchronously invoke
+        // callbacks that re-enter `complete_source`, which locks
+        // `self.sources` again on the same thread — a self-deadlock that
+        // wedged the cache after a few frames.
         enum Slot {
             Existing(Arc<Mutex<SourceState>>),
             Fresh,
@@ -1245,29 +1214,15 @@ impl Inner {
         // Dispatch the fetch with no locks held.
         match spec {
             SourceSpec::Compute { key: _, fetch } => {
-                match self.task_queue.try_submit(
+                self.task_queue.submit(
                     chunk_key,
                     Task::FetchSource {
                         key: source_key.clone(),
                         fetch,
                     },
-                ) {
-                    Ok(()) => {
-                        log::trace!("[{}] queued (chunk {})", source_key, chunk_key);
-                        RegisterResult::Queued
-                    }
-                    Err(_dropped) => {
-                        // Roll the placeholder forward to Done(Err) so any
-                        // concurrent waiters (the only chunk that could have
-                        // attached after we released the lock) get notified.
-                        log::trace!("[{}] dropped: cache queue full", source_key);
-                        self.complete_source(
-                            source_key,
-                            Err(BackfillError::Transient("cache queue full".into())),
-                        );
-                        RegisterResult::QueueFull
-                    }
-                }
+                );
+                log::trace!("[{}] queued (chunk {})", source_key, chunk_key);
+                RegisterResult::Queued
             }
             SourceSpec::Chunk { key: _, chunk_key: child_key } => {
                 // Register our interest BEFORE dispatching the child. If
@@ -1351,23 +1306,12 @@ impl Inner {
                     inner.complete_source(key_for_done, outcome);
                 });
 
-                // Submit without holding self.sources. The downloader may
-                // synchronously fire `on_done` (queue full / eviction), which
-                // calls complete_source — that path now safely re-locks
-                // self.sources.
-                match self.downloader.try_submit(&url, range, chunk_key, on_done) {
-                    SubmitResult::Submitted => {
-                        log::trace!("[{}] submitted (chunk {})", source_key, chunk_key);
-                        RegisterResult::Queued
-                    }
-                    SubmitResult::QueueFull => {
-                        // The downloader already invoked our on_done with
-                        // Err synchronously — complete_source has run and
-                        // cleared the placeholder. Nothing more to do.
-                        log::trace!("[{}] dropped: downloader queue full", source_key);
-                        RegisterResult::QueueFull
-                    }
-                }
+                // Submit without holding self.sources — the aged-out
+                // cancellation path invokes `on_done`, which calls
+                // complete_source and re-locks self.sources.
+                self.downloader.submit(&url, range, chunk_key, on_done);
+                log::trace!("[{}] submitted (chunk {})", source_key, chunk_key);
+                RegisterResult::Queued
             }
         }
     }
@@ -1438,23 +1382,16 @@ impl Inner {
         }
 
         for w in waiters {
-            if matches!(
-                self.satisfy(w, &source_key, outcome.clone()),
-                SatisfyResult::QueueFullOnExtract
-            ) {
-                self.map.insert(w, short_cooldown());
-            }
+            self.satisfy(w, &source_key, outcome.clone());
         }
     }
 
-    /// Apply one source's outcome to the chunk's progress. Returns
-    /// `QueueFullOnExtract` only when all sources are now resolved but
-    /// the resulting Extract task couldn't be enqueued; caller must then
-    /// move the chunk to a short cooldown.
-    fn satisfy(self: &Arc<Self>, chunk_key: ChunkKey, source_key: &str, outcome: SourceOutcome) -> SatisfyResult {
+    /// Apply one source's outcome to the chunk's progress; when the last
+    /// outstanding source resolves, queue the Extract task.
+    fn satisfy(self: &Arc<Self>, chunk_key: ChunkKey, source_key: &str, outcome: SourceOutcome) {
         let arc = match self.chunks.get(&chunk_key).map(|e| e.clone()) {
             Some(a) => a,
-            None => return SatisfyResult::Ok,
+            None => return,
         };
         let queue_extract = {
             let mut p = arc.lock().unwrap();
@@ -1467,16 +1404,7 @@ impl Inner {
             }
         };
         if queue_extract {
-            match self.task_queue.try_submit(chunk_key, Task::Extract) {
-                Ok(()) => SatisfyResult::Ok,
-                Err(_dropped) => {
-                    log::debug!("[{}] dropped: extract queue full", chunk_key);
-                    self.chunks.remove(&chunk_key);
-                    SatisfyResult::QueueFullOnExtract
-                }
-            }
-        } else {
-            SatisfyResult::Ok
+            self.task_queue.submit(chunk_key, Task::Extract);
         }
     }
 
@@ -1543,7 +1471,7 @@ impl Inner {
                 // Aged-out / cancelled fetches aren't a chunk failure — they
                 // just mean the viewport moved on before the source landed.
                 // Surface them as cancellations so they don't look like errors.
-                if reason.contains("aged out") || reason.contains("queue closed") {
+                if reason.contains("aged out") {
                     log::trace!("[{}] cancelled: {}", key, reason);
                 } else {
                     log::debug!("[{}] transient: {}", key, reason);
@@ -1668,7 +1596,7 @@ impl Inner {
         }
     }
 
-    /// Handle a `TaskEntry` that the queue dropped (age / shutdown). Acts
+    /// Handle a `TaskEntry` that the queue culled by age. Acts
     /// as if the task ran and failed transiently:
     /// `FetchSource` resolves with a Transient error so waiters back off;
     /// `Extract` just cleans up progress and reverts the chunk to cooldown.
@@ -1805,21 +1733,18 @@ impl TaskQueue {
                 entries: BTreeMap::new(),
                 chunk_index: HashMap::new(),
                 next_seq: 0,
-                closed: false,
             }),
             not_empty: Condvar::new(),
             max_age,
         }
     }
 
-    /// Submit a task. Only fails if the queue is closed (shutdown). The
-    /// queue is otherwise unbounded; cache-layer dedup ensures we don't
-    /// queue duplicate Fetch/Extract tasks for the same key.
-    fn try_submit(&self, chunk: ChunkKey, task: Task) -> Result<(), Task> {
+    /// Submit a task. The queue is unbounded — cache-layer dedup ensures
+    /// we don't queue duplicate Fetch/Extract tasks for the same key —
+    /// so submission always succeeds; the only way a task dies
+    /// unprocessed is the MAX_AGE cull at pop.
+    fn submit(&self, chunk: ChunkKey, task: Task) {
         let mut q = self.inner.lock().unwrap();
-        if q.closed {
-            return Err(task);
-        }
         q.next_seq += 1;
         let key = rev_seq(q.next_seq);
         q.entries.insert(
@@ -1832,7 +1757,6 @@ impl TaskQueue {
         );
         q.chunk_index.entry(chunk).or_default().push(key);
         self.not_empty.notify_one();
-        Ok(())
     }
 
     /// Refresh every queued entry for `chunk`: bump its seq (moving it
@@ -1862,17 +1786,13 @@ impl TaskQueue {
         }
     }
 
-    /// Block until either a non-stale entry is available (returned) or the
-    /// queue is closed. Entries dropped along the way (older than
-    /// `max_age`) are surfaced as `dropped` so the caller can run their
-    /// cancellation paths.
-    fn pop(&self) -> PopResult {
+    /// Block until a non-stale entry is available. Entries dropped along
+    /// the way (older than `max_age`) are surfaced as `dropped` so the
+    /// caller can run their cancellation paths.
+    fn pop(&self) -> (TaskEntry, Vec<TaskEntry>) {
         let mut q = self.inner.lock().unwrap();
         let mut dropped: Vec<TaskEntry> = Vec::new();
         loop {
-            if q.closed && q.entries.is_empty() {
-                return PopResult::Closed { dropped };
-            }
             let Some((key, entry)) = q.entries.pop_first() else {
                 q = self.not_empty.wait(q).unwrap();
                 continue;
@@ -1882,7 +1802,7 @@ impl TaskQueue {
                 dropped.push(entry);
                 continue;
             }
-            return PopResult::Ready { entry, dropped };
+            return (entry, dropped);
         }
     }
 }
@@ -1896,53 +1816,34 @@ fn forget_chunk_key(index: &mut HashMap<ChunkKey, Vec<u64>>, chunk: ChunkKey, ke
     }
 }
 
-enum PopResult {
-    Ready {
-        entry: TaskEntry,
-        dropped: Vec<TaskEntry>,
-    },
-    Closed {
-        dropped: Vec<TaskEntry>,
-    },
-}
-
 fn worker_loop(inner: Arc<Inner>) {
     loop {
-        match inner.task_queue.pop() {
-            PopResult::Ready { entry, dropped } => {
-                for d in dropped {
-                    inner.cancel_dropped_task(d, "stale on pop");
-                }
-                // Skip-met: cooldown-retry races or duplicate enqueues can
-                // leave stale work in the queue. Drop it instead of doing
-                // redundant disk + decode work.
-                let chunk = entry.chunk;
-                match &entry.task {
-                    Task::Extract => {
-                        if inner.is_chunk_done(chunk) {
-                            log::trace!("[{}] skip extract (already terminal)", chunk);
-                            inner.chunks.remove(&chunk);
-                            continue;
-                        }
-                    }
-                    Task::FetchSource { key, .. } => {
-                        if inner.is_source_done(key) {
-                            log::trace!("[{}] skip fetch (already done)", key);
-                            continue;
-                        }
-                    }
-                }
-                match entry.task {
-                    Task::FetchSource { key, fetch } => inner.fetch_source(key, fetch),
-                    Task::Extract => inner.extract_chunk(chunk),
+        let (entry, dropped) = inner.task_queue.pop();
+        for d in dropped {
+            inner.cancel_dropped_task(d, "stale on pop");
+        }
+        // Skip-met: cooldown-retry races or duplicate enqueues can
+        // leave stale work in the queue. Drop it instead of doing
+        // redundant disk + decode work.
+        let chunk = entry.chunk;
+        match &entry.task {
+            Task::Extract => {
+                if inner.is_chunk_done(chunk) {
+                    log::trace!("[{}] skip extract (already terminal)", chunk);
+                    inner.chunks.remove(&chunk);
+                    continue;
                 }
             }
-            PopResult::Closed { dropped } => {
-                for d in dropped {
-                    inner.cancel_dropped_task(d, "queue closed");
+            Task::FetchSource { key, .. } => {
+                if inner.is_source_done(key) {
+                    log::trace!("[{}] skip fetch (already done)", key);
+                    continue;
                 }
-                return;
             }
+        }
+        match entry.task {
+            Task::FetchSource { key, fetch } => inner.fetch_source(key, fetch),
+            Task::Extract => inner.extract_chunk(chunk),
         }
     }
 }

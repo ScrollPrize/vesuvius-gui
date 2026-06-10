@@ -40,15 +40,6 @@ pub type DownloadResult = Result<Option<bytes::Bytes>, DownloadError>;
 
 pub type OnDone = Box<dyn FnOnce(DownloadResult) + Send + 'static>;
 
-#[derive(Debug)]
-pub enum SubmitResult {
-    /// Job was queued.
-    Submitted,
-    /// Downloader was shut down; nothing queued. `on_done` was invoked with
-    /// a Transient error so the cache's cancellation path runs uniformly.
-    QueueFull,
-}
-
 pub struct Downloader {
     inner: Arc<DownloaderInner>,
 }
@@ -76,7 +67,6 @@ struct Queue {
     /// with `entries` on submit, pop, and touch.
     chunk_index: HashMap<ChunkKey, Vec<u64>>,
     next_seq: u64,
-    closed: bool,
 }
 
 fn rev_seq(seq: u64) -> u64 {
@@ -112,7 +102,6 @@ impl Downloader {
                 entries: BTreeMap::new(),
                 chunk_index: HashMap::new(),
                 next_seq: 0,
-                closed: false,
             }),
             not_empty: Condvar::new(),
             max_age,
@@ -140,58 +129,33 @@ impl Downloader {
         Self { inner }
     }
 
-    /// Non-blocking submission.
+    /// Non-blocking submission. The queue is unbounded — dedup happens at
+    /// the cache's source map — so submission always succeeds; the only
+    /// way a job dies unprocessed is the MAX_AGE cull at pop, which
+    /// invokes `on_done` with a Transient error.
     ///
     /// `chunk` is the cache chunk this download is on behalf of (used for
     /// logging + the in-flight counter — the downloader doesn't otherwise
     /// schedule based on it). `range`, when `Some((offset, len))`, becomes
     /// a `Range: bytes=offset-(offset+len-1)` header on the request; 206
     /// Partial Content is accepted as success.
-    ///
-    /// On `QueueFull`, `on_done` is invoked synchronously with
-    /// `Err(Transient(...))` so the caller's cancellation path runs
-    /// uniformly with stale-pop cancellation. Callers MUST NOT hold any
-    /// lock that `on_done` re-enters.
-    pub fn try_submit(
-        &self,
-        url: &str,
-        range: Option<(u64, u64)>,
-        chunk: ChunkKey,
-        on_done: OnDone,
-    ) -> SubmitResult {
-        let rejected_on_done = {
-            let mut q = self.inner.queue.lock().unwrap();
-            if q.closed {
-                Some(on_done)
-            } else {
-                q.next_seq += 1;
-                let key = rev_seq(q.next_seq);
-                q.entries.insert(
-                    key,
-                    Entry {
-                        url: url.to_string(),
-                        range,
-                        chunk,
-                        added_at: Instant::now(),
-                        on_done,
-                    },
-                );
-                q.chunk_index.entry(chunk).or_default().push(key);
-                self.inner.not_empty.notify_one();
-                None
-            }
-        };
-        match rejected_on_done {
-            None => {
-                log::trace!("[{}] submitted", url);
-                SubmitResult::Submitted
-            }
-            Some(on_done) => {
-                log::trace!("[{}] dropped: downloader closed", url);
-                on_done(Err(DownloadError::Transient("downloader closed".into())));
-                SubmitResult::QueueFull
-            }
-        }
+    pub fn submit(&self, url: &str, range: Option<(u64, u64)>, chunk: ChunkKey, on_done: OnDone) {
+        let mut q = self.inner.queue.lock().unwrap();
+        q.next_seq += 1;
+        let key = rev_seq(q.next_seq);
+        q.entries.insert(
+            key,
+            Entry {
+                url: url.to_string(),
+                range,
+                chunk,
+                added_at: Instant::now(),
+                on_done,
+            },
+        );
+        q.chunk_index.entry(chunk).or_default().push(key);
+        self.inner.not_empty.notify_one();
+        log::trace!("[{}] submitted", url);
     }
 
     /// True iff a worker is currently executing an HTTP GET for at least one
@@ -273,9 +237,6 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
             let mut q = inner.queue.lock().unwrap();
             let max_age = inner.max_age;
             loop {
-                if q.closed && q.entries.is_empty() {
-                    return;
-                }
                 let Some((key, entry)) = q.entries.pop_first() else {
                     q = inner.not_empty.wait(q).unwrap();
                     continue;
