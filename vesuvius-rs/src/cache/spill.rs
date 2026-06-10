@@ -37,18 +37,15 @@ impl SpillStore {
 
     /// Write `bytes` to a temp file under `root`, mmap, then unlink. The
     /// returned `Mmap` is the only reference to the inode after this
-    /// returns — drop it and the kernel reclaims the file. The
-    /// `source_key` parameter is accepted for symmetry with previous
-    /// designs but currently used only in log messages: spill files are
-    /// single-use and never looked up by key.
-    pub fn write_and_mmap(&self, source_key: &str, bytes: &[u8]) -> std::io::Result<Mmap> {
+    /// returns — drop it and the kernel reclaims the file. Spill files
+    /// are single-use and never looked up again by name.
+    pub fn write_and_mmap(&self, bytes: &[u8]) -> std::io::Result<Mmap> {
         std::fs::create_dir_all(&self.root)?;
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let tid = std::thread::current().id();
-        let path = self.root.join(format!("spill-{}-{:?}-{}.bin", pid, tid, n));
+        let path = self.root.join(format!("spill-{}-{}.bin", pid, n));
 
         {
             let mut f = File::create(&path)?;
@@ -60,12 +57,7 @@ impl SpillStore {
         // file alive. Failure here is non-fatal — worst case the file is
         // left behind for the next run to clean up.
         if let Err(e) = std::fs::remove_file(&path) {
-            log::trace!(
-                "[{}] spill unlink failed: {} (leaving {} on disk)",
-                source_key,
-                e,
-                path.display()
-            );
+            log::trace!("spill unlink failed: {} (leaving {} on disk)", e, path.display());
         }
         Ok(mmap)
     }
@@ -91,7 +83,7 @@ mod tests {
         let root = tmp_root();
         let store = SpillStore::new(&root);
         let bytes: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
-        let mmap = store.write_and_mmap("vol/L00/0/0/0", &bytes).unwrap();
+        let mmap = store.write_and_mmap(&bytes).unwrap();
         assert_eq!(mmap.len(), bytes.len());
         assert_eq!(&mmap[..16], &bytes[..16]);
     }
@@ -100,7 +92,7 @@ mod tests {
     fn file_is_unlinked_after_write() {
         let root = tmp_root();
         let store = SpillStore::new(&root);
-        let _mmap = store.write_and_mmap("vol/L00/0/0/0", &[42u8; 128]).unwrap();
+        let _mmap = store.write_and_mmap(&[42u8; 128]).unwrap();
         // The mmap holds the inode but the directory entry must be gone.
         let listing: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
@@ -121,7 +113,7 @@ mod tests {
         let root = tmp_root();
         let store = SpillStore::new(&root);
         let bytes: Vec<u8> = (0..1024u32).map(|i| (i * 31 & 0xff) as u8).collect();
-        let mmap = store.write_and_mmap("anon-test", &bytes).unwrap();
+        let mmap = store.write_and_mmap(&bytes).unwrap();
         assert_eq!(&mmap[..], &bytes[..]);
     }
 }

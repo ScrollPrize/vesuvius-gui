@@ -1290,7 +1290,7 @@ impl Inner {
                     // downloads complete faster than the (limited) cache
                     // workers can extract them.
                     let outcome: SourceOutcome = match result {
-                        Ok(Some(bytes)) => match inner.spill.write_and_mmap(&key_for_done, &bytes) {
+                        Ok(Some(bytes)) => match inner.spill.write_and_mmap(&bytes) {
                             Ok(mmap) => Ok(Some(Arc::new(mmap) as SourcePayload)),
                             Err(e) => {
                                 log::warn!("[{}] spill failed ({}); falling back to in-memory", key_for_done, e);

@@ -394,14 +394,6 @@ impl Sidecar {
         self.mmap.flush()
     }
 
-    /// Asynchronously hint to the kernel to schedule writeback of dirty
-    /// pages (msync(MS_ASYNC)). Returns immediately; durability is not
-    /// guaranteed on return. Used as a low-cost periodic nudge.
-    #[allow(dead_code)]
-    pub fn flush_async(&self) -> std::io::Result<()> {
-        self.mmap.flush_async()
-    }
-
     /// Read the access epoch tagged on `(lod, idx)`. Returns 0 for slots
     /// that have never been touched (or were reloaded from an older
     /// sidecar format).
