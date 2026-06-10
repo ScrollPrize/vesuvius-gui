@@ -13,12 +13,14 @@
 //! up promptly while detail streams in.
 //!
 //! `get()` is the per-voxel sampler used by surface (ObjVolume) and PPM
-//! renderers that don't go through `UnifiedVolume::paint`. It can't rely on
-//! a prior pre-dispatch pass, so on a target-LOD miss it dispatches every
-//! coarser LOD along the same column and picks the first resident one. The
-//! per-volume hot slot caches that chosen `(lod, chunk_state)` keyed by the
-//! target-LOD chunk so subsequent pixels in the same target chunk skip the
-//! pyramid walk entirely.
+//! renderers that don't go through `UnifiedVolume::paint`. It climbs the
+//! pyramid through the per-LOD shard hot slots (`resolve_chunk`): each
+//! level is one atomic bitmap probe, a chunk found `Unknown` gets its
+//! dispatch kicked off exactly once, and the first `Resident` level wins
+//! (`Empty` stops the climb — fine-grained absence overrides coarser
+//! data). `interpolate_u8` additionally keeps a chunk-grain slot caching
+//! its resolved `(lod, chunk_state)` binding for repeat samples in the
+//! same target chunk.
 //!
 //! ## Coordinate conventions
 //!
@@ -759,10 +761,11 @@ impl UnifiedVolume {
         result
     }
 
-    /// Convenience wrapper around `composite_along_normal` that returns
-    /// the per-sample max along the ray. Kept so the microbench can
-    /// measure the realistic monomorphized fast-path cost of what
-    /// `ObjVolume::paint` runs in practice.
+    /// Test support: convenience wrapper around `composite_along_normal`
+    /// returning the per-sample max along the ray — exercises the same
+    /// unswitch + monomorphized inner loop `ObjVolume::paint` reaches via
+    /// the trait.
+    #[cfg(test)]
     pub fn max_along_normal(&self, base: [f64; 3], dir: [f64; 3], w_lo: f64, w_hi: f64, downsampling: i32) -> u8 {
         let mut state = MaxCompositionState::new();
         let mut compositor = CompositorRef::Max(&mut state);

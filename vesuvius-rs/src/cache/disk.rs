@@ -385,6 +385,11 @@ impl DiskStore {
                     LoadOutcome::Missing
                 }
             },
+            // A peer write_atomic / punch is mid-flight on this slot —
+            // a benign race (e.g. try_upscale_from_parent loading a
+            // parent another worker is writing). Not readable yet;
+            // treat as Missing without warn-spam.
+            STATE_LOCKED => LoadOutcome::Missing,
             other => {
                 log::warn!("[{}] unknown sidecar state {}", key, other);
                 LoadOutcome::Missing

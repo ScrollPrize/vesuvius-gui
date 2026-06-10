@@ -1,4 +1,4 @@
-//! Cache purge planning + driver (skeleton).
+//! Cache purge planning.
 //!
 //! Goal: free at least `target_chunks` chunks across the cache by evicting
 //! the oldest chunks, where "oldest" is defined by the access-epoch column
@@ -22,9 +22,10 @@
 //! reader return Resident bytes that have already been deallocated, which
 //! is a permanent corruption window. Always: bitmap-first, then punch.
 //!
-//! This module currently provides only the planner and an evict-victim
-//! API stub. Wiring to actual purge triggers (write-bytes counter, statvfs
-//! poll) is intentionally deferred.
+//! This module holds the planner and the `PurgeTarget` contract; the
+//! triggers live in `epoch.rs` (watermark + statvfs checks on the
+//! watchdog tick, plus `run_startup_maintenance`) and the sweep itself
+//! in `cache.rs` (`Inner::run_purge`).
 
 use super::epoch::{EpochState, EPOCH_SLOTS};
 

@@ -426,6 +426,9 @@ impl ChunkCache {
         inner
     }
 
+    /// Test support: single-voxel read through `state_or_fetch`.
+    /// Rendering goes through `UnifiedVolume`'s shard hot slots instead.
+    #[cfg(test)]
     pub fn voxel(&self, x: u32, y: u32, z: u32, lod: u8) -> u8 {
         let key = ChunkKey::new(lod, x / 64, y / 64, z / 64);
         let state = self.state_or_fetch(key);
@@ -525,12 +528,10 @@ impl ChunkCache {
         self.inner.disk.shard_chunks_per_axis()
     }
 
-    /// Non-creating peek for a shard's mmap + per-chunk bitmap. Returns
-    /// `Some` once at least one chunk in the shard has been materialized
-    /// (the shard file is `set_len`'d + mmapped on first write); returns
-    /// `None` otherwise. The bitmap lets the volume reader distinguish
-    /// "resident" (fast read), "empty" (return 0), and "unknown" (slow path
-    /// with LOD climb) without consulting the DashMap per voxel.
+    /// Test support: non-creating peek for a shard's mmap + per-chunk
+    /// bitmap. Returns `Some` once the shard has been opened, `None`
+    /// otherwise. The volume reader uses `ensure_shard_open` instead.
+    #[cfg(test)]
     pub fn peek_shard(&self, lod: u8, shard: ShardCoord) -> Option<ShardSnapshot> {
         self.inner.disk.peek_shard(lod, shard)
     }
@@ -549,13 +550,17 @@ impl ChunkCache {
         }
     }
 
-    /// Look up the shard layout for `key`. Returns `(shard_coord,
-    /// in_shard_chunk_idx)` for in-bounds chunks. Used by the volume's hot
-    /// slot to avoid replicating shard-coord math from the disk layer.
+    /// Test support: look up the shard layout for `key` — `(shard_coord,
+    /// in_shard_chunk_idx)` for in-bounds chunks. The volume reader does
+    /// this math itself from `shard_chunks_per_axis`.
+    #[cfg(test)]
     pub fn locate(&self, key: ChunkKey) -> Option<(ShardCoord, u64)> {
         self.inner.disk.locate(key)
     }
 
+    /// Test support: poll `state_or_fetch` until `key` leaves `Pending`
+    /// or `timeout` elapses, returning the last observed state.
+    #[cfg(test)]
     pub fn wait_for(&self, key: ChunkKey, timeout: Duration) -> Arc<ChunkState> {
         let start = std::time::Instant::now();
         loop {
