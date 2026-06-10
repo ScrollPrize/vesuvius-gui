@@ -120,18 +120,7 @@ impl ChunkBackfiller for OmeZarrBackfiller {
 
         let mut sources: Vec<SourceSpec> = Vec::new();
         let mut coords: Vec<[usize; 3]> = Vec::new();
-        let coord_set: std::collections::HashSet<[usize; 3]> = {
-            let mut s = std::collections::HashSet::new();
-            for cz in cz_lo..=cz_hi {
-                for cy in cy_lo..=cy_hi {
-                    for cx in cx_lo..=cx_hi {
-                        s.insert([cz, cy, cx]);
-                    }
-                }
-            }
-            s
-        };
-        let covered = covered_cache_chunks(&coord_set, &nchunk, &shape, key.lod);
+        let covered = covered_cache_chunks([cz_lo, cy_lo, cx_lo], [cz_hi, cy_hi, cx_hi], &nchunk, &shape, key.lod);
         for cz in cz_lo..=cz_hi {
             for cy in cy_lo..=cy_hi {
                 for cx in cx_lo..=cx_hi {
@@ -182,39 +171,10 @@ impl ChunkBackfiller for OmeZarrBackfiller {
 
         let key_dbg = key;
         let array_for_decode = array.clone();
+        let covered_for_extract = covered.clone();
         let extract = Box::new(
             move |outcomes: &[SourceOutcome]| -> Result<Vec<(ChunkKey, ExtractedChunk)>, BackfillError> {
-                let started = std::time::Instant::now();
-                // Bail fast on errors. Pick worst severity.
-                let mut transient: Option<String> = None;
-                let mut permanent: Option<String> = None;
-                for o in outcomes {
-                    if let Err(e) = o {
-                        match e {
-                            BackfillError::OutOfBounds => permanent = Some("oob source".into()),
-                            BackfillError::Permanent(s) => permanent = Some(s.clone()),
-                            BackfillError::Transient(s) => {
-                                if transient.is_none() {
-                                    transient = Some(s.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(s) = permanent {
-                    return Err(BackfillError::Permanent(s));
-                }
-                if let Some(s) = transient {
-                    return Err(BackfillError::Transient(s));
-                }
-
-                let stride_y = nchunk[2];
-                let stride_z = nchunk[1] * nchunk[2];
-
-                // coord → outcome index for O(1) "is this native in our
-                // source set?" checks.
-                let coord_idx: HashMap<[usize; 3], usize> =
-                    coords.iter().copied().enumerate().map(|(i, c)| (c, i)).collect();
+                triage_outcomes(outcomes)?;
 
                 // Decode each loaded source upfront. With 128³ native chunks
                 // each one feeds 8 sibling 64³ cache chunks; doing the decode
@@ -246,155 +206,14 @@ impl ChunkBackfiller for OmeZarrBackfiller {
                     decoded.insert(*coord, ctx);
                 }
 
-                // Bounding box (in cache-chunk coords at the current LOD)
-                // of cache chunks that the loaded source set could possibly
-                // cover. Iterating this box and filtering by "all overlaps
-                // in source set" yields every cache chunk we have full data
-                // for — the primary and its siblings.
-                let mut bbox_lo = [usize::MAX; 3];
-                let mut bbox_hi = [0usize; 3];
-                for coord in coords.iter() {
-                    let voxel_lo = [coord[0] * nchunk[0], coord[1] * nchunk[1], coord[2] * nchunk[2]];
-                    let voxel_hi = [
-                        ((coord[0] + 1) * nchunk[0]).min(shape[0]),
-                        ((coord[1] + 1) * nchunk[1]).min(shape[1]),
-                        ((coord[2] + 1) * nchunk[2]).min(shape[2]),
-                    ];
-                    let cache_lo = [voxel_lo[0] / CHUNK_SIDE, voxel_lo[1] / CHUNK_SIDE, voxel_lo[2] / CHUNK_SIDE];
-                    let cache_hi = [
-                        voxel_hi[0].div_ceil(CHUNK_SIDE),
-                        voxel_hi[1].div_ceil(CHUNK_SIDE),
-                        voxel_hi[2].div_ceil(CHUNK_SIDE),
-                    ];
-                    for i in 0..3 {
-                        bbox_lo[i] = bbox_lo[i].min(cache_lo[i]);
-                        bbox_hi[i] = bbox_hi[i].max(cache_hi[i]);
-                    }
-                }
-
-                let mut output: Vec<(ChunkKey, ExtractedChunk)> = Vec::new();
-                let mut primary_found = false;
-                let mut empty_count = 0usize;
-                let mut bytes_count = 0usize;
-
-                for kz in bbox_lo[0]..bbox_hi[0] {
-                    for ky in bbox_lo[1]..bbox_hi[1] {
-                        for kx in bbox_lo[2]..bbox_hi[2] {
-                            let cv_base = [kz * CHUNK_SIDE, ky * CHUNK_SIDE, kx * CHUNK_SIDE];
-                            // Fully out of volume bounds → skip. OOB chunks
-                            // are never dispatched (dispatch_chunk rejects
-                            // them) so we shouldn't fabricate Empties for
-                            // them here.
-                            if cv_base[0] >= shape[0] || cv_base[1] >= shape[1] || cv_base[2] >= shape[2] {
-                                continue;
-                            }
-                            let cv_end = [
-                                (cv_base[0] + CHUNK_SIDE).min(shape[0]),
-                                (cv_base[1] + CHUNK_SIDE).min(shape[1]),
-                                (cv_base[2] + CHUNK_SIDE).min(shape[2]),
-                            ];
-
-                            // Native chunks overlapping this cache chunk.
-                            let ncz_lo = cv_base[0] / nchunk[0];
-                            let ncz_hi = (cv_end[0] - 1) / nchunk[0];
-                            let ncy_lo = cv_base[1] / nchunk[1];
-                            let ncy_hi = (cv_end[1] - 1) / nchunk[1];
-                            let ncx_lo = cv_base[2] / nchunk[2];
-                            let ncx_hi = (cv_end[2] - 1) / nchunk[2];
-
-                            // All overlapping native chunks must be in our
-                            // source set. If not, we can't fill this cache
-                            // chunk from this extract.
-                            let mut covered = true;
-                            let mut all_absent = true;
-                            'check: for ncz in ncz_lo..=ncz_hi {
-                                for ncy in ncy_lo..=ncy_hi {
-                                    for ncx in ncx_lo..=ncx_hi {
-                                        let coord = [ncz, ncy, ncx];
-                                        let Some(&idx) = coord_idx.get(&coord) else {
-                                            covered = false;
-                                            break 'check;
-                                        };
-                                        if matches!(&outcomes[idx], Ok(Some(_))) {
-                                            all_absent = false;
-                                        }
-                                    }
-                                }
-                            }
-                            if !covered {
-                                continue;
-                            }
-
-                            let chunk_key = ChunkKey::new(key.lod, kx as u32, ky as u32, kz as u32);
-                            if chunk_key == key {
-                                primary_found = true;
-                            }
-
-                            if all_absent {
-                                output.push((chunk_key, ExtractedChunk::Empty));
-                                empty_count += 1;
-                                continue;
-                            }
-
-                            // Slice each overlapping loaded native chunk into
-                            // this cache chunk's buffer. Absent (Ok(None))
-                            // overlaps leave their region zero-filled.
-                            let mut out = vec![0u8; CHUNK_VOXELS];
-                            for ncz in ncz_lo..=ncz_hi {
-                                for ncy in ncy_lo..=ncy_hi {
-                                    for ncx in ncx_lo..=ncx_hi {
-                                        let coord = [ncz, ncy, ncx];
-                                        let Some(ctx) = decoded.get(&coord) else {
-                                            continue;
-                                        };
-                                        let chunk_base_z = ncz * nchunk[0];
-                                        let chunk_base_y = ncy * nchunk[1];
-                                        let chunk_base_x = ncx * nchunk[2];
-                                        let nz_lo = chunk_base_z.max(cv_base[0]);
-                                        let nz_hi = (chunk_base_z + nchunk[0]).min(cv_end[0]);
-                                        let ny_lo = chunk_base_y.max(cv_base[1]);
-                                        let ny_hi = (chunk_base_y + nchunk[1]).min(cv_end[1]);
-                                        let nx_lo = chunk_base_x.max(cv_base[2]);
-                                        let nx_hi = (chunk_base_x + nchunk[2]).min(cv_end[2]);
-                                        for sz in nz_lo..nz_hi {
-                                            let lz = sz - cv_base[0];
-                                            let in_z = (sz - chunk_base_z) * stride_z;
-                                            let out_z = lz * CHUNK_SIDE * CHUNK_SIDE;
-                                            for sy in ny_lo..ny_hi {
-                                                let ly = sy - cv_base[1];
-                                                let in_y = in_z + (sy - chunk_base_y) * stride_y;
-                                                let out_y = out_z + ly * CHUNK_SIDE;
-                                                for sx in nx_lo..nx_hi {
-                                                    let lx = sx - cv_base[2];
-                                                    let in_idx = in_y + (sx - chunk_base_x);
-                                                    out[out_y + lx] = ctx.get(in_idx);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            output.push((chunk_key, ExtractedChunk::Bytes(out)));
-                            bytes_count += 1;
-                        }
-                    }
-                }
-
-                if !primary_found {
-                    // The primary's overlap set IS our source set by
-                    // construction, so this is structurally impossible —
-                    // log loudly and let the cache fall back to cooldown.
-                    log::warn!("[{}] sibling enumeration missed the primary key", key_dbg);
-                }
-
-                log::trace!(
-                    "[{}] extract: {} bytes + {} empty ({:?})",
+                Ok(fill_covered_chunks(
                     key_dbg,
-                    bytes_count,
-                    empty_count,
-                    started.elapsed()
-                );
-                Ok(output)
+                    &covered_for_extract,
+                    &shape,
+                    &nchunk,
+                    &decoded,
+                    "v2",
+                ))
             },
         );
 
@@ -411,45 +230,39 @@ impl ChunkBackfiller for OmeZarrBackfiller {
 }
 
 /// Compute the set of cache chunks whose every overlapping native chunk
-/// lies inside `coord_set`. That's exactly the set of cache chunks an
-/// extract over `coord_set` could fully materialize — its `covered` list.
+/// lies inside the dense native-chunk box `[lo, hi]` (inclusive, (z, y, x)
+/// order). That's exactly the set of cache chunks an extract over the
+/// box's sources could fully materialize — its `covered` list.
 ///
 /// Shared between the v2 OME-Zarr planner and the v3 sub-chunk planner;
 /// the math is identical once the native-chunk shape is plugged in
 /// (`nchunk` for v2 = native chunk shape, for v3 = c3d sub-chunk shape).
+/// Both planners enumerate full axis-aligned ranges, so the box form
+/// replaces the old `HashSet` membership walk with six comparisons per
+/// cache chunk.
 pub(super) fn covered_cache_chunks(
-    coord_set: &std::collections::HashSet<[usize; 3]>,
+    lo: [usize; 3],
+    hi: [usize; 3],
     nchunk: &[usize],
     shape: &[usize],
     lod: u8,
 ) -> Vec<ChunkKey> {
-    let mut bbox_lo = [usize::MAX; 3];
-    let mut bbox_hi = [0usize; 3];
-    for coord in coord_set.iter() {
-        let voxel_lo = [coord[0] * nchunk[0], coord[1] * nchunk[1], coord[2] * nchunk[2]];
-        let voxel_hi = [
-            ((coord[0] + 1) * nchunk[0]).min(shape[0]),
-            ((coord[1] + 1) * nchunk[1]).min(shape[1]),
-            ((coord[2] + 1) * nchunk[2]).min(shape[2]),
-        ];
-        let cache_lo = [voxel_lo[0] / CHUNK_SIDE, voxel_lo[1] / CHUNK_SIDE, voxel_lo[2] / CHUNK_SIDE];
-        let cache_hi = [
-            voxel_hi[0].div_ceil(CHUNK_SIDE),
-            voxel_hi[1].div_ceil(CHUNK_SIDE),
-            voxel_hi[2].div_ceil(CHUNK_SIDE),
-        ];
-        for i in 0..3 {
-            bbox_lo[i] = bbox_lo[i].min(cache_lo[i]);
-            bbox_hi[i] = bbox_hi[i].max(cache_hi[i]);
-        }
-    }
-    if bbox_lo[0] == usize::MAX {
-        return Vec::new();
-    }
+    let voxel_lo = [lo[0] * nchunk[0], lo[1] * nchunk[1], lo[2] * nchunk[2]];
+    let voxel_hi = [
+        ((hi[0] + 1) * nchunk[0]).min(shape[0]),
+        ((hi[1] + 1) * nchunk[1]).min(shape[1]),
+        ((hi[2] + 1) * nchunk[2]).min(shape[2]),
+    ];
+    let cache_lo = [voxel_lo[0] / CHUNK_SIDE, voxel_lo[1] / CHUNK_SIDE, voxel_lo[2] / CHUNK_SIDE];
+    let cache_hi = [
+        voxel_hi[0].div_ceil(CHUNK_SIDE),
+        voxel_hi[1].div_ceil(CHUNK_SIDE),
+        voxel_hi[2].div_ceil(CHUNK_SIDE),
+    ];
     let mut out = Vec::new();
-    for kz in bbox_lo[0]..bbox_hi[0] {
-        for ky in bbox_lo[1]..bbox_hi[1] {
-            for kx in bbox_lo[2]..bbox_hi[2] {
+    for kz in cache_lo[0]..cache_hi[0] {
+        for ky in cache_lo[1]..cache_hi[1] {
+            for kx in cache_lo[2]..cache_hi[2] {
                 let cv_base = [kz * CHUNK_SIDE, ky * CHUNK_SIDE, kx * CHUNK_SIDE];
                 if cv_base[0] >= shape[0] || cv_base[1] >= shape[1] || cv_base[2] >= shape[2] {
                     continue;
@@ -459,28 +272,187 @@ pub(super) fn covered_cache_chunks(
                     (cv_base[1] + CHUNK_SIDE).min(shape[1]),
                     (cv_base[2] + CHUNK_SIDE).min(shape[2]),
                 ];
-                let ncz_lo = cv_base[0] / nchunk[0];
-                let ncz_hi = (cv_end[0] - 1) / nchunk[0];
-                let ncy_lo = cv_base[1] / nchunk[1];
-                let ncy_hi = (cv_end[1] - 1) / nchunk[1];
-                let ncx_lo = cv_base[2] / nchunk[2];
-                let ncx_hi = (cv_end[2] - 1) / nchunk[2];
-                let mut covered = true;
-                'check: for ncz in ncz_lo..=ncz_hi {
-                    for ncy in ncy_lo..=ncy_hi {
-                        for ncx in ncx_lo..=ncx_hi {
-                            if !coord_set.contains(&[ncz, ncy, ncx]) {
-                                covered = false;
-                                break 'check;
-                            }
-                        }
-                    }
-                }
-                if covered {
+                // Covered iff every overlapping native chunk sits inside
+                // the box.
+                let inside = cv_base[0] / nchunk[0] >= lo[0]
+                    && (cv_end[0] - 1) / nchunk[0] <= hi[0]
+                    && cv_base[1] / nchunk[1] >= lo[1]
+                    && (cv_end[1] - 1) / nchunk[1] <= hi[1]
+                    && cv_base[2] / nchunk[2] >= lo[2]
+                    && (cv_end[2] - 1) / nchunk[2] <= hi[2];
+                if inside {
                     out.push(ChunkKey::new(lod, kx as u32, ky as u32, kz as u32));
                 }
             }
         }
     }
     out
+}
+
+/// Sampling interface over one decoded native chunk, shared by the v2
+/// (`ChunkContext`) and v3 (raw c3d buffer) extract paths so they can
+/// drive the same slicing loop.
+pub(super) trait NativeSample {
+    fn at(&self, idx: usize) -> u8;
+}
+
+impl NativeSample for ChunkContext {
+    #[inline]
+    fn at(&self, idx: usize) -> u8 {
+        self.get(idx)
+    }
+}
+
+impl NativeSample for Vec<u8> {
+    #[inline]
+    fn at(&self, idx: usize) -> u8 {
+        self[idx]
+    }
+}
+
+/// Short-circuit an extract on the worst error among `outcomes`:
+/// any permanent (or out-of-bounds) failure dominates, otherwise the
+/// first transient one is surfaced. `Ok(())` means every source either
+/// loaded or was definitively absent.
+pub(super) fn triage_outcomes(outcomes: &[SourceOutcome]) -> Result<(), BackfillError> {
+    let mut transient: Option<String> = None;
+    for o in outcomes {
+        if let Err(e) = o {
+            match e {
+                BackfillError::OutOfBounds => return Err(BackfillError::Permanent("oob source".into())),
+                BackfillError::Permanent(s) => return Err(BackfillError::Permanent(s.clone())),
+                BackfillError::Transient(s) => {
+                    if transient.is_none() {
+                        transient = Some(s.clone());
+                    }
+                }
+            }
+        }
+    }
+    match transient {
+        Some(s) => Err(BackfillError::Transient(s)),
+        None => Ok(()),
+    }
+}
+
+/// Fill every plan-time `covered` cache chunk from `decoded` (the map of
+/// successfully loaded + decoded native chunks). Chunks none of whose
+/// overlapping natives decoded come out `Empty`; otherwise each decoded
+/// overlap is sliced into the 64³ buffer and absent overlaps leave their
+/// region zero-filled. This is the shared back half of the v2 and v3
+/// extract closures — the plan-time coverage computation guarantees
+/// every key in `covered` (the primary and its siblings) has its full
+/// overlap set accounted for.
+pub(super) fn fill_covered_chunks<D: NativeSample>(
+    primary: ChunkKey,
+    covered: &[ChunkKey],
+    shape: &[usize],
+    nchunk: &[usize],
+    decoded: &HashMap<[usize; 3], Arc<D>>,
+    label: &str,
+) -> Vec<(ChunkKey, ExtractedChunk)> {
+    let started = std::time::Instant::now();
+    let stride_y = nchunk[2];
+    let stride_z = nchunk[1] * nchunk[2];
+    let mut output: Vec<(ChunkKey, ExtractedChunk)> = Vec::with_capacity(covered.len());
+    let mut primary_found = false;
+    let mut empty_count = 0usize;
+    let mut bytes_count = 0usize;
+
+    for &chunk_key in covered {
+        let cv_base = [
+            chunk_key.z as usize * CHUNK_SIDE,
+            chunk_key.y as usize * CHUNK_SIDE,
+            chunk_key.x as usize * CHUNK_SIDE,
+        ];
+        let cv_end = [
+            (cv_base[0] + CHUNK_SIDE).min(shape[0]),
+            (cv_base[1] + CHUNK_SIDE).min(shape[1]),
+            (cv_base[2] + CHUNK_SIDE).min(shape[2]),
+        ];
+
+        // Native chunks overlapping this cache chunk.
+        let ncz_lo = cv_base[0] / nchunk[0];
+        let ncz_hi = (cv_end[0] - 1) / nchunk[0];
+        let ncy_lo = cv_base[1] / nchunk[1];
+        let ncy_hi = (cv_end[1] - 1) / nchunk[1];
+        let ncx_lo = cv_base[2] / nchunk[2];
+        let ncx_hi = (cv_end[2] - 1) / nchunk[2];
+
+        if chunk_key == primary {
+            primary_found = true;
+        }
+
+        let mut all_absent = true;
+        'probe: for ncz in ncz_lo..=ncz_hi {
+            for ncy in ncy_lo..=ncy_hi {
+                for ncx in ncx_lo..=ncx_hi {
+                    if decoded.contains_key(&[ncz, ncy, ncx]) {
+                        all_absent = false;
+                        break 'probe;
+                    }
+                }
+            }
+        }
+        if all_absent {
+            output.push((chunk_key, ExtractedChunk::Empty));
+            empty_count += 1;
+            continue;
+        }
+
+        // Slice each overlapping decoded native chunk into this cache
+        // chunk's buffer. Absent overlaps leave their region zero-filled.
+        let mut out = vec![0u8; CHUNK_VOXELS];
+        for ncz in ncz_lo..=ncz_hi {
+            for ncy in ncy_lo..=ncy_hi {
+                for ncx in ncx_lo..=ncx_hi {
+                    let Some(d) = decoded.get(&[ncz, ncy, ncx]) else {
+                        continue;
+                    };
+                    let chunk_base_z = ncz * nchunk[0];
+                    let chunk_base_y = ncy * nchunk[1];
+                    let chunk_base_x = ncx * nchunk[2];
+                    let nz_lo = chunk_base_z.max(cv_base[0]);
+                    let nz_hi = (chunk_base_z + nchunk[0]).min(cv_end[0]);
+                    let ny_lo = chunk_base_y.max(cv_base[1]);
+                    let ny_hi = (chunk_base_y + nchunk[1]).min(cv_end[1]);
+                    let nx_lo = chunk_base_x.max(cv_base[2]);
+                    let nx_hi = (chunk_base_x + nchunk[2]).min(cv_end[2]);
+                    for sz in nz_lo..nz_hi {
+                        let lz = sz - cv_base[0];
+                        let in_z = (sz - chunk_base_z) * stride_z;
+                        let out_z = lz * CHUNK_SIDE * CHUNK_SIDE;
+                        for sy in ny_lo..ny_hi {
+                            let ly = sy - cv_base[1];
+                            let in_y = in_z + (sy - chunk_base_y) * stride_y;
+                            let out_y = out_z + ly * CHUNK_SIDE;
+                            for sx in nx_lo..nx_hi {
+                                let lx = sx - cv_base[2];
+                                out[out_y + lx] = d.at(in_y + (sx - chunk_base_x));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        output.push((chunk_key, ExtractedChunk::Bytes(out)));
+        bytes_count += 1;
+    }
+
+    if !primary_found {
+        // The primary's overlap set is inside the plan's source box by
+        // construction, so this is structurally impossible — log loudly
+        // and let the cache fall back to cooldown.
+        log::warn!("[{}] {} extract output missed the primary key", primary, label);
+    }
+
+    log::trace!(
+        "[{}] {} extract: {} bytes + {} empty ({:?})",
+        primary,
+        label,
+        bytes_count,
+        empty_count,
+        started.elapsed()
+    );
+    output
 }
