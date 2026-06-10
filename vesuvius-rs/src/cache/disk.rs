@@ -499,7 +499,19 @@ impl DiskStore {
     /// lookups can drive entirely off the bitmap without re-entering the
     /// DashMap. Returns `Ok(None)` when the LOD index is out of range.
     pub fn ensure_shard_open(&self, lod: u8, shard: ShardCoord) -> std::io::Result<Option<ShardSnapshot>> {
-        if (lod as usize) >= self.inner.lods.len() {
+        let Some(slot) = self.inner.lods.get(lod as usize) else {
+            return Ok(None);
+        };
+        // Refuse shards wholly outside the LOD's chunk grid — a stray
+        // probe past the volume extent would otherwise create a phantom
+        // sparse shard file and pay the bitmap-seed walk for slots that
+        // can never hold data.
+        let sca = self.inner.shard_chunks_per_axis as u64;
+        let dims = &slot.dims;
+        if (shard.0 as u64) * sca >= dims.nx as u64
+            || (shard.1 as u64) * sca >= dims.ny as u64
+            || (shard.2 as u64) * sca >= dims.nz as u64
+        {
             return Ok(None);
         }
         let lf = self.inner.ensure_open(lod, shard)?;

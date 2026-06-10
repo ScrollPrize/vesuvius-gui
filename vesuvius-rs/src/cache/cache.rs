@@ -661,12 +661,19 @@ impl ChunkCache {
             return;
         }
         let to_chunk = |v: f64| -> i64 { (v as i64).div_euclid(64) };
+        // Clamp the upper corner to the chunk grid at `target_lod` —
+        // surface AABBs routinely extend past the scroll, and every
+        // out-of-bounds chunk dispatched here would just park a
+        // permanent-cooldown entry in the map.
+        let extent = self.voxel_extent();
+        let chunk_world = 64u64 << target_lod;
+        let max_chunk = |e: u32| -> i64 { ((e as u64).div_ceil(chunk_world) as i64 - 1).max(0) };
         let cx0 = to_chunk(min[0]).max(0);
         let cy0 = to_chunk(min[1]).max(0);
         let cz0 = to_chunk(min[2]).max(0);
-        let cx1 = to_chunk(max[0]).max(0);
-        let cy1 = to_chunk(max[1]).max(0);
-        let cz1 = to_chunk(max[2]).max(0);
+        let cx1 = to_chunk(max[0]).max(0).min(max_chunk(extent[0]));
+        let cy1 = to_chunk(max[1]).max(0).min(max_chunk(extent[1]));
+        let cz1 = to_chunk(max[2]).max(0).min(max_chunk(extent[2]));
         if cx1 < cx0 || cy1 < cy0 || cz1 < cz0 {
             return;
         }
