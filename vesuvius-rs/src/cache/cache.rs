@@ -507,25 +507,9 @@ impl ChunkCache {
     /// `touch_access` before the inner loop runs, so every Resident
     /// chunk the renderer draws gets its access-epoch bumped per paint.
     ///
-    /// Race protocol: read `old`, read `current`, attempt CAS(old →
-    /// current) on the sidecar byte. Only the winning thread updates the
-    /// histogram via `record_access_transition`. Losers either see the
-    /// tag already at `current` (someone else won — done) or see it at
-    /// some other value (epoch advanced again mid-flight — bail; the
-    /// next paint frame will pick it up). Single-shot, no retry loop:
-    /// `touch_access` is called per-chunk per-paint, so the retry
-    /// budget is effectively the paint loop itself.
+    /// See `Inner::touch_access` for the race protocol.
     fn touch_access(&self, key: ChunkKey) {
-        let current = self.inner.epoch.current();
-        let Some(old) = self.inner.disk.get_access_epoch(key) else {
-            return;
-        };
-        if old == current {
-            return;
-        }
-        if let Some(Ok(_)) = self.inner.disk.cas_access_epoch(key, old, current) {
-            self.inner.epoch.record_access_transition(old, current);
-        }
+        self.inner.touch_access(key);
     }
 
     /// Evict the oldest chunks until at least `target_chunks` have been
@@ -1757,14 +1741,14 @@ impl Inner {
                     // isn't visible to the purger, but stamp the byte
                     // anyway so any later code that inspects it sees this
                     // frame's epoch.
-                    self.touch_access_inline(parent_key);
+                    self.touch_access(parent_key);
                     self.disk.set_access_epoch(key, self.epoch.current());
                 }
                 Ok(false) => {
                     // CAS lost — target was already non-MISSING (real
                     // fetch beat us, or a peer raced us through). Still
                     // bump the parent we read.
-                    self.touch_access_inline(parent_key);
+                    self.touch_access(parent_key);
                 }
                 Err(e) => {
                     log::debug!("[{}] upscale-from-parent write failed: {}", key, e);
@@ -1775,9 +1759,17 @@ impl Inner {
     }
 
     /// Bump `key`'s access-epoch tag to the current epoch with histogram
-    /// bookkeeping. Inline copy of `ChunkCache::touch_access`'s body for
-    /// use from `Inner` paths that can't go through `ChunkCache`.
-    fn touch_access_inline(&self, key: ChunkKey) {
+    /// bookkeeping. Cheap no-op when the tag already matches.
+    ///
+    /// Race protocol: read `old`, read `current`, attempt CAS(old →
+    /// current) on the sidecar byte. Only the winning thread updates the
+    /// histogram via `record_access_transition`. Losers either see the
+    /// tag already at `current` (someone else won — done) or see it at
+    /// some other value (epoch advanced again mid-flight — bail; the
+    /// next paint frame will pick it up). Single-shot, no retry loop:
+    /// this is called per-chunk per-paint, so the retry budget is
+    /// effectively the paint loop itself.
+    fn touch_access(&self, key: ChunkKey) {
         let current = self.epoch.current();
         let Some(old) = self.disk.get_access_epoch(key) else {
             return;
