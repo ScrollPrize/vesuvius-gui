@@ -896,12 +896,16 @@ fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf, signal: Arc<(Mut
     let mut last_purge_check = std::time::Instant::now();
     loop {
         // Block until a save is requested or the watchdog interval
-        // elapses, whichever comes first. We unset the flag pre-emptively
-        // so a signal arriving during `state.save()` is captured by the
-        // next wait (it'll find the flag set and skip the wait).
+        // elapses, whichever comes first. The predicate makes a signal
+        // that arrived while we were saving / purging (flag already set,
+        // notify with no waiter) take effect immediately instead of
+        // being lost until the next full interval.
         let timed_out = {
             let g = signal.0.lock().unwrap();
-            let (mut g, res) = signal.1.wait_timeout(g, WATCHDOG_INTERVAL).unwrap();
+            let (mut g, res) = signal
+                .1
+                .wait_timeout_while(g, WATCHDOG_INTERVAL, |saved| !*saved)
+                .unwrap();
             *g = false;
             res.timed_out()
         };
