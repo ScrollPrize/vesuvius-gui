@@ -32,7 +32,7 @@ use memmap::{Mmap, MmapOptions};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -81,6 +81,11 @@ struct LodFile {
     /// first opened (`ensure_open`) and updated on every `write_atomic` /
     /// `mark_empty` transition.
     state_bits: Arc<ChunkStateBits>,
+    /// Set by `write_atomic` when chunk bytes land in this shard; consumed
+    /// by `do_sync`, which fsyncs only dirty shards. Without it, any
+    /// sidecar transition (including pure-read access-epoch bumps) forced
+    /// an fsync of every open shard of the LOD every sync tick.
+    dirty: Arc<AtomicBool>,
 }
 
 pub type ShardCoord = (u32, u32, u32);
@@ -458,6 +463,9 @@ impl DiskStore {
             sidecar.set_state(key.lod, r.sidecar_idx, STATE_MISSING);
             return Err(e);
         }
+        // Mark before publishing RESIDENT so a sync racing this write
+        // either fsyncs the bytes or hasn't seen the RESIDENT bit yet.
+        lf.dirty.store(true, Ordering::Release);
         sidecar.set_state(key.lod, r.sidecar_idx, STATE_RESIDENT);
         lf.state_bits.store(r.in_shard_idx, ChunkBitState::Resident);
         self.inner.maybe_wake_sync();
@@ -791,6 +799,7 @@ impl DiskStoreInner {
             file: Arc::new(file),
             mmap: Arc::new(mmap),
             state_bits,
+            dirty: Arc::new(AtomicBool::new(false)),
         };
         // Re-check under the lock: if another thread opened the same shard
         // concurrently, drop our work and use theirs to keep the
@@ -1132,31 +1141,23 @@ fn do_sync(inner: &DiskStoreInner) {
         // Nothing changed since the last sync; nothing to flush.
         return;
     }
-    // Pending counts LOD-wide transitions; we don't track which shard each
-    // transition landed in, so conservatively fsync every shard we have
-    // open for that LOD. A write-path shard is always open here (its
-    // pwrite happened-before the Release that bumped pending). fsync on
-    // read-only / clean shards is harmless — essentially a no-op.
-    for (lod_idx, &count) in pending.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-        let opened: Vec<(ShardCoord, LodFile)> = inner.lods[lod_idx]
+    // fsync only shards that took data writes since the last sync
+    // (`write_atomic` sets the per-shard dirty flag before publishing
+    // RESIDENT). Sidecar-only transitions — access-epoch LRU bumps,
+    // mark_empty, evictions — need just the msync below, so a pure-read
+    // session never fsyncs a data file at all.
+    for (lod_idx, slot) in inner.lods.iter().enumerate() {
+        let opened: Vec<(ShardCoord, LodFile)> = slot
             .opened
             .lock()
             .unwrap()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
-        if opened.is_empty() {
-            log::warn!(
-                "[cache] sync: LOD {} has {} pending but no open shards",
-                lod_idx,
-                count
-            );
-            continue;
-        }
         for (shard, lf) in opened {
+            if !lf.dirty.swap(false, Ordering::AcqRel) {
+                continue;
+            }
             if let Err(e) = lf.file.sync_data() {
                 log::warn!(
                     "[cache] sync: fsync LOD {} shard {:?} failed: {}",
@@ -1164,6 +1165,9 @@ fn do_sync(inner: &DiskStoreInner) {
                     shard,
                     e
                 );
+                // Leave the shard dirty so the next sync retries before
+                // the sidecar can persist its RESIDENT bits durably.
+                lf.dirty.store(true, Ordering::Release);
             }
         }
     }
@@ -1171,7 +1175,7 @@ fn do_sync(inner: &DiskStoreInner) {
     // RESIDENT/EMPTY bits and access-epoch tags reach the disk too.
     // Ordering matters: any RESIDENT bit visible on disk must point at
     // already-durable chunk bytes. msync(MS_SYNC) here pairs with the
-    // per-LOD `sync_data` above to honor that invariant.
+    // dirty-shard `sync_data` above to honor that invariant.
     if let Err(e) = inner.sidecar.flush() {
         log::warn!("[cache] sync: sidecar msync failed: {}", e);
     }
