@@ -648,12 +648,12 @@ impl ChunkCache {
     }
 
     /// Dispatch every chunk in the AABB `[min, max]` (inclusive, in
-    /// target-LOD voxel coords) at `target_lod`, and pre-dispatch the
-    /// matching LOD-(target+1) parents so the upscale-from-parent
-    /// preview path inside `dispatch_chunk` has a chance to fire. Used
-    /// by `ObjVolume::paint` to pre-touch the chunks each triangle's
-    /// ray will hit before the per-voxel composite loop runs — that
-    /// loop reads the shard mmap unconditionally and relies on
+    /// target-LOD voxel coords) at `target_lod`, and pre-dispatch a
+    /// single coarse parent level so the upscale-from-parent preview
+    /// path inside `dispatch_chunk` has a resident ancestor to fall
+    /// back on. Used by `ObjVolume::paint` to pre-touch the chunks each
+    /// triangle's ray will hit before the per-voxel composite loop runs
+    /// — that loop reads the shard mmap unconditionally and relies on
     /// pre-dispatch (or the upscale fill) for the bytes to be there.
     pub fn touch_aabb(&self, min: [f64; 3], max: [f64; 3], target_lod: u8) {
         let max_lod = self.max_lod();
@@ -670,21 +670,27 @@ impl ChunkCache {
         if cx1 < cx0 || cy1 < cy0 || cz1 < cz0 {
             return;
         }
-        // Pass 1: parent chunks at every coarser LOD up to `max_lod`,
-        // walked coarsest-first. Submitting the coarsest level last
-        // means it lands at the head of the LIFO task queue — those
-        // chunks are small, few, and likely to be persisted from prior
-        // sessions, so they're the fastest path to *some* resident
-        // ancestor that `try_upscale_from_parent` can fall back on.
-        // The geometric shrinkage (8× fewer chunks per coarser step)
-        // bounds total cost at ≈ 1.14× the LOD+1 count.
-        for parent_lod in ((target_lod + 1)..=max_lod).rev() {
-            let shift = parent_lod - target_lod;
-            // shift > 6 would map the AABB to a sub-voxel region of
-            // the parent — out of useful range for upscale; skip.
-            if shift > 6 {
-                continue;
-            }
+        // Pass 1: a SINGLE coarse parent level for the preview. We used
+        // to walk every coarser LOD from `target+1` to `max_lod`, but
+        // since the preview is now synthesized exactly once from the
+        // finest *already-resident* ancestor (no per-frame
+        // progressive-resharpen — see `dispatch_chunk` /
+        // `try_upscale_from_parent`), fetching the full pyramid only
+        // burned download bandwidth on intermediate levels that compete
+        // with the target fetch and are never used for sharpening.
+        //
+        // We keep just the coarsest reachable level (`shift` capped at 6
+        // — beyond that a target chunk maps to a sub-voxel region of the
+        // parent). Coarsest = fewest chunks (often a single one covering
+        // the whole AABB), fastest to land, most likely persisted from a
+        // prior session — so it's the most reliable resident ancestor
+        // for the one-shot preview. Incidentally-resident finer ancestors
+        // (e.g. a level previously browsed as a target) are still picked
+        // up by `try_upscale_from_parent`, which always prefers the
+        // finest resident ancestor; we just no longer fetch them here.
+        let preview_lod = max_lod.min(target_lod.saturating_add(6));
+        if preview_lod > target_lod {
+            let shift = preview_lod - target_lod;
             let px0 = (cx0 as u32) >> shift;
             let py0 = (cy0 as u32) >> shift;
             let pz0 = (cz0 as u32) >> shift;
@@ -694,7 +700,7 @@ impl ChunkCache {
             for pz in pz0..=pz1 {
                 for py in py0..=py1 {
                     for px in px0..=px1 {
-                        let _ = self.state_or_fetch(ChunkKey::new(parent_lod, px, py, pz));
+                        let _ = self.state_or_fetch(ChunkKey::new(preview_lod, px, py, pz));
                     }
                 }
             }
