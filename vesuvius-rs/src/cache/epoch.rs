@@ -239,10 +239,18 @@ impl EpochState {
             return 0;
         };
         let current = self.current();
-        let mut targets = self.targets.lock().unwrap();
-        targets.retain(|w| w.upgrade().is_some());
-        let live: Vec<Arc<dyn PurgeTarget>> = targets.iter().filter_map(Weak::upgrade).collect();
-        drop(targets);
+        let live: Vec<Arc<dyn PurgeTarget>> = {
+            let mut targets = self.targets.lock().unwrap();
+            let mut live = Vec::with_capacity(targets.len());
+            targets.retain(|w| match w.upgrade() {
+                Some(t) => {
+                    live.push(t);
+                    true
+                }
+                None => false,
+            });
+            live
+        };
 
         // Pre-purge breakdown: ask every live target + every on-disk
         // sidecar what they'd contribute under this plan, then emit a
@@ -265,7 +273,7 @@ impl EpochState {
             total = total.saturating_add(t.run_purge(plan));
         }
         if let Some(root) = self.unified_root.get() {
-            total = total.saturating_add(self.purge_offline_volumes(plan, root));
+            total = total.saturating_add(self.purge_offline_volumes(plan, root, &live_ids));
         }
         total
     }
@@ -292,54 +300,32 @@ impl EpochState {
     }
 
     /// Sweep every volume subdir under `unified_root` whose volume_id
-    /// is *not* in `accumulated_volume_ids`. For each such volume,
-    /// load its sidecar, evict every Resident chunk matching `plan`,
-    /// punch holes in the shard files, and write the updated sidecar
-    /// back atomically. Decrements the global histogram via
-    /// `record_evict` for every chunk freed.
+    /// is *not* in `live` (the set of volume_ids covered by live
+    /// `PurgeTarget`s — the caller already derived it for the plan
+    /// summary). For each such volume, load its sidecar, evict every
+    /// Resident chunk matching `plan`, punch holes in the shard files,
+    /// and write the updated sidecar back atomically. Decrements the
+    /// global histogram via `record_evict` for every chunk freed.
     ///
     /// This is the "no live cache" counterpart to live-target purging:
     /// without it, volumes the user opened in a previous session would
     /// inflate the trigger but never get touched, defeating the cap.
     ///
-    /// Concurrency: snapshots the live set up-front and skips matches.
-    /// If a `ChunkCache` opens one of these volumes between the
-    /// snapshot and the sidecar write, the sidecar write (atomic
-    /// rename) lands either before or after that cache's
-    /// `Sidecar::load`. The post-load eviction race is the same
-    /// transient-zero window the live sweep already tolerates.
-    pub fn purge_offline_volumes(&self, plan: PurgePlan, unified_root: &Path) -> u64 {
-        let live = self.live_target_volume_ids();
-        let entries = match std::fs::read_dir(unified_root) {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
-            Err(e) => {
-                log::warn!(target: super::purge::LOG_TARGET, "offline purge: read_dir {} failed: {}", unified_root.display(), e);
-                return 0;
-            }
-        };
+    /// Concurrency: the live set is a snapshot. If a `ChunkCache` opens
+    /// one of these volumes between the snapshot and the sidecar write,
+    /// the sidecar write (atomic rename) lands either before or after
+    /// that cache's `Sidecar::load`. The post-load eviction race is the
+    /// same transient-zero window the live sweep already tolerates.
+    pub fn purge_offline_volumes(&self, plan: PurgePlan, unified_root: &Path, live: &HashSet<String>) -> u64 {
         let current = self.current();
         let mut total_evicted: u64 = 0;
         let chunk_bytes = CHUNK_VOXELS as u64;
         let sca = SHARD_CHUNKS_PER_AXIS;
         let shard_total = (sca as u64).pow(3) * chunk_bytes;
 
-        for entry in entries.flatten() {
-            let vol_dir = entry.path();
-            if !vol_dir.is_dir() {
-                continue;
-            }
-            let sidecar_path = sidecar::sidecar_path(&vol_dir);
-            let sidecar = match Sidecar::load(&sidecar_path) {
-                Ok(Some(s)) => s,
-                Ok(None) => continue,
-                Err(e) => {
-                    log::warn!(target: super::purge::LOG_TARGET, "offline purge: sidecar {} failed: {}", sidecar_path.display(), e);
-                    continue;
-                }
-            };
+        for_each_volume_sidecar(unified_root, "offline purge", |vol_dir, sidecar| {
             if live.contains(&sidecar.header.volume_id) {
-                continue;
+                return;
             }
 
             let mut evicted_here: u64 = 0;
@@ -431,13 +417,18 @@ impl EpochState {
             }
 
             if evicted_here == 0 {
-                continue;
+                return;
             }
             // Force the demoted bytes out of the mmap's dirty pages
             // now, rather than waiting for the kernel writeback timer.
             // The data-file holes are already punched above.
             if let Err(e) = sidecar.flush() {
-                log::warn!(target: super::purge::LOG_TARGET, "offline purge: sidecar msync {} failed: {}", sidecar_path.display(), e);
+                log::warn!(
+                    target: super::purge::LOG_TARGET,
+                    "offline purge: sidecar msync {} failed: {}",
+                    sidecar::sidecar_path(vol_dir).display(),
+                    e
+                );
             }
             log::info!(
                 target: super::purge::LOG_TARGET,
@@ -446,7 +437,7 @@ impl EpochState {
                 evicted_here
             );
             total_evicted += evicted_here;
-        }
+        });
 
         total_evicted
     }
@@ -760,11 +751,28 @@ fn summarize_offline_volumes(
     unified_root: &Path,
     live_ids: &HashSet<String>,
 ) -> Vec<VolumeBreakdown> {
+    let mut out = Vec::new();
+    for_each_volume_sidecar(unified_root, "offline summarize", |_vol_dir, s| {
+        if !live_ids.contains(&s.header.volume_id) {
+            out.push(VolumeBreakdown::from_sidecar(&s, plan, current));
+        }
+    });
+    out
+}
+
+/// Shared traversal for every "walk all volume sidecars under the unified
+/// root" pass (offline purge, offline summarize, startup seed). `what`
+/// tags log messages. read_dir / sidecar-load failures are logged and
+/// skipped; subdirs without a sidecar are silently ignored.
+fn for_each_volume_sidecar(unified_root: &Path, what: &str, mut f: impl FnMut(&Path, Sidecar)) {
     let entries = match std::fs::read_dir(unified_root) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            log::warn!(target: super::purge::LOG_TARGET, "{}: read_dir {} failed: {}", what, unified_root.display(), e);
+            return;
+        }
     };
-    let mut out = Vec::new();
     for entry in entries.flatten() {
         let vol_dir = entry.path();
         if !vol_dir.is_dir() {
@@ -772,13 +780,13 @@ fn summarize_offline_volumes(
         }
         let sidecar_path = sidecar::sidecar_path(&vol_dir);
         match Sidecar::load(&sidecar_path) {
-            Ok(Some(s)) if !live_ids.contains(&s.header.volume_id) => {
-                out.push(VolumeBreakdown::from_sidecar(&s, plan, current));
+            Ok(Some(s)) => f(&vol_dir, s),
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!(target: super::purge::LOG_TARGET, "{}: sidecar {} failed to load: {}", what, sidecar_path.display(), e)
             }
-            _ => {}
         }
     }
-    out
 }
 
 /// Emit the multi-line per-volume plan log. Sorted by `victims`
@@ -857,30 +865,11 @@ fn log_global_stats(state: &EpochState, unified_root: &Path) {
 /// created mid-session (not on disk at startup) accumulate at that
 /// point.
 fn seed_from_disk(state: &EpochState, unified_root: &Path) {
-    let entries = match std::fs::read_dir(unified_root) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            log::warn!(target: super::purge::LOG_TARGET, "epoch seed: read_dir {} failed: {}", unified_root.display(), e);
-            return;
-        }
-    };
     let mut seeded = 0u32;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let sidecar_path = sidecar::sidecar_path(&path);
-        match Sidecar::load(&sidecar_path) {
-            Ok(Some(s)) => {
-                state.add_from_sidecar(&s);
-                seeded += 1;
-            }
-            Ok(None) => {}
-            Err(e) => log::warn!(target: super::purge::LOG_TARGET, "epoch seed: sidecar {} failed to load: {}", sidecar_path.display(), e),
-        }
-    }
+    for_each_volume_sidecar(unified_root, "epoch seed", |_vol_dir, s| {
+        state.add_from_sidecar(&s);
+        seeded += 1;
+    });
     if seeded > 0 {
         log::info!(
             target: super::purge::LOG_TARGET,
@@ -1169,7 +1158,7 @@ mod tests {
         };
         assert!(plan.is_victim(10, cur));
 
-        let evicted = state.purge_offline_volumes(plan, &unified);
+        let evicted = state.purge_offline_volumes(plan, &unified, &state.live_target_volume_ids());
         assert_eq!(evicted, 3);
         assert_eq!(state.total_chunks(), 0);
 
@@ -1246,7 +1235,7 @@ mod tests {
             freed_chunks: 1,
         };
         // Live target → offline sweep must skip this volume.
-        let evicted = state.purge_offline_volumes(plan, &unified);
+        let evicted = state.purge_offline_volumes(plan, &unified, &state.live_target_volume_ids());
         assert_eq!(evicted, 0);
         std::fs::remove_dir_all(&unified).ok();
     }
