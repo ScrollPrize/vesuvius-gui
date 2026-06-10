@@ -1136,6 +1136,12 @@ impl PaintVolume for UnifiedVolume {
         let target_lod = lod_for(sfactor);
         let max_lod = self.cache.max_lod();
 
+        // Per-paint filter LUT: `DrawingConfig::filter` re-evaluates
+        // `filters_active()`, the quant bit-mask match, and an f32 divide
+        // on every call — per pixel that dominates the inner loop. It's a
+        // pure function of `value` for a fixed config, so tabulate it once.
+        let filter_lut: [u8; 256] = std::array::from_fn(|i| config.filter(i as u8));
+
         let pzoom = paint_zoom as i32;
         let width_world = pzoom * canvas_width as i32;
         let height_world = pzoom * canvas_height as i32;
@@ -1222,29 +1228,38 @@ impl PaintVolume for UnifiedVolume {
 
                 let painted = if let Some((lod_use, state)) = chosen.as_ref() {
                     if let Some(mmap) = state.as_resident() {
-                        let scale_use = 1i32 << *lod_use;
-                        let chunk_world_use = 64 * scale_use;
-                        let shift = *lod_use - target_lod;
+                        let lod_use = *lod_use;
+                        let chunk_world_use = 64i32 << lod_use;
+                        let shift = lod_use - target_lod;
                         let parent_tu = tu >> shift;
                         let parent_tv = tv >> shift;
                         let parent_tpc = t.tile_pc >> shift;
                         let chunk_u_lo = parent_tu * chunk_world_use;
                         let chunk_v_lo = parent_tv * chunk_world_use;
                         let chunk_pc_lo = parent_tpc * chunk_world_use;
-                        let plane_sample = ((pc - chunk_pc_lo) / scale_use) as usize;
+                        // `world - chunk_lo` is non-negative inside the tile's
+                        // pixel rect, so `>> lod_use` matches `/ scale_use`
+                        // without the per-pixel idiv.
+                        let plane_sample = ((pc - chunk_pc_lo) >> lod_use) as usize;
+
+                        // Per-axis strides replace the dynamic
+                        // `s[u_coord]/s[v_coord]/s[plane_coord]` permutation
+                        // inside the pixel loop: the chunk is z-major
+                        // (`off = z*64*64 + y*64 + x`), so axis index i
+                        // contributes a factor of 64^i.
+                        const STRIDES: [usize; 3] = [1, 64, 64 * 64];
+                        let stride_u = STRIDES[u_coord];
+                        let stride_v = STRIDES[v_coord];
+                        let row_base = plane_sample * STRIDES[plane_coord];
 
                         for v_px in v_px_lo..v_px_hi {
                             let world_v = min_vc + v_px * pzoom;
-                            let sample_v = ((world_v - chunk_v_lo) / scale_use) as usize;
+                            let sample_v = ((world_v - chunk_v_lo) >> lod_use) as usize;
+                            let row = row_base + sample_v * stride_v;
                             for u_px in u_px_lo..u_px_hi {
                                 let world_u = min_uc + u_px * pzoom;
-                                let sample_u = ((world_u - chunk_u_lo) / scale_use) as usize;
-                                let mut s = [0usize; 3];
-                                s[u_coord] = sample_u;
-                                s[v_coord] = sample_v;
-                                s[plane_coord] = plane_sample;
-                                let off = s[2] * 64 * 64 + s[1] * 64 + s[0];
-                                let value = config.filter(mmap[off]);
+                                let sample_u = ((world_u - chunk_u_lo) >> lod_use) as usize;
+                                let value = filter_lut[mmap[row + sample_u * stride_u] as usize];
                                 buffer.set_gray(u_px as usize, v_px as usize, value);
                             }
                         }
@@ -1253,7 +1268,7 @@ impl PaintVolume for UnifiedVolume {
                         // Empty at this LOD — fill the rect with the filtered
                         // zero value so the user sees a clean "no data" cell
                         // instead of whatever the buffer happened to contain.
-                        let zero = config.filter(0);
+                        let zero = filter_lut[0];
                         for v_px in v_px_lo..v_px_hi {
                             for u_px in u_px_lo..u_px_hi {
                                 buffer.set_gray(u_px as usize, v_px as usize, zero);
