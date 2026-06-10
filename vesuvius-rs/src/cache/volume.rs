@@ -39,7 +39,6 @@ use super::CHUNK_VOXELS;
 use crate::volume::composition::{CompositionState, CompositorRef, MaxCompositionState};
 use crate::volume::{DrawingConfig, Image, PaintVolume, VolumeCons, VoxelPaintVolume, VoxelVolume};
 use ecolor::Color32;
-use libm::modf;
 use memmap::Mmap;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -597,10 +596,13 @@ impl UnifiedVolume {
         // +1-crosses-chunk boundary path uses `get`, which itself
         // fast-paths through the shard slot.
         if let Some(chunk_ptr) = self.shard_slot_chunk_slice(target_lod, target_cx, target_cy, target_cz) {
-            // `lod_use == target_lod` for the shard slot path.
-            let (fx_frac, cx0_f) = modf(xyz[0]);
-            let (fy_frac, cy0_f) = modf(xyz[1]);
-            let (fz_frac, cz0_f) = modf(xyz[2]);
+            // `lod_use == target_lod` for the shard slot path. trunc()
+            // matches modf's truncate-toward-zero split in one
+            // instruction instead of a libm call.
+            let cx0_f = xyz[0].trunc();
+            let cy0_f = xyz[1].trunc();
+            let cz0_f = xyz[2].trunc();
+            let (fx_frac, fy_frac, fz_frac) = (xyz[0] - cx0_f, xyz[1] - cy0_f, xyz[2] - cz0_f);
             let cx0 = (cx0_f as i64).max(0) as u64;
             let cy0 = (cy0_f as i64).max(0) as u64;
             let cz0 = (cz0_f as i64).max(0) as u64;
@@ -633,7 +635,7 @@ impl UnifiedVolume {
 
         // Resolve the LOD to interpolate at: reuse the chunk slot if it
         // still points at our target chunk, otherwise walk the pyramid.
-        let chosen: Option<(u8, Arc<ChunkState>)> = {
+        let cached: Option<(u8, Arc<ChunkState>)> = {
             let b = self.local.borrow();
             if b.target_key == Some(key_t) {
                 b.chosen.clone()
@@ -641,7 +643,8 @@ impl UnifiedVolume {
                 None
             }
         };
-        let chosen = match chosen {
+        let from_slot = cached.is_some();
+        let chosen = match cached {
             Some(c) => c,
             None => {
                 let walk_lo = target_lod.min(max_lod);
@@ -681,9 +684,13 @@ impl UnifiedVolume {
         // coarse mip, not duplicates of the same coarse voxel.
         let shift = lod_use - target_lod;
         let scale = (1u64 << shift) as f64;
-        let (cdx, cx0_f) = modf(xyz[0] / scale);
-        let (cdy, cy0_f) = modf(xyz[1] / scale);
-        let (cdz, cz0_f) = modf(xyz[2] / scale);
+        let lx = xyz[0] / scale;
+        let ly = xyz[1] / scale;
+        let lz = xyz[2] / scale;
+        let cx0_f = lx.trunc();
+        let cy0_f = ly.trunc();
+        let cz0_f = lz.trunc();
+        let (cdx, cdy, cdz) = (lx - cx0_f, ly - cy0_f, lz - cz0_f);
         let cx0 = (cx0_f as i64).max(0) as u64;
         let cy0 = (cy0_f as i64).max(0) as u64;
         let cz0 = (cz0_f as i64).max(0) as u64;
@@ -738,13 +745,17 @@ impl UnifiedVolume {
             None => 0, // Empty
         };
 
-        // Re-anchor the hot slot to our (target chunk → chosen LOD) binding.
-        // Slow-path `get` calls may have rewritten it for their own corner
-        // chunks at `lod_use`, but the next sample in this target chunk
-        // wants our mapping back.
-        let mut b = self.local.borrow_mut();
-        b.target_key = Some(key_t);
-        b.chosen = Some((lod_use, state));
+        // Anchor the hot slot to our (target chunk → chosen LOD) binding,
+        // but only when it changed: the streaming slow path re-enters
+        // here once per sample, and an unconditional rewrite costs a
+        // borrow_mut + Arc refcount round-trip per voxel. Nothing else
+        // writes this slot (`get`/`resolve_chunk` only touch the
+        // per-LOD shard slots), so a cached hit is still current.
+        if !from_slot {
+            let mut b = self.local.borrow_mut();
+            b.target_key = Some(key_t);
+            b.chosen = Some((lod_use, state));
+        }
         result
     }
 
