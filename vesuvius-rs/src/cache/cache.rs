@@ -787,24 +787,27 @@ impl Inner {
     /// Evict all Resident chunks whose access epoch falls into the
     /// `plan.is_victim` set, under per-slot CAS protection.
     ///
-    /// Protocol per victim:
-    ///   1. CAS sidecar `RESIDENT → LOCKED`. If the CAS fails, the slot
-    ///      was concurrently demoted or claimed by another op — skip.
+    /// Victims are processed in bounded batches:
+    ///   1. CAS sidecar `RESIDENT → LOCKED` per victim. If the CAS
+    ///      fails, the slot was concurrently demoted or claimed by
+    ///      another op — skip.
     ///   2. Drop the in-memory `ChunkState::Resident` entry so new
     ///      readers take the slow path.
-    ///   3. Demote the per-shard bitmap to `Unknown` (Release).
-    ///   4. punch_hole — physical reclaim.
-    ///   5. Store `MISSING` (releases the lock; pairs with reader
-    ///      Acquire loads).
-    ///   6. record_evict.
+    ///   3. Demote the per-shard bitmaps to `Unknown` (Release).
+    ///   4. Punch holes — one `fallocate` per contiguous in-shard run
+    ///      instead of one syscall per chunk (victims walk in raster
+    ///      order, so long runs are the norm).
+    ///   5. Store `MISSING` on every slot (releases the locks; pairs
+    ///      with reader Acquire loads).
+    ///   6. record_evict per victim.
     ///
     /// The CAS in step (1) serializes against any concurrent
     /// `write_atomic` on the same slot: a peer that started its CAS
     /// from `MISSING` would have failed (we're at `RESIDENT`), and a
-    /// peer that wins our `LOCKED` claim will see LOCKED and spin
-    /// until we release in step (5). The earlier race where a peer
-    /// fetcher's pwrite could land between our `set MISSING` and
-    /// `punch_hole` is now structurally impossible.
+    /// peer that races our `LOCKED` claim sees LOCKED and yields until
+    /// we release in step (5) — so no pwrite can interleave with the
+    /// punch. The bounded batch size caps how long any one slot stays
+    /// LOCKED.
     fn run_purge(&self, plan: PurgePlan) -> u64 {
         let sidecar = self.disk.sidecar();
         let current = self.epoch.current();
@@ -820,11 +823,13 @@ impl Inner {
         );
         let mut evicted: u64 = 0;
         let mut skipped: u64 = 0;
+        const BATCH: usize = 1024;
 
         for (lod_idx, dims) in sidecar.header.lods.iter().enumerate() {
             let lod = lod_idx as u8;
             let nx = dims.nx as u64;
             let ny = dims.ny as u64;
+            let mut batch: Vec<(u64, u8, ChunkKey)> = Vec::with_capacity(BATCH);
             for idx in 0..dims.count() {
                 if sidecar.get_state(lod, idx) != super::sidecar::STATE_RESIDENT {
                     continue;
@@ -858,28 +863,12 @@ impl Inner {
                 // documented mmap glitch readers tolerate.
                 self.map.remove(&key);
 
-                // (3) Per-shard bitmap demote (Release).
-                if let Some((shard, in_shard_idx)) = self.disk.locate(key) {
-                    if let Some(snap) = self.disk.peek_shard(lod, shard) {
-                        snap.state_bits.store(in_shard_idx, ChunkBitState::Unknown);
-                    }
-                    let _ = (shard, in_shard_idx);
+                batch.push((idx, ae, key));
+                if batch.len() >= BATCH {
+                    evicted += self.purge_release_batch(lod, &sidecar, &mut batch);
                 }
-
-                // (4) Physical reclaim under the lock — no concurrent
-                // pwrite can interleave because peer write_atomic is
-                // either spinning on LOCKED or already failed its CAS.
-                if let Err(e) = self.disk.punch_hole(key) {
-                    log::warn!(target: super::purge::LOG_TARGET, "punch_hole failed for {}: {}", key, e);
-                }
-
-                // (5) Release the lock by publishing MISSING.
-                sidecar.set_state(lod, idx, super::sidecar::STATE_MISSING);
-
-                // (6) Bookkeeping.
-                self.epoch.record_evict(ae);
-                evicted += 1;
             }
+            evicted += self.purge_release_batch(lod, &sidecar, &mut batch);
         }
 
         log::info!(
@@ -891,6 +880,69 @@ impl Inner {
             self.epoch.total_chunks(),
         );
         evicted
+    }
+
+    /// Steps (3)–(6) of `run_purge` for a batch of victims already
+    /// claimed LOCKED: demote the per-shard bitmaps, punch holes
+    /// coalesced per contiguous in-shard run, release every slot to
+    /// MISSING, and record the evictions. Drains `batch` and returns
+    /// its size.
+    fn purge_release_batch(
+        &self,
+        lod: u8,
+        sidecar: &super::sidecar::Sidecar,
+        batch: &mut Vec<(u64, u8, ChunkKey)>,
+    ) -> u64 {
+        if batch.is_empty() {
+            return 0;
+        }
+        // (3) Group per shard so the bitmap demote amortizes the
+        // `opened`-map lock and the punches can coalesce.
+        let mut by_shard: HashMap<ShardCoord, Vec<u64>> = HashMap::new();
+        for (_, _, key) in batch.iter() {
+            if let Some((shard, in_shard_idx)) = self.disk.locate(*key) {
+                by_shard.entry(shard).or_default().push(in_shard_idx);
+            }
+        }
+        for (shard, mut idxs) in by_shard {
+            if let Some(snap) = self.disk.peek_shard(lod, shard) {
+                for &i in &idxs {
+                    snap.state_bits.store(i, ChunkBitState::Unknown);
+                }
+            }
+            // (4) Physical reclaim while every victim is LOCKED — no
+            // concurrent pwrite can interleave. One fallocate per
+            // contiguous run.
+            idxs.sort_unstable();
+            let mut run_start = idxs[0];
+            let mut run_len: u64 = 1;
+            let punch = |start: u64, n: u64| {
+                if let Err(e) = self.disk.punch_hole_run(lod, shard, start, n) {
+                    log::warn!(
+                        target: super::purge::LOG_TARGET,
+                        "punch_hole_run failed lod={} shard={:?} start={} n={}: {}",
+                        lod, shard, start, n, e,
+                    );
+                }
+            };
+            for &i in &idxs[1..] {
+                if i == run_start + run_len {
+                    run_len += 1;
+                } else {
+                    punch(run_start, run_len);
+                    run_start = i;
+                    run_len = 1;
+                }
+            }
+            punch(run_start, run_len);
+        }
+        // (5) Release the locks by publishing MISSING; (6) bookkeeping.
+        let n = batch.len() as u64;
+        for (idx, ae, _) in batch.drain(..) {
+            sidecar.set_state(lod, idx, super::sidecar::STATE_MISSING);
+            self.epoch.record_evict(ae);
+        }
+        n
     }
 
     /// Same semantics as `ChunkCache::state_or_fetch` but callable from

@@ -442,7 +442,11 @@ impl DiskStore {
         loop {
             match sidecar.compare_exchange_state(key.lod, r.sidecar_idx, STATE_MISSING, STATE_LOCKED) {
                 Ok(_) => break,
-                Err(STATE_LOCKED) => std::hint::spin_loop(),
+                // Yield rather than spin: the peer's critical section
+                // includes a 256 KiB pwrite (or a batched purge punch),
+                // which can take milliseconds on a saturated disk —
+                // spin_loop would burn a full core for the duration.
+                Err(STATE_LOCKED) => std::thread::yield_now(),
                 Err(STATE_RESIDENT) => return Ok(WriteOutcome::AlreadyResident),
                 Err(STATE_EMPTY) => return Ok(WriteOutcome::AlreadyEmpty),
                 Err(other) => {
@@ -675,6 +679,9 @@ impl DiskStore {
     /// valid. Readers that already passed the bitmap check before our
     /// demote may transiently see zeros — the async pipeline tolerates
     /// that (next frame re-reads from the now-Missing slot).
+    /// Test-only single-chunk wrapper; production eviction goes through
+    /// `punch_hole_run` with batched, run-coalesced victims.
+    #[cfg(test)]
     pub fn punch_hole(&self, key: ChunkKey) -> std::io::Result<bool> {
         let r = self.inner.resolve(key).ok_or_else(|| {
             std::io::Error::new(
@@ -682,15 +689,58 @@ impl DiskStore {
                 format!("chunk {} out of bounds for this LOD", key),
             )
         })?;
-        let slot = self.inner.lods.get(key.lod as usize).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "lod out of range")
-        })?;
-        let lf = match slot.opened.lock().unwrap().get(&r.shard) {
-            Some(lf) => lf.clone(),
-            None => return Ok(false),
+        self.punch_hole_run(key.lod, r.shard, r.in_shard_idx, 1)
+    }
+
+    /// Punch a contiguous run of `n_chunks` slots starting at
+    /// `start_in_shard_idx` in one shard — one `fallocate` for the whole
+    /// run, which is what makes batch eviction cheap (purge victims walk
+    /// in raster order, so runs of hundreds of chunks are common).
+    ///
+    /// Uses the open shard's fd when available; otherwise opens the file
+    /// ad hoc — a RESIDENT chunk from a previous session can be purged
+    /// without the shard ever having been opened this session. Returns
+    /// `Ok(false)` if the shard file doesn't exist (no bytes to reclaim)
+    /// or has an unexpected length (defensive — never punch a file we
+    /// don't understand).
+    ///
+    /// Same ordering contract as `punch_hole`: callers must hold the
+    /// per-slot LOCKED claim (or have demoted the slots) for every chunk
+    /// in the run before punching.
+    pub fn punch_hole_run(
+        &self,
+        lod: u8,
+        shard: ShardCoord,
+        start_in_shard_idx: u64,
+        n_chunks: u64,
+    ) -> std::io::Result<bool> {
+        let off = start_in_shard_idx * CHUNK_VOXELS as u64;
+        let len = n_chunks * CHUNK_VOXELS as u64;
+        if let Some(slot) = self.inner.lods.get(lod as usize) {
+            let lf = slot.opened.lock().unwrap().get(&shard).cloned();
+            if let Some(lf) = lf {
+                punch_hole_at(&lf.file, off, len)?;
+                return Ok(true);
+            }
+        }
+        let path = self.inner.root.join(shard_filename(lod, shard));
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
         };
-        let off = r.in_shard_idx * CHUNK_VOXELS as u64;
-        punch_hole_at(&lf.file, off, CHUNK_VOXELS as u64)?;
+        let expected = self.inner.shard_bytes();
+        let actual = file.metadata()?.len();
+        if actual != expected {
+            log::warn!(
+                "[cache] punch_hole_run: skip shard {} (len {} != expected {})",
+                path.display(),
+                actual,
+                expected,
+            );
+            return Ok(false);
+        }
+        punch_hole_at(&file, off, len)?;
         Ok(true)
     }
 }
