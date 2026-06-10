@@ -1154,7 +1154,29 @@ impl PaintVolume for UnifiedVolume {
             return;
         }
 
-        // -------- Pass 1: dispatch coarse → fine --------
+        // -------- Pass 0: which target tiles still need data? --------
+        // Terminal tiles (Resident / Empty) need neither a dispatch nor a
+        // coarse preview; gating pass 1 on this stops the steady-state
+        // viewport from re-fetching the whole LOD pyramid every frame.
+        let Some(t) = viewport_tiles(min_uc, max_uc, min_vc, max_vc, pc, target_lod) else {
+            return;
+        };
+        let mut pending_tiles: Vec<(i32, i32)> = Vec::new();
+        for tu in t.tile_u_lo..=t.tile_u_hi {
+            for tv in t.tile_v_lo..=t.tile_v_hi {
+                let mut chunk = [0i32; 3];
+                chunk[u_coord] = tu;
+                chunk[v_coord] = tv;
+                chunk[plane_coord] = t.tile_pc;
+                let key = ChunkKey::new(target_lod, chunk[0] as u32, chunk[1] as u32, chunk[2] as u32);
+                let terminal = self.cache.peek(key).map(|s| s.is_terminal()).unwrap_or(false);
+                if !terminal {
+                    pending_tiles.push((tu, tv));
+                }
+            }
+        }
+
+        // -------- Pass 1: dispatch coarse → fine for pending tiles --------
         // Walking coarse → fine means the first submissions of a cold
         // viewport are the low-LOD preview chunks. The cache + downloader
         // queues are pure LIFO, so the most recently submitted (finest)
@@ -1162,15 +1184,29 @@ impl PaintVolume for UnifiedVolume {
         // low-LOD chunks into flight before the worker pool can drain
         // them, so a quick preview shows up promptly while detail
         // streams in behind it.
-        for lod in (target_lod..=max_lod).rev() {
-            let Some(tiles) = viewport_tiles(min_uc, max_uc, min_vc, max_vc, pc, lod) else {
-                continue;
-            };
-            for tu in tiles.tile_u_lo..=tiles.tile_u_hi {
-                for tv in tiles.tile_v_lo..=tiles.tile_v_hi {
+        //
+        // Only coarse ancestors of still-pending target tiles are
+        // touched: target tiles themselves are dispatched by pass 2, and
+        // ancestors of already-terminal tiles would be previews nobody
+        // renders. In-flight coarse fetches whose target tiles have all
+        // landed stop being re-touched here and age out of the queues.
+        if !pending_tiles.is_empty() {
+            let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+            for lod in (target_lod + 1..=max_lod).rev() {
+                let Some(tiles) = viewport_tiles(min_uc, max_uc, min_vc, max_vc, pc, lod) else {
+                    continue;
+                };
+                let shift = lod - target_lod;
+                seen.clear();
+                for &(tu, tv) in &pending_tiles {
+                    let ctu = tu >> shift;
+                    let ctv = tv >> shift;
+                    if !seen.insert((ctu, ctv)) {
+                        continue;
+                    }
                     let mut chunk = [0i32; 3];
-                    chunk[u_coord] = tu;
-                    chunk[v_coord] = tv;
+                    chunk[u_coord] = ctu;
+                    chunk[v_coord] = ctv;
                     chunk[plane_coord] = tiles.tile_pc;
                     let key = ChunkKey::new(lod, chunk[0] as u32, chunk[1] as u32, chunk[2] as u32);
                     let _ = self.cache.state_or_fetch(key);
@@ -1179,9 +1215,6 @@ impl PaintVolume for UnifiedVolume {
         }
 
         // -------- Pass 2: render per target tile, picking best resident LOD --------
-        let Some(t) = viewport_tiles(min_uc, max_uc, min_vc, max_vc, pc, target_lod) else {
-            return;
-        };
         let ceil_div = |x: i32, d: i32| (x + d - 1).div_euclid(d);
 
         for tu in t.tile_u_lo..=t.tile_u_hi {
