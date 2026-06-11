@@ -83,12 +83,31 @@ impl Downloader {
             in_flight: AtomicUsize::new(0),
         });
 
-        let client = Client::builder()
+        // HTTP/1.1 only, deliberately: with ALPN h2, reqwest multiplexes
+        // ALL workers onto a single TCP connection per host (the pool
+        // settings below only apply to http/1.1). One connection means one
+        // congestion window — measured ~3MB/s on a 10MB/s link against
+        // CloudFront — and every in-flight chunk inflates every other
+        // chunk's latency (2MB bodies taking 8-12s under load). Sixteen
+        // http/1.1 connections reach ~7-8MB/s on the same link.
+        //
+        // VESUVIUS_H2_WINDOW=<bytes> opts back into h2 with a fixed stream
+        // window (connection window 4x that) for experiments; a ~4MB window
+        // recovers throughput but keeps the shared-connection latency
+        // coupling, so it's not the default.
+        let mut builder = Client::builder()
             .pool_max_idle_per_host(workers)
             .pool_idle_timeout(Some(Duration::from_secs(60)))
-            .http2_adaptive_window(true)
             .tcp_keepalive(Some(Duration::from_secs(30)))
-            .timeout(Some(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)))
+            .timeout(Some(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS)));
+        if let Some(window) = std::env::var("VESUVIUS_H2_WINDOW").ok().and_then(|v| v.parse::<u32>().ok()) {
+            builder = builder
+                .http2_initial_stream_window_size(window)
+                .http2_initial_connection_window_size(window.saturating_mul(4));
+        } else {
+            builder = builder.http1_only();
+        }
+        let client = builder
             .build()
             .expect("failed to build reqwest client for cache Downloader");
 
