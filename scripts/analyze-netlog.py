@@ -46,7 +46,7 @@ def summarize(label, rows):
 
 def main(path):
     downloads, aged, extracts, task_aged, purges = [], [], [], [], []
-    purge_plans, anomalies, raw_hits = [], [], []
+    purge_plans, anomalies, raw_hits, decodes = [], [], [], []
     for line in open(path):
         try:
             r = json.loads(line)
@@ -67,6 +67,8 @@ def main(path):
             anomalies.append(r)
         elif ev == "raw_hit":
             raw_hits.append(r)
+        elif ev == "decode":
+            decodes.append(r)
         elif ev == "aged_out":
             aged.append(r)
 
@@ -130,6 +132,19 @@ def main(path):
                     reasons[r["reason"].split(":")[0][:60]] += 1
             if reasons:
                 print(f"  failure reasons: {dict(reasons)}")
+            pend = [r["pending_ms"] for r in ok_ex if "pending_ms" in r]
+            if pend:
+                print(f"  request->paintable: p50={pct(pend,50)}ms p90={pct(pend,90)}ms "
+                      f"p99={pct(pend,99)}ms max={max(pend)}ms")
+        if decodes:
+            ran = [r for r in decodes if r["ran"]]
+            blocked = [r for r in decodes if not r["ran"]]
+            rms = [r["ms"] for r in ran]
+            bms = [r["ms"] for r in blocked]
+            print(f"decodes: {len(ran)} ran (ms p50={pct(rms,50)} p90={pct(rms,90)}), "
+                  f"{len(blocked)} BLOCKED on another worker's decode "
+                  f"(ms p50={pct(bms,50)} p90={pct(bms,90)}) "
+                  f"— blocked worker-seconds: {sum(bms)/1000:.0f}s")
         if anomalies:
             kinds = defaultdict(int)
             for r in anomalies:
