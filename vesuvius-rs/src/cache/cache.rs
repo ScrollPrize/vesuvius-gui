@@ -1414,8 +1414,12 @@ impl Inner {
         let mut primary_state: Option<Arc<ChunkState>> = None;
         let mut sibling_states: Vec<(ChunkKey, Arc<ChunkState>)> = Vec::new();
         let mut failure_state: Option<Arc<ChunkState>> = None;
+        let mut outcome_label = "ok";
+        let mut fail_reason: Option<String> = None;
+        let mut n_fills = 0usize;
         match extract(&inputs) {
             Ok(fills) => {
+                n_fills = fills.len();
                 // Each fill is materialized to its terminal state (disk
                 // write + mmap → Resident, or .empty sentinel → Empty).
                 // Promoting *every* fill — not just the primary — means
@@ -1439,14 +1443,22 @@ impl Inner {
                 if !seen_primary {
                     log::warn!("[{}] extract produced no entry for the dispatched key", key);
                     failure_state = Some(cooldown());
+                    outcome_label = "no_primary";
                 }
             }
-            Err(BackfillError::OutOfBounds) => failure_state = Some(long_cooldown()),
+            Err(BackfillError::OutOfBounds) => {
+                failure_state = Some(long_cooldown());
+                outcome_label = "oob";
+            }
             Err(BackfillError::Permanent(reason)) => {
                 log::warn!("[{}] permanent: {}", key, reason);
                 failure_state = Some(long_cooldown());
+                outcome_label = "permanent";
+                fail_reason = Some(reason);
             }
             Err(BackfillError::Transient(reason)) => {
+                outcome_label = "transient";
+                fail_reason = Some(reason.clone());
                 // Aged-out / cancelled fetches aren't a chunk failure — they
                 // just mean the viewport moved on before the source landed.
                 // Surface them as cancellations so they don't look like errors.
@@ -1463,6 +1475,20 @@ impl Inner {
         // can see them — Arc clones inside the source entries remain.
         drop(inputs);
         self.release_sources(&order);
+
+        if super::netlog::enabled() {
+            super::netlog::emit(serde_json::json!({
+                "t": super::netlog::now_ms(),
+                "event": "extract",
+                "chunk": format!("{:?}", key),
+                "outcome": outcome_label,
+                "reason": fail_reason,
+                "fills": n_fills,
+                "covered": covered.len(),
+                "sources": order.len(),
+                "ms": t0.elapsed().as_millis() as u64,
+            }));
+        }
 
         let new_state = primary_state.unwrap_or_else(|| failure_state.clone().unwrap_or_else(cooldown));
         self.map.insert(key, new_state.clone());
@@ -1522,6 +1548,12 @@ impl Inner {
                             }
                             None => {
                                 log::warn!("[{}] write ok but mmap reload failed", key);
+                                super::netlog::emit(serde_json::json!({
+                                    "t": super::netlog::now_ms(),
+                                    "event": "disk_anomaly",
+                                    "kind": "mmap_reload_failed",
+                                    "chunk": format!("{:?}", key),
+                                }));
                                 cooldown()
                             }
                         },
@@ -1533,6 +1565,13 @@ impl Inner {
                 }
                 Err(e) => {
                     log::warn!("[{}] disk write failed: {}", key, e);
+                    super::netlog::emit(serde_json::json!({
+                        "t": super::netlog::now_ms(),
+                        "event": "disk_anomaly",
+                        "kind": "write_failed",
+                        "chunk": format!("{:?}", key),
+                        "error": e.to_string(),
+                    }));
                     cooldown()
                 }
             },
@@ -1580,6 +1619,22 @@ impl Inner {
     /// `FetchSource` resolves with a Transient error so waiters back off;
     /// `Extract` just cleans up progress and reverts the chunk to cooldown.
     fn cancel_dropped_task(self: &Arc<Self>, entry: QueueEntry<Task>, reason: &str) {
+        if super::netlog::enabled() {
+            // An aged-out Extract is the expensive case: its sources were
+            // already downloaded and their payloads get dropped without
+            // producing a single chunk — the next request re-downloads.
+            super::netlog::emit(serde_json::json!({
+                "t": super::netlog::now_ms(),
+                "event": "task_aged_out",
+                "kind": match &entry.item {
+                    Task::FetchSource { .. } => "fetch_source",
+                    Task::Extract => "extract",
+                },
+                "chunk": format!("{:?}", entry.chunk),
+                "queued_ms": entry.submitted_at.elapsed().as_millis() as u64,
+                "touches": entry.touch_count,
+            }));
+        }
         match entry.item {
             Task::FetchSource { key, fetch: _ } => {
                 log::trace!("[{}] cancel: {}", key, reason);

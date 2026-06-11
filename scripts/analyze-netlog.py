@@ -45,19 +45,35 @@ def summarize(label, rows):
 
 
 def main(path):
-    downloads, aged = [], []
+    downloads, aged, extracts, task_aged, purges = [], [], [], [], []
+    purge_plans, anomalies = [], []
     for line in open(path):
         try:
             r = json.loads(line)
         except json.JSONDecodeError:
             continue
-        (downloads if r.get("event") == "download" else aged).append(r)
+        ev = r.get("event")
+        if ev == "download":
+            downloads.append(r)
+        elif ev == "extract":
+            extracts.append(r)
+        elif ev == "task_aged_out":
+            task_aged.append(r)
+        elif ev == "purge":
+            purges.append(r)
+        elif ev == "purge_plan":
+            purge_plans.append(r)
+        elif ev == "disk_anomaly":
+            anomalies.append(r)
+        elif ev == "aged_out":
+            aged.append(r)
 
     if not downloads:
         print("no download events")
         return
 
-    print(f"=== {len(downloads)} downloads, {len(aged)} aged-out cancellations ===")
+    print(f"=== {len(downloads)} downloads, {len(aged)} download age-outs, "
+          f"{len(extracts)} extracts, {len(task_aged)} task age-outs, {len(purges)} purge passes ===")
 
     by_host = defaultdict(list)
     for r in downloads:
@@ -89,6 +105,54 @@ def main(path):
     if aged:
         qm = [r["queued_ms"] for r in aged]
         print(f"aged out: n={len(aged)} queued p50={pct(qm,50)}ms touched={sum(1 for r in aged if r['touches']>0)}")
+
+    # extract pipeline: outcomes, fan-out, decode cost, discarded payloads
+    if extracts or task_aged:
+        print("\n=== extract pipeline ===")
+        out = defaultdict(int)
+        for r in extracts:
+            out[r["outcome"]] += 1
+        ok_ex = [r for r in extracts if r["outcome"] == "ok"]
+        if extracts:
+            ms = [r["ms"] for r in ok_ex]
+            fills = [r["fills"] for r in ok_ex]
+            print(f"extracts: {dict(out)}  ms p50={pct(ms,50)} p90={pct(ms,90)} max={max(ms) if ms else 0}  "
+                  f"fills/extract p50={pct(fills,50)} p90={pct(fills,90)}")
+            reasons = defaultdict(int)
+            for r in extracts:
+                if r.get("reason"):
+                    # collapse per-url details so reasons aggregate
+                    reasons[r["reason"].split(":")[0][:60]] += 1
+            if reasons:
+                print(f"  failure reasons: {dict(reasons)}")
+        if anomalies:
+            kinds = defaultdict(int)
+            for r in anomalies:
+                kinds[r["kind"]] += 1
+            print(f"disk anomalies: {dict(kinds)}")
+        by_kind = defaultdict(list)
+        for r in task_aged:
+            by_kind[r["kind"]].append(r)
+        for kind, rows in sorted(by_kind.items()):
+            qm = [r["queued_ms"] for r in rows]
+            note = "  <-- downloaded payloads DISCARDED un-extracted" if kind == "extract" else ""
+            print(f"task age-outs [{kind}]: n={len(rows)} queued p50={pct(qm,50)}ms "
+                  f"touched={sum(1 for r in rows if r['touches']>0)}{note}")
+
+    # purge passes: is eviction touching what we just wrote?
+    if purges or purge_plans:
+        print("\n=== purge passes ===")
+        for r in purges:
+            print(f"  trigger={r['trigger']} target={r['target']} evicted={r['evicted']} "
+                  f"resident_before={r['resident_before']} (hw={r['high_water']} lw={r['low_water']})")
+        for r in purge_plans:
+            # age_threshold small (< ~10) => purge is eating recently-written epochs
+            print(f"  plan: current_epoch={r['current_epoch']} age_threshold={r['age_threshold']} "
+                  f"planned_victims={r['planned_victims']} target={r['target_chunks']}")
+            vols = sorted(r.get("volumes", []), key=lambda v: -v["victims"])[:6]
+            for v in vols:
+                if v["victims"]:
+                    print(f"    {v['id'][:60]}: victims={v['victims']} of {v['resident']} (oldest_age={v['oldest_age']})")
 
     # timeline: per-second downlink utilization + concurrency
     buckets = defaultdict(lambda: [0.0, []])  # sec -> [bytes, [in_flight..]]

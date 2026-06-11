@@ -221,6 +221,18 @@ impl EpochState {
             high_water,
             low_water,
         );
+        if super::netlog::enabled() {
+            super::netlog::emit(serde_json::json!({
+                "t": super::netlog::now_ms(),
+                "event": "purge",
+                "trigger": source,
+                "target": target,
+                "evicted": evicted,
+                "resident_before": total,
+                "high_water": high_water,
+                "low_water": low_water,
+            }));
+        }
         evicted
     }
 
@@ -267,6 +279,25 @@ impl EpochState {
             summaries.extend(summarize_offline_volumes(plan, current, root, &live_ids));
         }
         log_plan(plan, current, &summaries);
+        if super::netlog::enabled() {
+            // age_threshold is the modular epoch distance above which a
+            // chunk is a victim: a SMALL threshold means the purge is
+            // reaching into recently-written epochs.
+            super::netlog::emit(serde_json::json!({
+                "t": super::netlog::now_ms(),
+                "event": "purge_plan",
+                "current_epoch": current,
+                "age_threshold": plan.age_threshold,
+                "target_chunks": plan.target_chunks,
+                "planned_victims": plan.freed_chunks,
+                "volumes": summaries.iter().map(|b| serde_json::json!({
+                    "id": b.volume_id,
+                    "resident": b.resident,
+                    "oldest_age": b.oldest_age,
+                    "victims": b.victims,
+                })).collect::<Vec<_>>(),
+            }));
+        }
 
         let mut total: u64 = 0;
         for t in live {
