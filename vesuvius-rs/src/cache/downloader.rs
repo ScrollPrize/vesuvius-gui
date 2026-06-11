@@ -16,10 +16,12 @@
 //! short cooldown.
 
 use super::lifo::LifoQueue;
+use super::netlog;
 use super::state::ChunkKey;
 use super::MAX_AGE;
 use dashmap::DashMap;
 use reqwest::blocking::Client;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,6 +54,9 @@ struct DownloaderInner {
     /// removed when the count drops to zero, so `contains_key` is a sufficient
     /// "is actively downloading" check.
     active: DashMap<ChunkKey, usize>,
+    /// Total HTTP GETs currently on the wire across all workers. Telemetry
+    /// only (the netlog records the concurrency each request contended with).
+    in_flight: AtomicUsize,
 }
 
 struct Job {
@@ -75,6 +80,7 @@ impl Downloader {
         let inner = Arc::new(DownloaderInner {
             queue: LifoQueue::new(max_age),
             active: DashMap::new(),
+            in_flight: AtomicUsize::new(0),
         });
 
         let client = Client::builder()
@@ -173,6 +179,11 @@ impl Default for Downloader {
     }
 }
 
+/// Host part of `url`, for per-host aggregation in the netlog.
+fn url_host(url: &str) -> &str {
+    url.split('/').nth(2).unwrap_or("")
+}
+
 fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
     loop {
         let (entry, dropped) = inner.queue.pop();
@@ -180,10 +191,27 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
             // Stale by age — cancel so the cache rolls the chunk back to
             // a cooldown.
             log::trace!("[{}] aged out", d.item.url);
+            if netlog::enabled() {
+                netlog::emit(serde_json::json!({
+                    "t": netlog::now_ms(),
+                    "event": "aged_out",
+                    "host": url_host(&d.item.url),
+                    "url": d.item.url,
+                    "chunk": format!("{:?}", d.chunk),
+                    "range_off": d.item.range.map(|(off, _)| off),
+                    "queued_ms": d.submitted_at.elapsed().as_millis() as u64,
+                    "touches": d.touch_count,
+                }));
+            }
             (d.item.on_done)(Err(DownloadError::Transient("aged out".into())));
         }
         let chunk = entry.chunk;
         let job = entry.item;
+        // Queue wait split two ways: since the last touch (how long the
+        // *current* viewport waited) and since first submission.
+        let wait_ms = entry.added_at.elapsed().as_millis() as u64;
+        let wait_total_ms = entry.submitted_at.elapsed().as_millis() as u64;
+        let q_depth = if netlog::enabled() { inner.queue.len() } else { 0 };
 
         let t0 = Instant::now();
         let mut req = client.get(&job.url);
@@ -197,18 +225,39 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
             log::trace!("[{}] GET", job.url);
         }
         inner.mark_active(chunk);
+        let in_flight = inner.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _active = ActiveGuard { inner: &inner, chunk };
+        let mut ttfb_ms: u64 = 0;
+        let mut body_ms: u64 = 0;
+        let mut got_bytes: u64 = 0;
+        let mut http_status: u16 = 0;
+        let mut cdn_cache: Option<String> = None;
         let outcome: DownloadResult = match req.send() {
             Ok(resp) => {
+                // `send` returns once response headers are in: TTFB covers
+                // queue-free request latency (connect/TLS if not pooled,
+                // plus server processing and one RTT).
+                ttfb_ms = t0.elapsed().as_millis() as u64;
                 let status = resp.status();
                 let code = status.as_u16();
+                http_status = code;
+                if netlog::enabled() {
+                    cdn_cache = resp
+                        .headers()
+                        .get("x-cache")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                }
                 // 200 OK is the un-ranged success; 206 Partial Content is the
                 // ranged success. Some servers return 200 with the full body
                 // when they ignore Range — caller decides whether that's
                 // acceptable. Here we surface either as Ok(Some(bytes)).
                 if code == 200 || code == 206 {
+                    let t_body = Instant::now();
                     match resp.bytes() {
                         Ok(bytes) => {
+                            body_ms = t_body.elapsed().as_millis() as u64;
+                            got_bytes = bytes.len() as u64;
                             log::trace!("[{}] {} ({} bytes, {:?})", job.url, code, bytes.len(), t0.elapsed());
                             Ok(Some(bytes))
                         }
@@ -234,6 +283,30 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
                 Err(DownloadError::Transient(format!("transport: {}", e)))
             }
         };
+        inner.in_flight.fetch_sub(1, Ordering::Relaxed);
+
+        if netlog::enabled() {
+            netlog::emit(serde_json::json!({
+                "t": netlog::now_ms(),
+                "event": "download",
+                "host": url_host(&job.url),
+                "url": job.url,
+                "chunk": format!("{:?}", chunk),
+                "range_off": job.range.map(|(off, _)| off),
+                "range_len": job.range.map(|(_, len)| len),
+                "status": http_status,
+                "ok": outcome.is_ok(),
+                "x_cache": cdn_cache,
+                "wait_ms": wait_ms,
+                "wait_total_ms": wait_total_ms,
+                "touches": entry.touch_count,
+                "ttfb_ms": ttfb_ms,
+                "body_ms": body_ms,
+                "bytes": got_bytes,
+                "in_flight": in_flight,
+                "q_depth": q_depth,
+            }));
+        }
 
         (job.on_done)(outcome);
     }

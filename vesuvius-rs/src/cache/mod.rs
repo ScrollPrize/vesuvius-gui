@@ -17,6 +17,7 @@ mod cache;
 mod disk;
 mod downloader;
 mod lifo;
+mod netlog;
 pub mod epoch;
 pub mod purge;
 mod sidecar;

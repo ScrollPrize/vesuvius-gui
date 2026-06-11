@@ -44,6 +44,13 @@ pub(super) struct QueueEntry<T> {
     /// The cache chunk this work is on behalf of — the `touch` handle.
     pub chunk: ChunkKey,
     pub added_at: Instant,
+    /// First submission time — unlike `added_at`, never reset by `touch`.
+    /// Telemetry only: total time from "first wanted" to pop.
+    pub submitted_at: Instant,
+    /// How many times `touch` refreshed this entry while it waited. A high
+    /// count marks a chunk the paint loop kept asking for — telemetry for
+    /// spotting priority inversion / head-of-line blocking.
+    pub touch_count: u32,
     pub item: T,
 }
 
@@ -74,11 +81,14 @@ impl<T> LifoQueue<T> {
         let mut q = self.inner.lock().unwrap();
         q.next_seq += 1;
         let key = rev_seq(q.next_seq);
+        let now = Instant::now();
         q.entries.insert(
             key,
             QueueEntry {
                 chunk,
-                added_at: Instant::now(),
+                added_at: now,
+                submitted_at: now,
+                touch_count: 0,
                 item,
             },
         );
@@ -102,6 +112,7 @@ impl<T> LifoQueue<T> {
                 continue;
             };
             entry.added_at = now;
+            entry.touch_count += 1;
             q.next_seq += 1;
             let new_key = rev_seq(q.next_seq);
             q.entries.insert(new_key, entry);
@@ -111,6 +122,11 @@ impl<T> LifoQueue<T> {
             q.chunk_index.insert(chunk, new_keys);
             self.not_empty.notify_one();
         }
+    }
+
+    /// Number of queued entries right now. Telemetry only.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().entries.len()
     }
 
     /// Block until a non-stale entry is available. Entries culled along
