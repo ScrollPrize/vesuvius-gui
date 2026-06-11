@@ -45,7 +45,7 @@ use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone};
 use super::epoch::{self, EpochState};
 use super::lifo::{LifoQueue, QueueEntry};
 use super::purge::{PurgePlan, PurgeTarget};
-use super::spill::SpillStore;
+use super::spill::RawStore;
 use super::state::{ChunkKey, ChunkState};
 use super::{CHUNK_VOXELS, MAX_AGE};
 use dashmap::DashMap;
@@ -83,10 +83,12 @@ struct Inner {
     /// access deadlocks.
     dispatching: DashMap<ChunkKey, ()>,
     disk: DiskStore,
-    /// On-disk spill for downloaded source bytes. Sits between the
-    /// downloader and Extract so the compressed payload doesn't live on
-    /// the heap.
-    spill: SpillStore,
+    /// Keyed on-disk retention for downloaded source bytes. Doubles as
+    /// the spill between the downloader and Extract (compressed payloads
+    /// stay off the heap) and as a (url, range)-keyed cache so a region
+    /// evicted from the decoded chunk store re-decodes locally instead of
+    /// re-downloading. Shared dir across volumes; see `spill::RawStore`.
+    raw: RawStore,
     backfiller: Arc<dyn ChunkBackfiller>,
     /// `Mutex<HashMap>` rather than `DashMap` so claim-the-slot for a fresh
     /// source key is atomic. The lock is never held across `try_submit`
@@ -378,9 +380,11 @@ impl ChunkCache {
         epoch: Arc<EpochState>,
     ) -> Arc<Inner> {
         let task_queue = LifoQueue::new(MAX_AGE);
-        let spill_root = root.join("spill");
+        // Raw-source retention lives at the unified root (volume-agnostic:
+        // keys are (url, range) hashes), so every volume shares one budget.
+        let raw_root = root.parent().map(|p| p.join("raw")).unwrap_or_else(|| root.join("raw"));
         let chunks_root = root;
-        let _ = std::fs::create_dir_all(&spill_root);
+        let _ = std::fs::create_dir_all(&raw_root);
 
         let volume_id = backfiller.volume_id();
         let extent = backfiller.voxel_extent();
@@ -402,7 +406,7 @@ impl ChunkCache {
             map: DashMap::new(),
             dispatching: DashMap::new(),
             disk,
-            spill: SpillStore::new(spill_root),
+            raw: RawStore::new(raw_root),
             backfiller,
             sources: Mutex::new(HashMap::new()),
             chunks: DashMap::new(),
@@ -1264,16 +1268,47 @@ impl Inner {
                 }
             }
             SourceSpec::Download { key: _, url, range } => {
+                // Retention key: the (url, byte-range) identity of the
+                // bytes themselves — volume-agnostic, so the same shard
+                // range fetched through two volume identities still hits.
+                let raw_key = match range {
+                    Some((off, len)) => format!("{}#{}+{}", url, off, len),
+                    None => format!("{}#full", url),
+                };
+
+                // Raw-store hit: the bytes are already on local disk from
+                // an earlier download. Complete the source synchronously —
+                // no locks are held here, and complete_source firing from
+                // this thread is the same re-entrancy the downloader's
+                // synchronous on_done path already exercises.
+                if let Some(mmap) = self.raw.get(&raw_key) {
+                    if super::netlog::enabled() {
+                        super::netlog::emit(serde_json::json!({
+                            "t": super::netlog::now_ms(),
+                            "event": "raw_hit",
+                            "url": url,
+                            "range_off": range.map(|(off, _)| off),
+                            "range_len": range.map(|(_, len)| len),
+                            "chunk": format!("{:?}", chunk_key),
+                            "bytes": mmap.len(),
+                        }));
+                    }
+                    log::trace!("[{}] raw-store hit (chunk {})", source_key, chunk_key);
+                    self.complete_source(source_key, Ok(Some(Arc::new(mmap) as SourcePayload)));
+                    return RegisterResult::Queued;
+                }
+
                 let inner = self.clone();
                 let key_for_done = source_key.clone();
                 let on_done: OnDone = Box::new(move |result: DownloadResult| {
-                    // Spill the bytes to disk as soon as they arrive so the
-                    // payload is mmap-backed by the time Extract picks it
-                    // up. This keeps the heap bounded even when many
-                    // downloads complete faster than the (limited) cache
-                    // workers can extract them.
+                    // Persist the bytes to the raw store as soon as they
+                    // arrive: the payload is mmap-backed (heap stays
+                    // bounded even when downloads outpace extraction) and
+                    // the file is retained so future evictions of the
+                    // decoded chunks re-decode locally instead of
+                    // re-downloading.
                     let outcome: SourceOutcome = match result {
-                        Ok(Some(bytes)) => match inner.spill.write_and_mmap(&bytes) {
+                        Ok(Some(bytes)) => match inner.raw.put(&raw_key, &bytes) {
                             Ok(mmap) => Ok(Some(Arc::new(mmap) as SourcePayload)),
                             Err(e) => {
                                 log::warn!("[{}] spill failed ({}); falling back to in-memory", key_for_done, e);

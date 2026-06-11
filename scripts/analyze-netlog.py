@@ -46,7 +46,7 @@ def summarize(label, rows):
 
 def main(path):
     downloads, aged, extracts, task_aged, purges = [], [], [], [], []
-    purge_plans, anomalies = [], []
+    purge_plans, anomalies, raw_hits = [], [], []
     for line in open(path):
         try:
             r = json.loads(line)
@@ -65,6 +65,8 @@ def main(path):
             purge_plans.append(r)
         elif ev == "disk_anomaly":
             anomalies.append(r)
+        elif ev == "raw_hit":
+            raw_hits.append(r)
         elif ev == "aged_out":
             aged.append(r)
 
@@ -74,6 +76,9 @@ def main(path):
 
     print(f"=== {len(downloads)} downloads, {len(aged)} download age-outs, "
           f"{len(extracts)} extracts, {len(task_aged)} task age-outs, {len(purges)} purge passes ===")
+    if raw_hits:
+        saved = sum(r["bytes"] for r in raw_hits)
+        print(f"raw-store hits: {len(raw_hits)} ({saved/1e6:.0f}MB served locally instead of re-downloaded)")
 
     by_host = defaultdict(list)
     for r in downloads:
