@@ -17,7 +17,9 @@
 //!
 //! Unbounded; dedup happens at the cache layer (source-key + chunk-key
 //! uniqueness), so submission always succeeds. The only staleness check
-//! is age.
+//! is age, and `submit_durable` entries are exempt from it — used for
+//! Extract tasks whose downloads already completed, where discarding
+//! would waste the paid-for bytes.
 
 use super::state::ChunkKey;
 use std::collections::{BTreeMap, HashMap};
@@ -51,6 +53,13 @@ pub(super) struct QueueEntry<T> {
     /// count marks a chunk the paint loop kept asking for — telemetry for
     /// spotting priority inversion / head-of-line blocking.
     pub touch_count: u32,
+    /// Exempt from the `max_age` cull at pop. For work whose inputs are
+    /// already paid for (an Extract whose sources finished downloading),
+    /// running late is strictly cheaper than discarding: the alternative
+    /// is re-downloading the same bytes on the next visit. Durable entries
+    /// keep normal LIFO order — they just wait at the tail instead of
+    /// dying there.
+    pub durable: bool,
     pub item: T,
 }
 
@@ -78,6 +87,17 @@ impl<T> LifoQueue<T> {
     /// queue is unbounded); the only way queued work dies unprocessed is
     /// the `max_age` cull at pop.
     pub fn submit(&self, chunk: ChunkKey, item: T) {
+        self.submit_inner(chunk, item, false);
+    }
+
+    /// Like `submit`, but the entry is exempt from the `max_age` cull —
+    /// it runs whenever the LIFO order reaches it, no matter how stale.
+    /// For work whose inputs are already paid for (see `QueueEntry::durable`).
+    pub fn submit_durable(&self, chunk: ChunkKey, item: T) {
+        self.submit_inner(chunk, item, true);
+    }
+
+    fn submit_inner(&self, chunk: ChunkKey, item: T, durable: bool) {
         let mut q = self.inner.lock().unwrap();
         q.next_seq += 1;
         let key = rev_seq(q.next_seq);
@@ -89,6 +109,7 @@ impl<T> LifoQueue<T> {
                 added_at: now,
                 submitted_at: now,
                 touch_count: 0,
+                durable,
                 item,
             },
         );
@@ -147,7 +168,7 @@ impl<T> LifoQueue<T> {
                     q.chunk_index.remove(&entry.chunk);
                 }
             }
-            if entry.added_at.elapsed() > self.max_age {
+            if !entry.durable && entry.added_at.elapsed() > self.max_age {
                 dropped.push(entry);
                 continue;
             }

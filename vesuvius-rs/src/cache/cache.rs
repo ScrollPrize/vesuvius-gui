@@ -61,7 +61,12 @@ const PERMANENT_COOLDOWN: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 /// Small worker pool — extract + decode is CPU-bound but lock-light. Keeping
 /// the count low reduces the chance that a worker stalls behind a
 /// DashMap shard another worker is holding.
-const DEFAULT_WORKERS: usize = 4;
+// Sized against the downloader: at a saturated ~13MB/s the downloader
+// delivers ~19 c3d sub-chunks/s while one extract (256³ c3d decode + 64
+// chunk writes) takes ~400ms. Four workers (~10/s) let the extract
+// backlog grow unboundedly during sustained browsing; eight keep pace
+// while leaving half the cores to paint/decode rayon work.
+const DEFAULT_WORKERS: usize = 8;
 
 pub struct ChunkCache {
     inner: Arc<Inner>,
@@ -1107,8 +1112,9 @@ impl Inner {
         self.chunks.insert(key, progress_arc.clone());
 
         if order.is_empty() {
-            // 0-source plan: queue Extract immediately.
-            self.task_queue.submit(key, Task::Extract);
+            // 0-source plan: queue Extract immediately. Durable: extracts
+            // are never age-culled (their inputs are already paid for).
+            self.task_queue.submit_durable(key, Task::Extract);
             return pending_state();
         }
 
@@ -1383,7 +1389,11 @@ impl Inner {
             }
         };
         if queue_extract {
-            self.task_queue.submit(chunk_key, Task::Extract);
+            // Durable: every source for this chunk has finished downloading,
+            // so culling the Extract by age would discard paid-for bytes and
+            // force a re-download on the next visit. Late extraction is
+            // strictly cheaper — it still persists all covered chunks.
+            self.task_queue.submit_durable(chunk_key, Task::Extract);
         }
     }
 
