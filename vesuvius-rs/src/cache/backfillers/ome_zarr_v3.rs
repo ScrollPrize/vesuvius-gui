@@ -17,20 +17,20 @@
 //!   3. Emit one `SourceSpec::Download { url, range }` per non-empty
 //!      sub-chunk. Sentinel index entries and 404-on-shard-index get
 //!      no source — the extract closure treats their region as zero.
-//!   4. Extract: c3d-decode each received sub-chunk and slice it into
-//!      the 64³ cache chunk (primary + siblings, same shape as the v2
-//!      extract in `ome_zarr.rs`).
+//!   4. Extract: c3d-decode the sub-chunk (memoized on the shared
+//!      `LazySource` payload, so concurrent sibling extracts decode once)
+//!      and slice out the requesting 64³ cache chunk. Coverage is lazy —
+//!      only requested chunks are materialized; see the `covered`
+//!      comment in `plan_v3_chunk`.
 //!
 //! Source payload is the same as `Download` produces elsewhere:
-//! `Arc<Mmap>` (spilled to disk by the cache's on_done) with a
-//! fallback to `Arc<Vec<u8>>` if the spill write failed.
+//! `Arc<LazySource>` over raw-store-backed bytes.
 
 use crate::cache::backfiller::{
-    BackfillError, BackfillPlan, ExtractedChunk, SourceOutcome, SourcePayload, SourceSpec,
+    BackfillError, BackfillPlan, ExtractedChunk, LazySource, SourceOutcome, SourcePayload, SourceSpec,
 };
 use crate::cache::state::ChunkKey;
 use crate::cache::CHUNK_SIDE;
-use memmap::Mmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use vesuvius_zarr::v3::V3RemoteShardedAccess;
@@ -135,8 +135,24 @@ pub(super) fn plan_v3_chunk(
         }
     }
 
-    let covered =
-        super::ome_zarr::covered_cache_chunks([cz_lo, cy_lo, cx_lo], [cz_hi, cy_hi, cx_hi], &sub, &shape, key.lod);
+    // Lazy materialization: when there's something to download, cover only
+    // the requesting chunk. The old behavior (cover all ~64 cache chunks
+    // inside the sub-chunk box) decoded once but wrote the full 16.7MB of
+    // children to disk per sub-chunk — for slab/slice browsing ~3/4 of
+    // that is depth the viewport never visits, and the write volume cycles
+    // the decoded cache. Siblings that ARE requested register on the same
+    // source (deduped) and share the decode via `LazySource`; siblings
+    // requested after the source entry is gone re-decode from the raw
+    // store without a network round trip.
+    //
+    // The all-absent case keeps full-box coverage: zero-filling the whole
+    // box costs no decode and saves ~63 future dispatches over empty
+    // space.
+    let covered = if sources.is_empty() {
+        super::ome_zarr::covered_cache_chunks([cz_lo, cy_lo, cx_lo], [cz_hi, cy_hi, cx_hi], &sub, &shape, key.lod)
+    } else {
+        vec![key]
+    };
 
     log::trace!(
         "[{}] v3 plan → {} download(s) over {} considered sub-chunk(s), covers {} cache chunk(s)",
@@ -161,6 +177,11 @@ pub(super) fn plan_v3_chunk(
             // Decode each present sub-chunk into a 256³ heap buffer keyed
             // by sub-chunk coordinate. Absent (Ok(None)) and skipped
             // sub-chunks stay out of the map → extract zero-fills.
+            //
+            // The decode is memoized on the shared `LazySource` payload:
+            // every cache chunk registered on the same sub-chunk source
+            // shares one decoded buffer, so a slab's worth of sibling
+            // extracts pays the ~400ms c3d decode exactly once.
             let mut decoded: HashMap<[usize; 3], Arc<Vec<u8>>> = HashMap::new();
             for (i, coord) in source_coords.iter().enumerate() {
                 let payload_opt: &Option<SourcePayload> = match &outcomes[i] {
@@ -168,16 +189,14 @@ pub(super) fn plan_v3_chunk(
                     Err(_) => unreachable!("error already short-circuited"),
                 };
                 let Some(payload) = payload_opt else { continue };
-                let decoded_bytes = if let Ok(mmap_arc) = payload.clone().downcast::<Mmap>() {
-                    vesuvius_c3d::with_decoder(|d| d.decode(&mmap_arc[..]))
-                        .map_err(|e| BackfillError::Permanent(format!("c3d decode at {:?}: {}", coord, e)))?
-                } else if let Ok(bytes_arc) = payload.clone().downcast::<Vec<u8>>() {
-                    vesuvius_c3d::with_decoder(|d| d.decode(&bytes_arc))
-                        .map_err(|e| BackfillError::Permanent(format!("c3d decode at {:?}: {}", coord, e)))?
-                } else {
-                    return Err(BackfillError::Permanent("source payload type".into()));
-                };
-                decoded.insert(*coord, Arc::new(decoded_bytes));
+                let lazy = payload
+                    .clone()
+                    .downcast::<LazySource>()
+                    .map_err(|_| BackfillError::Permanent("source payload type".into()))?;
+                let decoded_bytes = lazy
+                    .decoded_with(|bytes| vesuvius_c3d::with_decoder(|d| d.decode(bytes)).map_err(|e| e.to_string()))
+                    .map_err(|e| BackfillError::Permanent(format!("c3d decode at {:?}: {}", coord, e)))?;
+                decoded.insert(*coord, decoded_bytes);
             }
 
             Ok(super::ome_zarr::fill_covered_chunks(

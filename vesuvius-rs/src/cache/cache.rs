@@ -38,7 +38,8 @@
 //!     are already Done. Defensive against cooldown-retry races.
 
 use super::backfiller::{
-    BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, SourceOutcome, SourcePayload, SourceSpec,
+    BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, LazySource, SourceOutcome, SourcePayload,
+    SourceSpec,
 };
 use super::disk::{DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone};
@@ -1294,7 +1295,8 @@ impl Inner {
                         }));
                     }
                     log::trace!("[{}] raw-store hit (chunk {})", source_key, chunk_key);
-                    self.complete_source(source_key, Ok(Some(Arc::new(mmap) as SourcePayload)));
+                    let payload = Arc::new(LazySource::new(Arc::new(mmap))) as SourcePayload;
+                    self.complete_source(source_key, Ok(Some(payload)));
                     return RegisterResult::Queued;
                 }
 
@@ -1309,13 +1311,10 @@ impl Inner {
                     // re-downloading.
                     let outcome: SourceOutcome = match result {
                         Ok(Some(bytes)) => match inner.raw.put(&raw_key, &bytes) {
-                            Ok(mmap) => Ok(Some(Arc::new(mmap) as SourcePayload)),
+                            Ok(mmap) => Ok(Some(Arc::new(LazySource::new(Arc::new(mmap))) as SourcePayload)),
                             Err(e) => {
                                 log::warn!("[{}] spill failed ({}); falling back to in-memory", key_for_done, e);
-                                // Rare path: materialize as Vec<u8> so the
-                                // extract closures' downcast arms stay
-                                // unchanged.
-                                Ok(Some(Arc::new(bytes.to_vec()) as SourcePayload))
+                                Ok(Some(Arc::new(LazySource::new(Arc::new(bytes.to_vec()))) as SourcePayload))
                             }
                         },
                         Ok(None) => Ok(None),

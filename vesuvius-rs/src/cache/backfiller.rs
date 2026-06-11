@@ -47,6 +47,56 @@ pub type SourcePayload = Arc<dyn Any + Send + Sync>;
 ///   - `Err(e)`: transient/permanent failure — extract typically propagates.
 pub type SourceOutcome = Result<Option<SourcePayload>, BackfillError>;
 
+/// Payload wrapper for `SourceSpec::Download` sources: the raw downloaded
+/// bytes plus a once-per-source memo of their decoded form.
+///
+/// Every chunk registered on a source shares the same `Arc<LazySource>`
+/// (the cache's source map hands the identical payload to each consumer),
+/// so when 16 slab chunks extract from one 256³ c3d sub-chunk, the first
+/// extract pays the decode and the other 15 reuse the buffer. The memo's
+/// lifetime is the source entry's consumer window: when the last
+/// registered chunk releases the source, the decoded buffer drops with
+/// it. Later waves (raw-store hits) decode afresh — by design, this is a
+/// coalescing window, not a cache.
+pub struct LazySource {
+    /// The raw downloaded bytes: `Arc<Mmap>` (spilled/raw-store path) or
+    /// `Arc<Vec<u8>>` (write-failure fallback).
+    raw: SourcePayload,
+    decoded: std::sync::OnceLock<Result<Arc<Vec<u8>>, String>>,
+}
+
+impl LazySource {
+    pub fn new(raw: SourcePayload) -> Self {
+        Self {
+            raw,
+            decoded: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The raw downloaded bytes, regardless of backing storage. `None` if
+    /// the payload is neither an `Mmap` nor a `Vec<u8>` (a cache bug).
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(mmap) = self.raw.downcast_ref::<memmap::Mmap>() {
+            return Some(&mmap[..]);
+        }
+        self.raw.downcast_ref::<Vec<u8>>().map(|v| &v[..])
+    }
+
+    /// Decode-once: the first caller runs `decode` over the raw bytes,
+    /// concurrent and later callers (while this source entry is alive)
+    /// share the resulting buffer. Errors are memoized too — a failing
+    /// decode is deterministic, retrying it per consumer just burns CPU.
+    pub fn decoded_with(&self, decode: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>) -> Result<Arc<Vec<u8>>, String> {
+        self.decoded
+            .get_or_init(|| match self.raw_bytes() {
+                Some(bytes) => decode(bytes).map(Arc::new),
+                None => Err("unexpected source payload type".to_string()),
+            })
+            .clone()
+    }
+}
+
 /// One fetchable input artifact. Two specs with the same key are
 /// deduplicated by the cache: the first observer's fetch (or download)
 /// runs, later observers attach as waiters and share the outcome.
@@ -69,7 +119,7 @@ pub enum SourceSpec {
         key: String,
         /// HTTP URL. The cache submits this to its centralized downloader,
         /// which delivers the raw bytes as the source payload
-        /// (`Arc<Vec<u8>>`). No decode happens here — the backfiller's
+        /// (`Arc<LazySource>`). No decode happens here — the backfiller's
         /// `extract` closure receives the raw bytes and is responsible for
         /// any decompression.
         url: String,

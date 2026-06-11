@@ -10,8 +10,9 @@
 //! keeping it in extract means it runs on the cache worker pool (CPU-sized)
 //! rather than the download pool (I/O-sized).
 //!
-//! Source payload type: `Arc<Vec<u8>>` — the raw HTTP body. Sibling cache
-//! chunks that consume the same source share one allocation via the `Arc`.
+//! Source payload type: `Arc<LazySource>` over the raw HTTP body (mmap-
+//! backed via the raw store). Sibling cache chunks that consume the same
+//! source share one allocation via the `Arc`.
 //!
 //! Arrays without a chunk URL (e.g. local-disk zarrs) fall back to the
 //! `Compute` source variant: the fetch closure runs synchronously on a
@@ -19,11 +20,11 @@
 //! is fast enough that an async path here would be needless complexity.
 
 use crate::cache::backfiller::{
-    BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, SourceOutcome, SourcePayload, SourceSpec,
+    BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, LazySource, SourceOutcome, SourcePayload,
+    SourceSpec,
 };
 use crate::cache::state::ChunkKey;
 use crate::cache::{CHUNK_SIDE, CHUNK_VOXELS};
-use memmap::Mmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use vesuvius_zarr::{ChunkContext, OmeZarrContext, ZarrArray};
@@ -190,16 +191,16 @@ impl ChunkBackfiller for OmeZarrBackfiller {
                     let ctx = if let Ok(ctx_arc) = payload.clone().downcast::<ChunkContext>() {
                         // Local-fallback Compute payload, already decoded.
                         ctx_arc
-                    } else if let Ok(mmap_arc) = payload.clone().downcast::<Mmap>() {
-                        // Download payload — bytes were spilled to disk by
-                        // the cache's on_done handler. Decode from the mmap
-                        // so we don't materialize the compressed payload
-                        // back into the heap.
-                        Arc::new(array_for_decode.decode_chunk_bytes(&mmap_arc[..]))
-                    } else if let Ok(bytes_arc) = payload.clone().downcast::<Vec<u8>>() {
-                        // Fallback when spill write failed: bytes still in
-                        // memory.
-                        Arc::new(array_for_decode.decode_chunk_bytes(&bytes_arc))
+                    } else if let Ok(lazy) = payload.clone().downcast::<LazySource>() {
+                        // Download payload — raw bytes are mmap-backed by
+                        // the cache's raw store (or heap on spill failure).
+                        // v2 decodes into a ChunkContext rather than a flat
+                        // buffer, so the LazySource decode memo isn't used
+                        // here — just the raw bytes.
+                        let bytes = lazy
+                            .raw_bytes()
+                            .ok_or_else(|| BackfillError::Permanent("source payload type".into()))?;
+                        Arc::new(array_for_decode.decode_chunk_bytes(bytes))
                     } else {
                         return Err(BackfillError::Permanent("source payload type".into()));
                     };
