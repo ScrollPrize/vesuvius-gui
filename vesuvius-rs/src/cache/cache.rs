@@ -40,7 +40,7 @@
 use super::backfiller::{
     BackfillError, BackfillPlan, ChunkBackfiller, ExtractedChunk, SourceOutcome, SourcePayload, SourceSpec,
 };
-use super::disk::{ChunkBitState, DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
+use super::disk::{DiskStore, LoadOutcome, ShardCoord, ShardSnapshot};
 use super::downloader::{DownloadError, DownloadResult, Downloader, OnDone};
 use super::epoch::{self, EpochState};
 use super::lifo::{LifoQueue, QueueEntry};
@@ -469,18 +469,22 @@ impl ChunkCache {
     /// of chunks actually evicted.
     ///
     /// Eviction order per victim, to keep readers safe:
-    ///   1. Remove the in-memory `ChunkState::Resident` entry from the
+    ///   1. CAS the sidecar slot RESIDENT → LOCKED, claiming it. Readers
+    ///      treat LOCKED as not-readable, so no new reader binds the
+    ///      bytes while we work.
+    ///   2. Remove the in-memory `ChunkState::Resident` entry from the
     ///      DashMap, so any future lookup re-takes the slow path.
-    ///   2. Demote the per-shard `ChunkStateBits` to Unknown (Release).
-    ///   3. Demote the sidecar's persistent state byte to Missing
-    ///      (Release; bumps the pending counter so the sync thread
-    ///      eventually durably records the eviction).
+    ///   3. Clear the shard's dispatched bit so the next reader of the
+    ///      slot re-dispatches (and re-synthesizes its upscale preview).
     ///   4. Punch the chunk's slot in the shard file
     ///      (`fallocate(FALLOC_FL_PUNCH_HOLE)`), freeing physical
     ///      blocks.
-    ///   5. Update the global `EpochState` histogram and total_chunks.
+    ///   5. Release the slot to MISSING (Release; bumps the pending
+    ///      counter so the sync thread eventually durably records the
+    ///      eviction).
+    ///   6. Update the global `EpochState` histogram and total_chunks.
     ///
-    /// Readers that already passed the bitmap check before step 2 may
+    /// Readers that already passed the sidecar check before step 1 may
     /// transiently see zeros from the punched mmap; the async pipeline
     /// tolerates that, and the next paint loop re-dispatches.
     pub fn purge_to_target(&self, target_chunks: u64) -> u64 {
@@ -528,18 +532,27 @@ impl ChunkCache {
         self.inner.disk.shard_chunks_per_axis()
     }
 
-    /// Test support: non-creating peek for a shard's mmap + per-chunk
-    /// bitmap. Returns `Some` once the shard has been opened, `None`
+    /// Test support: non-creating peek for a shard's mmap + dispatched
+    /// bits. Returns `Some` once the shard has been opened, `None`
     /// otherwise. The volume reader uses `ensure_shard_open` instead.
     #[cfg(test)]
     pub fn peek_shard(&self, lod: u8, shard: ShardCoord) -> Option<ShardSnapshot> {
         self.inner.disk.peek_shard(lod, shard)
     }
 
-    /// Open (sparse-mmap + seed bitmap) the shard at `(lod, shard)` if it
-    /// isn't already, returning its snapshot. The volume's shard-based slow
+    /// Shared handle to this volume's sidecar — the durable per-chunk
+    /// state map (Missing / Resident / Empty / Locked, one atomic byte
+    /// per chunk per LOD). The volume reader probes it directly on the
+    /// per-voxel fast path.
+    pub(super) fn sidecar(&self) -> Arc<super::sidecar::Sidecar> {
+        self.inner.disk.sidecar()
+    }
+
+    /// Open (sparse-mmap) the shard at `(lod, shard)` if it isn't
+    /// already, returning its snapshot. The volume's shard-based slow
     /// path calls this on its first miss for a shard so all subsequent
-    /// per-voxel lookups in that shard are bitmap-only.
+    /// per-voxel lookups in that shard run off the cached mmap base +
+    /// direct sidecar probes.
     pub fn ensure_shard_open(&self, lod: u8, shard: ShardCoord) -> Option<ShardSnapshot> {
         match self.inner.disk.ensure_shard_open(lod, shard) {
             Ok(snap) => snap,
@@ -821,7 +834,7 @@ impl Inner {
     }
 
     /// Steps (3)–(6) of `run_purge` for a batch of victims already
-    /// claimed LOCKED: demote the per-shard bitmaps, punch holes
+    /// claimed LOCKED: clear the per-shard dispatched bits, punch holes
     /// coalesced per contiguous in-shard run, release every slot to
     /// MISSING, and record the evictions. Drains `batch` and returns
     /// its size.
@@ -834,7 +847,7 @@ impl Inner {
         if batch.is_empty() {
             return 0;
         }
-        // (3) Group per shard so the bitmap demote amortizes the
+        // (3) Group per shard so the dispatched-bit clears amortize the
         // `opened`-map lock and the punches can coalesce.
         let mut by_shard: HashMap<ShardCoord, Vec<u64>> = HashMap::new();
         for (_, _, key) in batch.iter() {
@@ -845,7 +858,7 @@ impl Inner {
         for (shard, mut idxs) in by_shard {
             if let Some(snap) = self.disk.peek_shard(lod, shard) {
                 for &i in &idxs {
-                    snap.state_bits.store(i, ChunkBitState::Unknown);
+                    snap.dispatched.clear(i);
                 }
             }
             // (4) Physical reclaim while every victim is LOCKED — no
@@ -1000,20 +1013,19 @@ impl Inner {
             log::trace!("[{}] out of bounds", key);
             return long_cooldown();
         }
-        // Claim the chunk's shard bitmap cell as `Dispatched`. This is what
-        // lets the volume's per-voxel slow path tell "fetch in flight" from
-        // "never tried" without ever consulting the DashMap once we've
-        // primed it here — the bitmap is the single source of truth for
-        // per-chunk presence going forward.
-        // `mark_dispatched` flips the bitmap cell `Unknown→Dispatched` and
-        // returns `true` only on that first transition. The in-memory shard
-        // bitmap outlives this chunk's DashMap entry: purge demotes a
-        // *Resident* cell back to `Unknown` when it reclaims the bytes, but a
-        // preview-only cell (sidecar still MISSING, never Resident) keeps its
-        // `Dispatched` bit. So `first_dispatch` means precisely "no preview
-        // has been synthesized for this slot yet this session (or the real
-        // data it held was purged)" — which is exactly when we want to fill
-        // the preview.
+        // Claim the chunk's per-shard dispatched bit. This is what lets
+        // the volume's per-voxel slow path tell "fetch in flight" from
+        // "never tried" without re-entering the DashMap: a MISSING
+        // sidecar byte with the dispatched bit set means a fetch is
+        // already on its way.
+        // `mark_dispatched` returns `true` only on the first 0→1
+        // transition. The bit outlives this chunk's DashMap entry: purge
+        // clears it when it reclaims the bytes, but a preview-only slot
+        // (sidecar still MISSING, never Resident) keeps its bit. So
+        // `first_dispatch` means precisely "no preview has been
+        // synthesized for this slot yet this session (or the real data it
+        // held was purged)" — which is exactly when we want to fill the
+        // preview.
         let first_dispatch = match self.disk.mark_dispatched(key) {
             Ok(transitioned) => transitioned,
             Err(e) => {

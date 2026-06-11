@@ -62,25 +62,26 @@ pub enum WriteOutcome {
     AlreadyEmpty,
 }
 
-/// Read-only view returned by `DiskStore::peek_shard`. Bundles the shard's
-/// mmap (for sparse-hole-aware voxel reads) with its per-chunk state
-/// bitmap (so the reader can distinguish "resident" from "sparse hole").
+/// Read-only view returned by `DiskStore::peek_shard` /
+/// `ensure_shard_open`. Bundles the shard's mmap (for sparse-hole-aware
+/// voxel reads) with its per-chunk dispatched bits (so the volume reader
+/// can tell "fetch in flight" from "never tried" without re-entering the
+/// cache's DashMap per voxel). Durable chunk state (Missing / Resident /
+/// Empty / Locked) is probed straight off the sidecar.
 pub struct ShardSnapshot {
     pub mmap: Arc<Mmap>,
-    pub state_bits: Arc<ChunkStateBits>,
+    pub dispatched: Arc<DispatchedBits>,
 }
 
 #[derive(Clone)]
 struct LodFile {
     file: Arc<File>,
     mmap: Arc<Mmap>,
-    /// Per-chunk-in-shard 2-bit state map. Mirrors the sidecar's per-chunk
-    /// state, but indexed by `in_shard_chunk_idx` (so volume readers can
-    /// probe it from a cached shard base without consulting the global
-    /// sidecar bitmap or the cache's DashMap). Populated when the shard is
-    /// first opened (`ensure_open`) and updated on every `write_atomic` /
-    /// `mark_empty` transition.
-    state_bits: Arc<ChunkStateBits>,
+    /// Per-chunk-in-shard "dispatch attempted this session" bits. See
+    /// `DispatchedBits`. Durable state lives in the sidecar, which readers
+    /// probe directly; this map only exists because Dispatched is
+    /// in-memory-only state with no sidecar byte.
+    dispatched: Arc<DispatchedBits>,
     /// Set by `write_atomic` when chunk bytes land in this shard; consumed
     /// by `do_sync`, which fsyncs only dirty shards. Without it, any
     /// sidecar transition (including pure-read access-epoch bumps) forced
@@ -90,38 +91,23 @@ struct LodFile {
 
 pub type ShardCoord = (u32, u32, u32);
 
-/// Per-shard chunk-state bitmap. Two bits per chunk, raster order matching
-/// `in_shard_chunk_idx`. Production size: 128³ × 2 bits = 524 288 bytes
-/// (512 KiB) per (lod, shard).
+/// Per-shard "fetch dispatched" bit set. One bit per chunk, raster order
+/// matching `in_shard_chunk_idx`. Production size: 128³ bits = 256 KiB per
+/// (lod, shard).
 ///
-/// Encoding:
-/// - `00` Unknown    — never observed; reader takes the slow path (LOD climb).
-/// - `01` Dispatched — fetch in flight; reader still climbs, but bulk
-///   dispatchers can read this to skip re-issuing the same fetch.
-/// - `10` Resident   — chunk bytes are present in the mmap at the matching
-///   offset; reader observing this with `Acquire` is guaranteed to see the
-///   full 256 KiB (paired with the `Release` store in `write_atomic`).
-/// - `11` Empty      — chunk is definitively absent; reader returns 0 and
-///   does *not* climb (Empty at a fine LOD overrides coarser data).
-pub struct ChunkStateBits {
+/// This is the only per-chunk state NOT held in the sidecar: a per-process
+/// "fetch in flight (or already attempted) this session" claim, never
+/// persisted. Zero-initialized means "nothing dispatched", so a freshly
+/// opened shard needs no seeding pass — unlike durable state, which the
+/// sidecar carries across sessions and exposes to readers as one atomic
+/// byte per chunk.
+pub struct DispatchedBits {
     words: Box<[AtomicU64]>,
 }
 
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ChunkBitState {
-    Unknown = 0b00,
-    Dispatched = 0b01,
-    Resident = 0b10,
-    Empty = 0b11,
-}
-
-const BITS_PER_CHUNK: u32 = 2;
-
-impl ChunkStateBits {
+impl DispatchedBits {
     fn new(num_chunks: u64) -> Self {
-        let total_bits = num_chunks * BITS_PER_CHUNK as u64;
-        let num_words = ((total_bits + 63) / 64) as usize;
+        let num_words = num_chunks.div_ceil(64) as usize;
         let mut words = Vec::with_capacity(num_words);
         for _ in 0..num_words {
             words.push(AtomicU64::new(0));
@@ -129,70 +115,29 @@ impl ChunkStateBits {
         Self { words: words.into_boxed_slice() }
     }
 
+    /// True if the chunk's dispatch bit is set. Relaxed: the bit is a
+    /// dispatch-dedup hint, no data visibility piggybacks on it (mmap
+    /// visibility is ordered by the sidecar's Acquire/Release pair).
     #[inline]
-    pub fn load(&self, in_shard_idx: u64) -> ChunkBitState {
-        let bit_pos = in_shard_idx * BITS_PER_CHUNK as u64;
-        let word_idx = (bit_pos / 64) as usize;
-        let shift = (bit_pos % 64) as u32;
-        // SAFETY: word_idx is checked via the `Box<[AtomicU64]>` indexing.
-        // Acquire pairs with the Release store in `store(Resident)` to
-        // guarantee the mmap bytes are visible.
-        let bits = (self.words[word_idx].load(Ordering::Acquire) >> shift) & 0b11;
-        match bits {
-            0b00 => ChunkBitState::Unknown,
-            0b01 => ChunkBitState::Dispatched,
-            0b10 => ChunkBitState::Resident,
-            _ => ChunkBitState::Empty,
-        }
+    pub fn get(&self, in_shard_idx: u64) -> bool {
+        let word = &self.words[(in_shard_idx / 64) as usize];
+        (word.load(Ordering::Relaxed) >> (in_shard_idx % 64)) & 1 != 0
     }
 
-    /// CAS-loop store of a 2-bit field. Concurrent stores to *different*
-    /// chunks within the same word race on the CAS but each will succeed
-    /// within a few attempts; same-chunk concurrent writes are guarded by
-    /// the cache's per-chunk dispatch claim, so the only contention here is
-    /// across neighboring chunks of the same shard.
-    pub fn store(&self, in_shard_idx: u64, state: ChunkBitState) {
-        let bit_pos = in_shard_idx * BITS_PER_CHUNK as u64;
-        let word_idx = (bit_pos / 64) as usize;
-        let shift = (bit_pos % 64) as u32;
-        let new_bits = (state as u64) << shift;
-        let mask = 0b11u64 << shift;
-        let word = &self.words[word_idx];
-        let mut cur = word.load(Ordering::Relaxed);
-        loop {
-            let next = (cur & !mask) | new_bits;
-            if next == cur {
-                return;
-            }
-            match word.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => return,
-                Err(actual) => cur = actual,
-            }
-        }
+    /// Set the bit if it is clear. Returns true iff this call transitioned
+    /// it 0→1 — the winner performs the once-per-slot dispatch work
+    /// (upscale-preview synthesis).
+    pub fn set_if_clear(&self, in_shard_idx: u64) -> bool {
+        let mask = 1u64 << (in_shard_idx % 64);
+        let prev = self.words[(in_shard_idx / 64) as usize].fetch_or(mask, Ordering::Relaxed);
+        prev & mask == 0
     }
 
-    /// Conditional store: write `state` only if the current 2-bit field is
-    /// `Unknown`. Returns true if we transitioned, false otherwise. Used to
-    /// claim "needs dispatch" without ever clobbering a Resident/Empty/
-    /// Dispatched cell.
-    pub fn store_if_unknown(&self, in_shard_idx: u64, state: ChunkBitState) -> bool {
-        let bit_pos = in_shard_idx * BITS_PER_CHUNK as u64;
-        let word_idx = (bit_pos / 64) as usize;
-        let shift = (bit_pos % 64) as u32;
-        let new_bits = (state as u64) << shift;
-        let mask = 0b11u64 << shift;
-        let word = &self.words[word_idx];
-        let mut cur = word.load(Ordering::Relaxed);
-        loop {
-            if (cur >> shift) & 0b11 != 0 {
-                return false;
-            }
-            let next = (cur & !mask) | new_bits;
-            match word.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => return true,
-                Err(actual) => cur = actual,
-            }
-        }
+    /// Clear the bit. Purge calls this when it reclaims a chunk's bytes so
+    /// the next reader re-dispatches (and re-synthesizes its preview).
+    pub fn clear(&self, in_shard_idx: u64) {
+        let mask = 1u64 << (in_shard_idx % 64);
+        self.words[(in_shard_idx / 64) as usize].fetch_and(!mask, Ordering::Relaxed);
     }
 }
 
@@ -413,9 +358,9 @@ impl DiskStore {
     /// Protocol:
     ///   1. CAS sidecar `MISSING → LOCKED` to claim exclusive access.
     ///   2. pwrite the bytes into the shard.
-    ///   3. Store `RESIDENT` (releases the lock, publishes visibility).
-    ///   4. Store `Resident` into the per-shard bitmap with `Release`,
-    ///      pairing with the reader fast path's `Acquire`.
+    ///   3. Store `RESIDENT` (releases the lock; the Release swap pairs
+    ///      with the reader fast path's `Acquire` load to publish the
+    ///      mmap bytes).
     ///
     /// Concurrency outcomes (see `WriteOutcome` for the return type):
     ///   - CAS sees `RESIDENT` → another writer already filled the slot.
@@ -476,7 +421,6 @@ impl DiskStore {
         // either fsyncs the bytes or hasn't seen the RESIDENT bit yet.
         lf.dirty.store(true, Ordering::Release);
         sidecar.set_state(key.lod, r.sidecar_idx, STATE_RESIDENT);
-        lf.state_bits.store(r.in_shard_idx, ChunkBitState::Resident);
         self.inner.maybe_wake_sync();
         Ok(WriteOutcome::Wrote)
     }
@@ -498,7 +442,7 @@ impl DiskStore {
         self.inner.shard_chunks_per_axis
     }
 
-    /// Return the shard's mmap + per-chunk state bitmap if the shard is
+    /// Return the shard's mmap + dispatched bits if the shard is
     /// currently open, without creating or mapping it. Used by the volume's
     /// per-render hot slot to fast-path reads once any chunk in the shard
     /// has been materialized.
@@ -506,23 +450,23 @@ impl DiskStore {
         let slot = self.inner.lods.get(lod as usize)?;
         slot.opened.lock().unwrap().get(&shard).map(|lf| ShardSnapshot {
             mmap: lf.mmap.clone(),
-            state_bits: lf.state_bits.clone(),
+            dispatched: lf.dispatched.clone(),
         })
     }
 
-    /// Ensure the shard at `(lod, shard)` is open (sparse mmap + seeded
-    /// bitmap), then return its snapshot. The shard-based volume slow path
-    /// calls this on its first miss for a shard so subsequent per-voxel
-    /// lookups can drive entirely off the bitmap without re-entering the
-    /// DashMap. Returns `Ok(None)` when the LOD index is out of range.
+    /// Ensure the shard at `(lod, shard)` is open (sparse mmap), then
+    /// return its snapshot. The shard-based volume slow path calls this on
+    /// its first miss for a shard so subsequent per-voxel lookups can run
+    /// off the cached mmap base + direct sidecar probes without
+    /// re-entering the DashMap. Returns `Ok(None)` when the LOD index is
+    /// out of range.
     pub fn ensure_shard_open(&self, lod: u8, shard: ShardCoord) -> std::io::Result<Option<ShardSnapshot>> {
         let Some(slot) = self.inner.lods.get(lod as usize) else {
             return Ok(None);
         };
         // Refuse shards wholly outside the LOD's chunk grid — a stray
         // probe past the volume extent would otherwise create a phantom
-        // sparse shard file and pay the bitmap-seed walk for slots that
-        // can never hold data.
+        // sparse shard file for slots that can never hold data.
         let sca = self.inner.shard_chunks_per_axis as u64;
         let dims = &slot.dims;
         if (shard.0 as u64) * sca >= dims.nx as u64
@@ -534,15 +478,15 @@ impl DiskStore {
         let lf = self.inner.ensure_open(lod, shard)?;
         Ok(Some(ShardSnapshot {
             mmap: lf.mmap.clone(),
-            state_bits: lf.state_bits.clone(),
+            dispatched: lf.dispatched.clone(),
         }))
     }
 
-    /// Mark `key` as `Dispatched` on its shard bitmap if the cell is still
-    /// `Unknown`. No sidecar write — Dispatched is in-memory only (it's a
-    /// per-process "fetch in flight" claim, not durable state). Returns
-    /// `Ok(false)` when the bit was already non-Unknown (Resident / Empty /
-    /// Dispatched), so callers can skip redundant dispatch work.
+    /// Set `key`'s dispatched bit on its shard if it wasn't already set.
+    /// No sidecar write — Dispatched is in-memory only (a per-process
+    /// "fetch in flight" claim, not durable state). Returns `Ok(false)`
+    /// when the bit was already set, so callers can skip redundant
+    /// dispatch work.
     pub fn mark_dispatched(&self, key: ChunkKey) -> std::io::Result<bool> {
         let r = self.inner.resolve(key).ok_or_else(|| {
             std::io::Error::new(
@@ -551,7 +495,7 @@ impl DiskStore {
             )
         })?;
         let lf = self.inner.ensure_open(key.lod, r.shard)?;
-        Ok(lf.state_bits.store_if_unknown(r.in_shard_idx, ChunkBitState::Dispatched))
+        Ok(lf.dispatched.set_if_clear(r.in_shard_idx))
     }
 
     /// Write `bytes` into the slot for `key` as a best-effort preview.
@@ -603,8 +547,9 @@ impl DiskStore {
         result.map(|_| true)
     }
 
-    /// Mark `key` as definitively absent in the sidecar. No bytes are written
-    /// to a data file.
+    /// Mark `key` as definitively absent in the sidecar. No bytes are
+    /// written and no shard file is created — readers see the EMPTY byte
+    /// straight off the sidecar.
     pub fn mark_empty(&self, key: ChunkKey) -> std::io::Result<()> {
         let r = self.inner.resolve(key).ok_or_else(|| {
             std::io::Error::new(
@@ -612,12 +557,7 @@ impl DiskStore {
                 format!("chunk {} out of bounds for this LOD", key),
             )
         })?;
-        // Open the shard so subsequent reads can see the Empty bit through
-        // the per-shard bitmap fast path. The shard file is created (sparse)
-        // by `ensure_open`; no bytes are written.
-        let lf = self.inner.ensure_open(key.lod, r.shard)?;
         self.inner.sidecar.set_state(key.lod, r.sidecar_idx, STATE_EMPTY);
-        lf.state_bits.store(r.in_shard_idx, ChunkBitState::Empty);
         self.inner.maybe_wake_sync();
         Ok(())
     }
@@ -677,11 +617,11 @@ impl DiskStore {
     /// open (nothing to punch — the slot was never written), `Ok(true)`
     /// if a hole was successfully punched.
     ///
-    /// IMPORTANT ordering: callers must demote the chunk's state to
-    /// MISSING (sidecar + per-shard ChunkStateBits, with Release) BEFORE
+    /// IMPORTANT ordering: callers must hold the per-slot LOCKED claim
+    /// (or have demoted the slot to MISSING) in the sidecar BEFORE
     /// calling this. Otherwise a concurrent reader observing Resident
     /// may pass through and read zeros from a chunk it believes is
-    /// valid. Readers that already passed the bitmap check before our
+    /// valid. Readers that already passed the sidecar check before our
     /// demote may transiently see zeros — the async pipeline tolerates
     /// that (next frame re-reads from the now-Missing slot).
     /// Test-only single-chunk wrapper; production eviction goes through
@@ -821,12 +761,10 @@ impl DiskStoreInner {
         if let Some(lf) = slot.opened.lock().unwrap().get(&shard) {
             return Ok(lf.clone());
         }
-        // Cold path: build the file + mmap + seeded bitmap *outside* the
-        // per-LOD `opened` mutex. Seeding walks 128³ sidecar entries per
-        // shard — holding the lock through that serializes every worker
-        // and per-voxel `peek_shard` against the cold opener. Two threads
-        // can race here; the cheaper-loser handles it with the
-        // double-checked insert below.
+        // Cold path: build the file + mmap *outside* the per-LOD `opened`
+        // mutex so concurrent first-opens of other shards never serialize
+        // on the file I/O. Two threads can race here; the cheaper-loser
+        // handles it with the double-checked insert below.
         let total = self.shard_bytes();
         let path = self.root.join(shard_filename(lod, shard));
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
@@ -848,63 +786,21 @@ impl DiskStoreInner {
         }
         let mmap = unsafe { MmapOptions::new().len(total as usize).map(&file)? };
         let sca = self.shard_chunks_per_axis as u64;
-        let state_bits = Arc::new(ChunkStateBits::new(sca * sca * sca));
-        self.seed_shard_state_bits(lod, shard, &slot.dims, &state_bits);
         let lf = LodFile {
             file: Arc::new(file),
             mmap: Arc::new(mmap),
-            state_bits,
+            dispatched: Arc::new(DispatchedBits::new(sca * sca * sca)),
             dirty: Arc::new(AtomicBool::new(false)),
         };
         // Re-check under the lock: if another thread opened the same shard
-        // concurrently, drop our work and use theirs to keep the
-        // mmap/bitmap unique per shard.
+        // concurrently, drop our work and use theirs to keep the mmap and
+        // dispatched bits unique per shard.
         let mut guard = slot.opened.lock().unwrap();
         if let Some(existing) = guard.get(&shard) {
             return Ok(existing.clone());
         }
         guard.insert(shard, lf.clone());
         Ok(lf)
-    }
-
-    /// Populate `bits` for the chunks owned by `(lod, shard)` from the
-    /// sidecar's persisted state. Skips chunks outside the LOD extent
-    /// (`linear_index` returns `None`) — they stay as Unknown.
-    fn seed_shard_state_bits(&self, lod: u8, shard: ShardCoord, dims: &LodDims, bits: &ChunkStateBits) {
-        let sca = self.shard_chunks_per_axis;
-        let s = sca as u64;
-        let base_cx = shard.0 * sca;
-        let base_cy = shard.1 * sca;
-        let base_cz = shard.2 * sca;
-        // Clamp the iteration to the LOD's chunk extent so we don't touch
-        // sidecar slots that don't exist for this LOD.
-        let hi_cx = (base_cx + sca).min(dims.nx);
-        let hi_cy = (base_cy + sca).min(dims.ny);
-        let hi_cz = (base_cz + sca).min(dims.nz);
-        if base_cx >= dims.nx || base_cy >= dims.ny || base_cz >= dims.nz {
-            return;
-        }
-        for cz in base_cz..hi_cz {
-            for cy in base_cy..hi_cy {
-                for cx in base_cx..hi_cx {
-                    let sidecar_idx = match dims.linear_index(cx, cy, cz) {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    let raw = self.sidecar.get_state(lod, sidecar_idx);
-                    let s_bit = match raw {
-                        STATE_RESIDENT => ChunkBitState::Resident,
-                        STATE_EMPTY => ChunkBitState::Empty,
-                        _ => continue,
-                    };
-                    let wx = (cx - base_cx) as u64;
-                    let wy = (cy - base_cy) as u64;
-                    let wz = (cz - base_cz) as u64;
-                    let in_shard_idx = (wz * s + wy) * s + wx;
-                    bits.store(in_shard_idx, s_bit);
-                }
-            }
-        }
     }
 
     fn shard_bytes(&self) -> u64 {

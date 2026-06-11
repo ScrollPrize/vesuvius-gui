@@ -1095,10 +1095,8 @@ fn second_open_picks_up_disk_cache() {
 
 #[test]
 fn purge_evicts_oldest_and_preserves_survivors() {
-    use super::disk::ChunkBitState;
-
     // Four chunks along the X axis at LOD 0; same shard so we exercise
-    // the per-shard bitmap demote alongside the sidecar transition.
+    // the per-shard dispatched-bit clear alongside the sidecar transition.
     let root = tmp_root("purge-basic");
     let backfiller = Arc::new(SyntheticBackfiller::new(
         "purge-vol",
@@ -1143,16 +1141,24 @@ fn purge_evicts_oldest_and_preserves_survivors() {
     assert_eq!(hist[initial_epoch as usize], 0);
     assert_eq!(hist[new_epoch as usize], 2);
 
-    // Victims (first two): no longer in the in-memory map, per-shard
-    // bitmap demoted to Unknown.
+    // Victims (first two): no longer in the in-memory map, sidecar slot
+    // demoted to MISSING, dispatched bit cleared for re-dispatch.
+    let sidecar = cache.sidecar();
+    let lod0_dims = sidecar.header.lods[0];
     for k in &keys[..2] {
         assert!(cache.peek(*k).is_none(), "victim {} should be removed from map", k);
+        let idx = lod0_dims.linear_index(k.x, k.y, k.z).unwrap();
+        assert_eq!(
+            sidecar.get_state(0, idx),
+            super::sidecar::STATE_MISSING,
+            "victim {} should be MISSING in the sidecar",
+            k
+        );
         let (shard, in_shard_idx) = cache.locate(*k).unwrap();
         let snap = cache.peek_shard(0, shard).unwrap();
-        assert_eq!(
-            snap.state_bits.load(in_shard_idx),
-            ChunkBitState::Unknown,
-            "victim {}'s shard bit should be Unknown",
+        assert!(
+            !snap.dispatched.get(in_shard_idx),
+            "victim {}'s dispatched bit should be cleared",
             k
         );
     }

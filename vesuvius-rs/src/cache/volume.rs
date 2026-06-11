@@ -15,9 +15,9 @@
 //! `get()` is the per-voxel sampler used by surface (ObjVolume) and PPM
 //! renderers that don't go through `UnifiedVolume::paint`. It climbs the
 //! pyramid through the per-LOD shard hot slots (`resolve_chunk`): each
-//! level is one atomic bitmap probe, a chunk found `Unknown` gets its
-//! dispatch kicked off exactly once, and the first `Resident` level wins
-//! (`Empty` stops the climb — fine-grained absence overrides coarser
+//! level is one atomic sidecar-byte probe, a never-dispatched chunk gets
+//! its dispatch kicked off exactly once, and the first `Resident` level
+//! wins (`Empty` stops the climb — fine-grained absence overrides coarser
 //! data). `interpolate_u8` additionally keeps a chunk-grain slot caching
 //! its resolved `(lod, chunk_state)` binding for repeat samples in the
 //! same target chunk.
@@ -35,10 +35,13 @@
 //!   so do NOT redivide here.
 
 use super::cache::ChunkCache;
-use super::disk::{ChunkBitState, ChunkStateBits, ShardCoord};
+use super::disk::{DispatchedBits, ShardCoord};
+use super::sidecar::{Sidecar, STATE_EMPTY, STATE_LOCKED, STATE_RESIDENT};
 use super::state::{ChunkKey, ChunkState};
 use super::CHUNK_VOXELS;
-use crate::volume::composition::{CompositionState, CompositorRef, MaxCompositionState};
+#[cfg(test)]
+use crate::volume::composition::MaxCompositionState;
+use crate::volume::composition::{CompositionState, CompositorRef};
 use crate::volume::{DrawingConfig, Image, PaintVolume, VolumeCons, VoxelPaintVolume, VoxelVolume};
 use ecolor::Color32;
 use memmap::Mmap;
@@ -57,6 +60,12 @@ const SHARD_SLOTS_PER_LOD: usize = 16;
 
 pub struct UnifiedVolume {
     cache: ChunkCache,
+    /// Durable per-chunk state map, shared with the cache's DiskStore.
+    /// The per-voxel fast path probes one atomic byte here per LOD-climb
+    /// level: Resident / Empty / Locked come straight from this map; only
+    /// the in-memory "dispatched" claim lives elsewhere (per-shard bits
+    /// on the `ShardSlot`).
+    sidecar: Arc<Sidecar>,
     /// Shard side (in chunks) as log2 + mask — cached from
     /// `ChunkCache::shard_chunks_per_axis` at construction (production
     /// value 128 → shift 7). Stored pre-decomposed so the per-voxel
@@ -66,10 +75,10 @@ pub struct UnifiedVolume {
     shard_mask: u32,
     /// World-voxel (LOD 0) extent of the volume, cached from the
     /// backfiller. Samples at or beyond the extent return 0 up front —
-    /// without this, out-of-bounds chunks (whose bitmap cells stay
-    /// `Unknown` forever because dispatch bails before marking them)
-    /// would send every OOB voxel down the DashMap + clock-read slow
-    /// path at every LOD climb level.
+    /// without this, out-of-bounds chunks (whose dispatched bits stay
+    /// clear forever because dispatch bails before marking them) would
+    /// send every OOB voxel down the DashMap + clock-read slow path at
+    /// every LOD climb level.
     extent: [u32; 3],
     // Per-volume hot slot for the last target chunk touched by `get`. The
     // cached `chosen` may be a coarser-LOD parent when the target chunk
@@ -87,9 +96,9 @@ struct LocalSlot {
     /// target LOD), so a single shared slot would thrash between e.g.
     /// LOD 0 and a coarser-parent LOD as the +1 corner crosses a chunk
     /// boundary. Per-LOD slots keep both alive simultaneously without
-    /// cross-eviction. The bitmap on `ShardSlot` gates reads so unwritten
-    /// chunks fall back to the slow path instead of returning the kernel's
-    /// zero page as if it were data.
+    /// cross-eviction. The sidecar probe gates reads so unwritten chunks
+    /// fall back to the slow path instead of returning the kernel's zero
+    /// page as if it were data.
     shards: [Option<ShardSlot>; SHARD_SLOTS_PER_LOD],
     /// Chunk-grain slot for the slow path's LOD-fallback result. Lets
     /// repeat samples in the same target chunk skip the pyramid walk
@@ -112,11 +121,10 @@ struct ShardSlot {
     shard: ShardCoord,
     base: *const u8,
     _mmap: Arc<Mmap>,
-    /// Per-chunk 2-bit state map for this shard. Probed before every
-    /// shard-slot read so we can distinguish Resident (fast mmap deref)
-    /// from Unknown / Dispatched (fall back to LOD climb) and Empty
-    /// (return 0 without climbing).
-    state_bits: Arc<ChunkStateBits>,
+    /// Per-chunk "dispatch attempted" bits for this shard. Consulted only
+    /// when the sidecar says MISSING, so the slow path kicks each chunk's
+    /// dispatch exactly once instead of re-entering the DashMap per voxel.
+    dispatched: Arc<DispatchedBits>,
 }
 
 impl UnifiedVolume {
@@ -124,8 +132,10 @@ impl UnifiedVolume {
         let sca = cache.shard_chunks_per_axis();
         assert!(sca.is_power_of_two(), "shard side must be a power of two, got {}", sca);
         let extent = cache.voxel_extent();
+        let sidecar = cache.sidecar();
         Self {
             cache,
+            sidecar,
             shard_shift: sca.trailing_zeros(),
             shard_mask: sca - 1,
             extent,
@@ -169,12 +179,51 @@ impl UnifiedVolume {
         (shard, in_shard_idx)
     }
 
+    /// Probe the sidecar's state byte for the chunk at `(lod, cx, cy, cz)`.
+    /// One atomic Acquire load — pairs with `write_atomic`'s Release store
+    /// so an observed `STATE_RESIDENT` guarantees the mmap bytes are
+    /// visible. `None` when the chunk is outside the LOD's grid.
+    #[inline]
+    fn sidecar_state(&self, lod: u8, cx: u32, cy: u32, cz: u32) -> Option<u8> {
+        let dims = self.sidecar.header.lods.get(lod as usize)?;
+        let idx = dims.linear_index(cx, cy, cz)?;
+        Some(self.sidecar.get_state(lod, idx))
+    }
+
+    /// Run `f` against the hot shard slot for `(lod, shard)`, populating
+    /// the slot (and opening the shard file) on a miss. The common case —
+    /// slot already addresses this shard, true for every voxel after the
+    /// first in a shard — is a single RefCell borrow; only a slot miss
+    /// pays the populate + re-probe. Returns `None` when the shard can't
+    /// be opened (I/O error or out-of-grid).
+    #[inline]
+    fn with_shard_slot<R>(&self, lod: u8, shard: ShardCoord, f: impl FnOnce(&ShardSlot) -> R) -> Option<R> {
+        let lod_ix = lod as usize;
+        if lod_ix >= SHARD_SLOTS_PER_LOD {
+            return None;
+        }
+        {
+            let b = self.local.borrow();
+            if let Some(slot) = b.shards[lod_ix].as_ref() {
+                if slot.shard == shard {
+                    return Some(f(slot));
+                }
+            }
+        }
+        self.populate_shard_slot(lod, shard);
+        let b = self.local.borrow();
+        match b.shards[lod_ix].as_ref() {
+            Some(slot) if slot.shard == shard => Some(f(slot)),
+            _ => None,
+        }
+    }
+
     /// Borrow the resident chunk's 64³ slice from the shard hot slot, if
     /// the slot addresses the same `(lod, shard)` that contains
-    /// `(target_cx, target_cy, target_cz)` AND the chunk is marked
-    /// Resident. Returns the slice base pointer; `None` for any other
-    /// state (caller must slow-path — `resolve_chunk` reads the bitmap
-    /// itself to distinguish Empty from Unknown/Dispatched there).
+    /// `(target_cx, target_cy, target_cz)` AND the chunk's sidecar byte
+    /// reads Resident. Returns the slice base pointer; `None` for any
+    /// other state (caller must slow-path — `resolve_chunk` distinguishes
+    /// Empty from Missing/Dispatched there).
     #[inline]
     fn shard_slot_chunk_slice(&self, target_lod: u8, target_cx: u32, target_cy: u32, target_cz: u32) -> Option<*const u8> {
         let lod_ix = target_lod as usize;
@@ -187,19 +236,19 @@ impl UnifiedVolume {
         if slot.shard != shard {
             return None;
         }
-        match slot.state_bits.load(in_shard_idx) {
+        match self.sidecar_state(target_lod, target_cx, target_cy, target_cz) {
             // SAFETY: in_shard_idx * CHUNK_VOXELS + CHUNK_VOXELS ≤
             // shard mmap length.
-            ChunkBitState::Resident => Some(unsafe { slot.base.add((in_shard_idx as usize) * CHUNK_VOXELS) }),
+            Some(STATE_RESIDENT) => Some(unsafe { slot.base.add((in_shard_idx as usize) * CHUNK_VOXELS) }),
             _ => None,
         }
     }
 
     /// Populate the shard hot slot for `(target_lod, shard)`, opening the
-    /// shard file (sparse mmap + seeded bitmap) if it isn't already. After
-    /// this call, the slot's bitmap is the single source of truth for
-    /// every chunk inside this shard — the per-voxel slow path never
-    /// needs to re-enter the DashMap or the per-LOD `opened` mutex.
+    /// shard file (sparse mmap) if it isn't already. After this call,
+    /// per-voxel reads in this shard run entirely off the cached mmap
+    /// base + direct sidecar probes — never re-entering the DashMap or
+    /// the per-LOD `opened` mutex.
     ///
     /// No-op if the slot already addresses this shard.
     fn populate_shard_slot(&self, target_lod: u8, shard: ShardCoord) {
@@ -222,7 +271,7 @@ impl UnifiedVolume {
                 shard,
                 base,
                 _mmap: snap.mmap,
-                state_bits: snap.state_bits,
+                dispatched: snap.dispatched,
             });
         }
     }
@@ -375,7 +424,7 @@ impl UnifiedVolume {
 
         // Upper bounds in target-LOD voxel units. Rays running past the
         // volume extent (common for surfaces near the scroll edge) feed 0
-        // here instead of probing forever-Unknown bitmap cells.
+        // here instead of probing forever-missing chunks.
         let scale = (1u64 << target_lod) as f64;
         let ext_x = self.extent[0] as f64 / scale;
         let ext_y = self.extent[1] as f64 / scale;
@@ -847,12 +896,14 @@ impl BoundChunk {
 }
 
 impl UnifiedVolume {
-    /// Shard-based LOD climb. After populating each LOD's hot shard slot,
-    /// every per-voxel decision (resident / dispatched / empty / unknown)
-    /// comes from the shard bitmap — a lock-free atomic read. The DashMap
-    /// is only consulted on the first encounter with an `Unknown` chunk,
-    /// to kick off its dispatch; subsequent voxels see `Dispatched` on the
-    /// bitmap and skip the cache layer entirely.
+    /// Shard-based LOD climb. Every per-voxel decision (resident / empty /
+    /// locked / missing) is one lock-free atomic byte read off the sidecar;
+    /// the per-shard dispatched bits — reached through each LOD's hot
+    /// shard slot — only disambiguate Missing into "fetch in flight" vs
+    /// "never tried". The DashMap is consulted exactly once per chunk, on
+    /// the first voxel that finds it never-dispatched, to kick off the
+    /// fetch; subsequent voxels see the dispatched bit and skip the cache
+    /// layer entirely.
     fn resolve_chunk(&self, target_lod: u8, max_lod: u8, cx: u32, cy: u32, cz: u32) -> Option<BoundChunk> {
         let walk_lo = target_lod.min(max_lod);
         for lod_try in walk_lo..=max_lod {
@@ -860,49 +911,47 @@ impl UnifiedVolume {
             let cx_try = cx >> shift;
             let cy_try = cy >> shift;
             let cz_try = cz >> shift;
-            let (shard, in_shard_idx) = self.shard_decompose(cx_try, cy_try, cz_try);
             let lod_ix = lod_try as usize;
             if lod_ix >= SHARD_SLOTS_PER_LOD {
                 continue;
             }
-
-            // Common case (slot already addresses this shard — true for
-            // every voxel after the first in a shard) is a single RefCell
-            // borrow + one atomic bitmap load, no Arc traffic. Only a
-            // slot miss pays the populate + re-probe.
-            let probe = {
-                let b = self.local.borrow();
-                match b.shards[lod_ix].as_ref() {
-                    Some(slot) if slot.shard == shard => Some((slot.state_bits.load(in_shard_idx), slot.base)),
-                    _ => None,
-                }
+            // Out-of-grid at this LOD (shouldn't happen for in-extent
+            // samples) — climb on.
+            let Some(state) = self.sidecar_state(lod_try, cx_try, cy_try, cz_try) else {
+                continue;
             };
-            let (state, base) = match probe {
-                Some(p) => p,
-                None => {
-                    self.populate_shard_slot(lod_try, shard);
-                    let b = self.local.borrow();
-                    match b.shards[lod_ix].as_ref() {
+            let (shard, in_shard_idx) = self.shard_decompose(cx_try, cy_try, cz_try);
+            match state {
+                STATE_RESIDENT => {
+                    let chunk_ptr = self.with_shard_slot(lod_try, shard, |slot| {
+                        // SAFETY: in_shard_idx * CHUNK_VOXELS + CHUNK_VOXELS
+                        // ≤ shard mmap length.
+                        unsafe { slot.base.add((in_shard_idx as usize) * CHUNK_VOXELS) }
+                    });
+                    match chunk_ptr {
+                        Some(p) => return Some(BoundChunk { shift, chunk_ptr: p }),
                         // Shard couldn't be opened (I/O error) — climb on.
-                        Some(slot) if slot.shard == shard => (slot.state_bits.load(in_shard_idx), slot.base),
-                        _ => continue,
+                        None => continue,
                     }
                 }
-            };
-            match state {
-                ChunkBitState::Resident => {
-                    let chunk_ptr = unsafe { base.add((in_shard_idx as usize) * CHUNK_VOXELS) };
-                    return Some(BoundChunk { shift, chunk_ptr });
-                }
-                ChunkBitState::Empty => return None,
-                ChunkBitState::Dispatched => continue,
-                ChunkBitState::Unknown => {
-                    // First voxel to find this chunk Unknown kicks off the
-                    // dispatch. `dispatch_chunk` flips the bitmap to
-                    // Dispatched (or Resident / Empty if disk had it), so
-                    // siblings of this voxel never re-enter the DashMap.
-                    let key = ChunkKey::new(lod_try, cx_try, cy_try, cz_try);
-                    let _ = self.cache.state_or_fetch(key);
+                STATE_EMPTY => return None,
+                // A write or punch is mid-flight on this slot; not
+                // readable yet, and something is already driving it.
+                STATE_LOCKED => continue,
+                _ /* STATE_MISSING */ => {
+                    // First voxel to find this chunk never-dispatched kicks
+                    // off the fetch. `dispatch_chunk` sets the dispatched
+                    // bit, so siblings of this voxel never re-enter the
+                    // DashMap. If the shard can't be opened, skip the
+                    // dispatch too (`state_or_fetch` would fail the same
+                    // way) and climb on.
+                    let dispatched = self
+                        .with_shard_slot(lod_try, shard, |slot| slot.dispatched.get(in_shard_idx))
+                        .unwrap_or(true);
+                    if !dispatched {
+                        let key = ChunkKey::new(lod_try, cx_try, cy_try, cz_try);
+                        let _ = self.cache.state_or_fetch(key);
+                    }
                     continue;
                 }
             }
