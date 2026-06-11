@@ -138,6 +138,13 @@ enum SourceState {
     Done {
         outcome: SourceOutcome,
         remaining_consumers: usize,
+        /// Extract-ready chunks whose Extract task is intentionally NOT
+        /// queued yet: one batch extract (the first ready waiter) runs
+        /// first, decodes once, and fills every requester it covers; it
+        /// then drains this list, and the deferred tasks skip-met against
+        /// the already-promoted states. This keeps N workers from popping
+        /// N same-source extracts and serializing on one decode.
+        deferred: Vec<ChunkKey>,
     },
 }
 
@@ -156,6 +163,10 @@ struct ChunkProgress {
     /// Pending claim on transient/permanent failure so retries can happen
     /// via a fresh dispatch.
     covered: Vec<ChunkKey>,
+    /// When the chunk was dispatched (first paint request that found it
+    /// Missing). Telemetry: dispatch→extract-done is the user-perceived
+    /// "asked for it → paintable" latency, logged as `pending_ms`.
+    dispatched_at: std::time::Instant,
 }
 
 enum Task {
@@ -1113,6 +1124,7 @@ impl Inner {
             results: HashMap::new(),
             extract: Some(extract),
             covered,
+            dispatched_at: std::time::Instant::now(),
         }));
         self.chunks.insert(key, progress_arc.clone());
 
@@ -1184,11 +1196,18 @@ impl Inner {
                 SourceState::Done {
                     outcome,
                     remaining_consumers,
+                    ..
                 } => {
                     // New consumer for an already-completed source — bump
                     // the refcount so `extract_chunk`'s eviction logic
-                    // waits for this chunk too.
+                    // waits for this chunk too, and note it as a requester
+                    // so a still-pending batch extract can fill it.
                     *remaining_consumers += 1;
+                    if let Ok(Some(payload)) = &*outcome {
+                        if let Some(lazy) = payload.downcast_ref::<LazySource>() {
+                            lazy.note_requester(chunk_key);
+                        }
+                    }
                     log::trace!(
                         "[{}] reuse (chunk {}, refcount {})",
                         source_key,
@@ -1370,6 +1389,7 @@ impl Inner {
                 SourceState::Done {
                     outcome: outcome.clone(),
                     remaining_consumers: n,
+                    deferred: Vec::new(),
                 },
             );
             match prev {
@@ -1400,29 +1420,67 @@ impl Inner {
             self.sources.lock().unwrap().remove(&source_key);
         }
 
+        // Record the outcome on every waiter; collect the ones that became
+        // extract-ready.
+        let mut ready: Vec<ChunkKey> = Vec::new();
         for w in waiters {
-            self.satisfy(w, &source_key, outcome.clone());
+            if self.record_source_outcome(w, &source_key, outcome.clone()) {
+                ready.push(w);
+            }
+        }
+
+        // Batch dispatch: with a decodable payload and several ready
+        // chunks, queue ONE extract (it decodes once and fills every
+        // requester its plan covers) and defer the rest — they're queued
+        // by the batch extract when it finishes and skip-met against the
+        // promoted states. Queuing all of them up front made N workers pop
+        // N same-source extracts and serialize on one decode.
+        let lazy = match &outcome {
+            Ok(Some(payload)) => payload.downcast_ref::<LazySource>(),
+            _ => None,
+        };
+        match (lazy, ready.split_first()) {
+            (Some(lazy), Some((first, rest))) => {
+                for r in &ready {
+                    lazy.note_requester(*r);
+                }
+                if !rest.is_empty() {
+                    let mut s = arc.lock().unwrap();
+                    if let SourceState::Done { deferred, .. } = &mut *s {
+                        deferred.extend_from_slice(rest);
+                    }
+                }
+                self.task_queue.submit_durable(*first, Task::Extract);
+            }
+            _ => {
+                for w in ready {
+                    self.task_queue.submit_durable(w, Task::Extract);
+                }
+            }
+        }
+    }
+
+    /// Apply one source's outcome to the chunk's progress; returns true
+    /// when this was the chunk's last outstanding source (extract-ready).
+    fn record_source_outcome(self: &Arc<Self>, chunk_key: ChunkKey, source_key: &str, outcome: SourceOutcome) -> bool {
+        let arc = match self.chunks.get(&chunk_key).map(|e| e.clone()) {
+            Some(a) => a,
+            None => return false,
+        };
+        let mut p = arc.lock().unwrap();
+        if p.results.contains_key(source_key) {
+            false
+        } else {
+            p.results.insert(source_key.to_string(), outcome);
+            p.remaining = p.remaining.saturating_sub(1);
+            p.remaining == 0
         }
     }
 
     /// Apply one source's outcome to the chunk's progress; when the last
     /// outstanding source resolves, queue the Extract task.
     fn satisfy(self: &Arc<Self>, chunk_key: ChunkKey, source_key: &str, outcome: SourceOutcome) {
-        let arc = match self.chunks.get(&chunk_key).map(|e| e.clone()) {
-            Some(a) => a,
-            None => return,
-        };
-        let queue_extract = {
-            let mut p = arc.lock().unwrap();
-            if p.results.contains_key(source_key) {
-                false
-            } else {
-                p.results.insert(source_key.to_string(), outcome);
-                p.remaining = p.remaining.saturating_sub(1);
-                p.remaining == 0
-            }
-        };
-        if queue_extract {
+        if self.record_source_outcome(chunk_key, source_key, outcome) {
             // Durable: every source for this chunk has finished downloading,
             // so culling the Extract by age would discard paid-for bytes and
             // force a re-download on the next visit. Late extraction is
@@ -1438,7 +1496,7 @@ impl Inner {
             Some(v) => v,
             None => return,
         };
-        let (order, results, extract, covered) = {
+        let (order, results, extract, covered, dispatched_at) = {
             let mut p = arc.lock().unwrap();
             let extract = match p.extract.take() {
                 Some(e) => e,
@@ -1447,7 +1505,7 @@ impl Inner {
             let order = std::mem::take(&mut p.order);
             let results = std::mem::take(&mut p.results);
             let covered = std::mem::take(&mut p.covered);
-            (order, results, extract, covered)
+            (order, results, extract, covered, p.dispatched_at)
         };
         let mut inputs: Vec<SourceOutcome> = Vec::with_capacity(order.len());
         let mut results = results;
@@ -1531,6 +1589,7 @@ impl Inner {
                 "covered": covered.len(),
                 "sources": order.len(),
                 "ms": t0.elapsed().as_millis() as u64,
+                "pending_ms": dispatched_at.elapsed().as_millis() as u64,
             }));
         }
 
@@ -1563,6 +1622,53 @@ impl Inner {
             let s = failure_state.clone().unwrap_or_else(short_cooldown);
             self.map.insert(*c, s);
         }
+
+        // Queue the extracts deferred behind this batch. On success their
+        // chunks were just promoted, so they skip-met and merely release
+        // their source refcounts; anything the batch couldn't fill (or a
+        // failed batch) runs its own extract against the memoized decode.
+        self.queue_deferred(&order);
+    }
+
+    /// Queue every Extract deferred on `order`'s sources (see
+    /// `SourceState::Done::deferred`).
+    fn queue_deferred(self: &Arc<Self>, order: &[String]) {
+        for source_key in order {
+            let deferred = {
+                let sources = self.sources.lock().unwrap();
+                match sources.get(source_key) {
+                    Some(arc) => {
+                        let mut s = arc.lock().unwrap();
+                        match &mut *s {
+                            SourceState::Done { deferred, .. } => std::mem::take(deferred),
+                            _ => Vec::new(),
+                        }
+                    }
+                    None => Vec::new(),
+                }
+            };
+            for chunk in deferred {
+                self.task_queue.submit_durable(chunk, Task::Extract);
+            }
+        }
+    }
+
+    /// Drop a chunk's pending progress without extracting: release its
+    /// source refcounts (so payloads don't leak) and queue any extracts
+    /// deferred behind it (so a skipped batch leader can't strand its
+    /// followers).
+    fn discard_progress(self: &Arc<Self>, key: ChunkKey) {
+        let Some((_, arc)) = self.chunks.remove(&key) else {
+            return;
+        };
+        let order = {
+            let mut p = arc.lock().unwrap();
+            p.extract = None;
+            p.results.clear();
+            std::mem::take(&mut p.order)
+        };
+        self.release_sources(&order);
+        self.queue_deferred(&order);
     }
 
     /// Translate a primary `ExtractedChunk` into the in-memory state to
@@ -1687,7 +1793,7 @@ impl Inner {
             Task::Extract => {
                 let chunk_key = entry.chunk;
                 log::debug!("[{}] dropped: {}", chunk_key, reason);
-                self.chunks.remove(&chunk_key);
+                self.discard_progress(chunk_key);
                 self.map.insert(chunk_key, short_cooldown());
             }
         }
@@ -1817,8 +1923,12 @@ fn worker_loop(inner: Arc<Inner>) {
         match &entry.item {
             Task::Extract => {
                 if inner.is_chunk_done(chunk) {
+                    // Common path for batch-deferred extracts: the batch
+                    // leader already promoted this chunk; releasing the
+                    // source refcounts here is what lets the shared
+                    // payload (and its decoded buffer) drop.
                     log::trace!("[{}] skip extract (already terminal)", chunk);
-                    inner.chunks.remove(&chunk);
+                    inner.discard_progress(chunk);
                     continue;
                 }
             }

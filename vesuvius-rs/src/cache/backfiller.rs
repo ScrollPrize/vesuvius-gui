@@ -63,6 +63,11 @@ pub struct LazySource {
     /// `Arc<Vec<u8>>` (write-failure fallback).
     raw: SourcePayload,
     decoded: std::sync::OnceLock<Result<Arc<Vec<u8>>, String>>,
+    /// Chunks registered on this source that are extract-ready. The cache
+    /// notes them when the source completes (and on late attach); the
+    /// single batch extract reads the snapshot and fills every requester
+    /// its plan geometry covers, so one decode serves the whole wave.
+    requesters: std::sync::Mutex<Vec<crate::cache::ChunkKey>>,
 }
 
 impl LazySource {
@@ -70,7 +75,21 @@ impl LazySource {
         Self {
             raw,
             decoded: std::sync::OnceLock::new(),
+            requesters: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Record a chunk as wanting this source's data (extract-ready).
+    pub fn note_requester(&self, key: crate::cache::ChunkKey) {
+        let mut r = self.requesters.lock().unwrap();
+        if !r.contains(&key) {
+            r.push(key);
+        }
+    }
+
+    /// Snapshot of every chunk noted so far.
+    pub fn requesters(&self) -> Vec<crate::cache::ChunkKey> {
+        self.requesters.lock().unwrap().clone()
     }
 
     /// The raw downloaded bytes, regardless of backing storage. `None` if
@@ -87,13 +106,39 @@ impl LazySource {
     /// concurrent and later callers (while this source entry is alive)
     /// share the resulting buffer. Errors are memoized too — a failing
     /// decode is deterministic, retrying it per consumer just burns CPU.
+    ///
+    /// NB: concurrent callers BLOCK on the running decode (OnceLock
+    /// semantics) — a worker that picks up a sibling's Extract while the
+    /// decode is in flight stalls for its duration. The netlog `decode`
+    /// event records `ran` vs blocked (`wait`) so this serialization is
+    /// visible in captures.
     pub fn decoded_with(&self, decode: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>) -> Result<Arc<Vec<u8>>, String> {
-        self.decoded
-            .get_or_init(|| match self.raw_bytes() {
-                Some(bytes) => decode(bytes).map(Arc::new),
-                None => Err("unexpected source payload type".to_string()),
+        let t0 = std::time::Instant::now();
+        let mut ran = false;
+        let result = self
+            .decoded
+            .get_or_init(|| {
+                ran = true;
+                match self.raw_bytes() {
+                    Some(bytes) => decode(bytes).map(Arc::new),
+                    None => Err("unexpected source payload type".to_string()),
+                }
             })
-            .clone()
+            .clone();
+        let ms = t0.elapsed().as_millis() as u64;
+        // Memo hits return in ~µs; only a run or a genuine block is worth
+        // a log line.
+        if super::netlog::enabled() && (ran || ms >= 20) {
+            super::netlog::emit(serde_json::json!({
+                "t": super::netlog::now_ms(),
+                "event": "decode",
+                "ran": ran,
+                "ms": ms,
+                "raw_bytes": self.raw_bytes().map(|b| b.len()),
+                "ok": result.is_ok(),
+            }));
+        }
+        result
     }
 }
 

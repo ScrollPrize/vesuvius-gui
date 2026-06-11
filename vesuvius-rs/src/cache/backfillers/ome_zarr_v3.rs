@@ -178,11 +178,13 @@ pub(super) fn plan_v3_chunk(
             // by sub-chunk coordinate. Absent (Ok(None)) and skipped
             // sub-chunks stay out of the map → extract zero-fills.
             //
-            // The decode is memoized on the shared `LazySource` payload:
-            // every cache chunk registered on the same sub-chunk source
-            // shares one decoded buffer, so a slab's worth of sibling
-            // extracts pays the ~400ms c3d decode exactly once.
+            // The decode is memoized on the shared `LazySource` payload,
+            // and this extract is the wave's batch leader (the cache
+            // queues one extract per source completion): decode once,
+            // then fill every requester chunk this plan's sub-chunk box
+            // covers. Followers skip-met against the promoted states.
             let mut decoded: HashMap<[usize; 3], Arc<Vec<u8>>> = HashMap::new();
+            let mut targets: Vec<ChunkKey> = covered_for_extract.clone();
             for (i, coord) in source_coords.iter().enumerate() {
                 let payload_opt: &Option<SourcePayload> = match &outcomes[i] {
                     Ok(p) => p,
@@ -193,6 +195,33 @@ pub(super) fn plan_v3_chunk(
                     .clone()
                     .downcast::<LazySource>()
                     .map_err(|_| BackfillError::Permanent("source payload type".into()))?;
+                for r in lazy.requesters() {
+                    // Fillable iff the requester's full sub-chunk overlap
+                    // set lies inside this plan's considered box — a
+                    // requester spanning a sub-chunk we didn't plan for
+                    // (multi-source chunk) must run its own extract.
+                    if r.lod != key_dbg.lod || targets.contains(&r) {
+                        continue;
+                    }
+                    let rb = [r.z as usize * CHUNK_SIDE, r.y as usize * CHUNK_SIDE, r.x as usize * CHUNK_SIDE];
+                    if rb[0] >= shape[0] || rb[1] >= shape[1] || rb[2] >= shape[2] {
+                        continue;
+                    }
+                    let re = [
+                        (rb[0] + CHUNK_SIDE).min(shape[0]),
+                        (rb[1] + CHUNK_SIDE).min(shape[1]),
+                        (rb[2] + CHUNK_SIDE).min(shape[2]),
+                    ];
+                    let inside = rb[0] / sub[0] >= cz_lo
+                        && (re[0] - 1) / sub[0] <= cz_hi
+                        && rb[1] / sub[1] >= cy_lo
+                        && (re[1] - 1) / sub[1] <= cy_hi
+                        && rb[2] / sub[2] >= cx_lo
+                        && (re[2] - 1) / sub[2] <= cx_hi;
+                    if inside {
+                        targets.push(r);
+                    }
+                }
                 let decoded_bytes = lazy
                     .decoded_with(|bytes| vesuvius_c3d::with_decoder(|d| d.decode(bytes)).map_err(|e| e.to_string()))
                     .map_err(|e| BackfillError::Permanent(format!("c3d decode at {:?}: {}", coord, e)))?;
@@ -201,7 +230,7 @@ pub(super) fn plan_v3_chunk(
 
             Ok(super::ome_zarr::fill_covered_chunks(
                 key_dbg,
-                &covered_for_extract,
+                &targets,
                 &shape,
                 &sub,
                 &decoded,

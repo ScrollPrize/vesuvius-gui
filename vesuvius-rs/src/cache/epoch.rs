@@ -954,7 +954,7 @@ fn watchdog_loop(weak: Weak<EpochState>, unified_root: PathBuf, signal: Arc<(Mut
 }
 
 #[cfg(unix)]
-fn statvfs_free(path: &Path) -> Option<u64> {
+pub(super) fn statvfs_free(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -967,7 +967,7 @@ fn statvfs_free(path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn statvfs_free(_path: &Path) -> Option<u64> {
+pub(super) fn statvfs_free(_path: &Path) -> Option<u64> {
     None
 }
 

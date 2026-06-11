@@ -84,6 +84,12 @@ const DEFAULT_RAW_CACHE_CAP: u64 = 24 * 1024 * 1024 * 1024;
 /// amortize instead of firing on every put.
 const RAW_EVICT_TO_PCT: u64 = 90;
 
+/// Minimum free space on the store's filesystem. When a put sees less
+/// than this, it runs an eviction pass that also reclaims the deficit —
+/// retention must never be the thing that fills the disk. Matches the
+/// unified purger's floor.
+const RAW_MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 /// Keyed retention store for downloaded source bytes (compressed c3d
 /// sub-chunks, zarr chunks, …), keyed by `(url, byte range)`.
 ///
@@ -180,6 +186,20 @@ impl RawStore {
 
     fn put_keyed(&self, key: &str, bytes: &[u8]) -> std::io::Result<Mmap> {
         std::fs::create_dir_all(&self.root)?;
+        // Disk-free floor: if the filesystem is nearly full, evict enough
+        // raw entries to restore the floor before writing — and refuse the
+        // keyed write entirely if eviction can't (a full disk is somebody
+        // else's data; the caller falls back to the anonymous spill).
+        if let Some(free) = super::epoch::statvfs_free(&self.root) {
+            if free + (bytes.len() as u64) < RAW_MIN_FREE_BYTES {
+                self.evict_pass(Some(RAW_MIN_FREE_BYTES - free));
+                let still_low = super::epoch::statvfs_free(&self.root)
+                    .is_some_and(|f| f + (bytes.len() as u64) < RAW_MIN_FREE_BYTES);
+                if still_low {
+                    return Err(std::io::Error::other("raw store: disk below free floor"));
+                }
+            }
+        }
         let path = self.path_for(key);
         let tmp = path.with_extension("tmp");
         {
@@ -192,16 +212,18 @@ impl RawStore {
 
         let total = self.total.fetch_add(bytes.len() as u64, Ordering::Relaxed) + bytes.len() as u64;
         if total > self.cap_bytes {
-            self.evict_pass();
+            self.evict_pass(None);
         }
         Ok(mmap)
     }
 
     /// Delete oldest-mtime files until the store is at `RAW_EVICT_TO_PCT`
-    /// of cap. Lists the directory (filesystem truth) rather than trusting
-    /// the running counter. Unlinking a file another thread has mmapped is
-    /// fine — the inode survives until the mmap drops.
-    fn evict_pass(&self) {
+    /// of cap — or, with `extra_free`, until that many additional bytes
+    /// have been reclaimed (disk-floor recovery). Lists the directory
+    /// (filesystem truth) rather than trusting the running counter.
+    /// Unlinking a file another thread has mmapped is fine — the inode
+    /// survives until the mmap drops.
+    fn evict_pass(&self, extra_free: Option<u64>) {
         let Ok(_guard) = self.evict_lock.try_lock() else {
             return; // another thread is already evicting
         };
@@ -217,7 +239,10 @@ impl RawStore {
             Err(_) => return,
         };
         let mut total: u64 = entries.iter().map(|(_, _, len)| len).sum();
-        let target = self.cap_bytes * RAW_EVICT_TO_PCT / 100;
+        let mut target = self.cap_bytes * RAW_EVICT_TO_PCT / 100;
+        if let Some(extra) = extra_free {
+            target = target.min(total.saturating_sub(extra));
+        }
         if total > target {
             entries.sort_by_key(|(_, mtime, _)| *mtime);
             let mut evicted = 0usize;
