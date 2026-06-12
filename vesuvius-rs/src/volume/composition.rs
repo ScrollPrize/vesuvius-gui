@@ -67,6 +67,13 @@ impl AlphaCompositionState {
             alpha: 0.0,
         }
     }
+
+    /// `(min, max, alpha_cutoff, opacity)` — read back by `OverlayVolume`'s
+    /// dual-volume walk (`Compositor::AlphaOverlay`), which accumulates
+    /// outside this state machine but uses the same user-facing parameters.
+    pub fn params(&self) -> (f32, f32, f32, f32) {
+        (self.min, self.max, self.alpha_cutoff, self.opacity)
+    }
 }
 impl CompositionState for AlphaCompositionState {
     fn update(&mut self, a: u8) -> bool {
@@ -176,6 +183,12 @@ pub enum Compositor {
     Alpha(AlphaCompositionState),
     HeightMap(AlphaHeightMapCompositionState),
     None(NoCompositionState),
+    /// "Value from base, opacity from overlay" mode. For single-volume walks
+    /// this behaves exactly like `Alpha` (the inner state runs the regular
+    /// alpha accumulation); `OverlayVolume::composite_color_along_normal`
+    /// pattern-matches on this variant to run its dual-volume walk instead,
+    /// reusing the state's parameters via `AlphaCompositionState::params`.
+    AlphaOverlay(AlphaCompositionState),
 }
 
 impl Compositor {
@@ -186,6 +199,7 @@ impl Compositor {
             Compositor::Alpha(s) => CompositorRef::Alpha(s),
             Compositor::HeightMap(s) => CompositorRef::HeightMap(s),
             Compositor::None(s) => CompositorRef::None(s),
+            Compositor::AlphaOverlay(s) => CompositorRef::Alpha(s),
         }
     }
 
@@ -196,6 +210,7 @@ impl Compositor {
             Compositor::Alpha(s) => s.reset(),
             Compositor::HeightMap(s) => s.reset(),
             Compositor::None(s) => s.reset(),
+            Compositor::AlphaOverlay(s) => s.reset(),
         }
     }
 
@@ -206,6 +221,7 @@ impl Compositor {
             Compositor::Alpha(s) => s.result(num_layers),
             Compositor::HeightMap(s) => s.result(num_layers),
             Compositor::None(s) => s.result(num_layers),
+            Compositor::AlphaOverlay(s) => s.result(num_layers),
         }
     }
 }

@@ -1065,6 +1065,7 @@ impl TemplateApp {
 
                         if self.drawing_config.compositing.mode == CompositingMode::Alpha
                             || self.drawing_config.compositing.mode == CompositingMode::AlphaHeightMap
+                            || self.drawing_config.compositing.mode == CompositingMode::AlphaOverlay
                         {
                             slider(
                                 ui,

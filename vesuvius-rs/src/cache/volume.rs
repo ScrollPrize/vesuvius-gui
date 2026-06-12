@@ -379,6 +379,22 @@ impl VoxelVolume for UnifiedVolume {
             }
         }
     }
+
+    /// Fast-path override: fill `out` with samples along the ray using the
+    /// same amortized shard walk as `composite_along_normal`, instead of the
+    /// trait default's per-sample `get_interpolated`.
+    fn gather_along_normal(&self, base: [f64; 3], dir: [f64; 3], downsampling: i32, out: &mut [u8]) {
+        let n = out.len();
+        if n == 0 {
+            return;
+        }
+        let mut i = 0usize;
+        self.composite_along_normal_inner(base, dir, 0.0, n as f64, downsampling, |v| {
+            out[i] = v;
+            i += 1;
+            i < n
+        });
+    }
 }
 
 impl UnifiedVolume {

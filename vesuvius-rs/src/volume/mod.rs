@@ -37,6 +37,11 @@ pub enum CompositingMode {
     Max,
     Alpha,
     AlphaHeightMap,
+    /// Alpha walk where the overlay volume supplies per-sample opacity and the
+    /// base volume supplies the value. Only `OverlayVolume` interprets this
+    /// specially (see its `composite_color_along_normal`); for plain volumes it
+    /// behaves exactly like `Alpha`.
+    AlphaOverlay,
 }
 impl CompositingMode {
     pub fn label(&self) -> &str {
@@ -45,13 +50,15 @@ impl CompositingMode {
             CompositingMode::Max => "Max",
             CompositingMode::Alpha => "Alpha",
             CompositingMode::AlphaHeightMap => "Alpha Height Map",
+            CompositingMode::AlphaOverlay => "Alpha (overlay opacity)",
         }
     }
-    pub const VALUES: [CompositingMode; 4] = [
+    pub const VALUES: [CompositingMode; 5] = [
         CompositingMode::None,
         CompositingMode::Max,
         CompositingMode::Alpha,
         CompositingMode::AlphaHeightMap,
+        CompositingMode::AlphaOverlay,
     ];
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
@@ -251,6 +258,21 @@ pub trait VoxelVolume {
         );
         Color32::from_gray(compositor.result(num_layers))
     }
+
+    /// Gather `out.len()` trilinear samples along `base + k*dir` for
+    /// `k in 0..out.len()` into `out`. This is the "no compositor" form of
+    /// the ray walk: callers that need the raw per-sample values (e.g. to
+    /// combine two volumes — value from one, opacity from another) use this
+    /// to keep the cache's amortized chunk lookup instead of calling
+    /// `get_interpolated` per sample. Default impl is the per-sample slow
+    /// loop; chunked backends override it.
+    fn gather_along_normal(&self, base: [f64; 3], dir: [f64; 3], downsampling: i32, out: &mut [u8]) {
+        for (k, slot) in out.iter_mut().enumerate() {
+            let w = k as f64;
+            let p = [base[0] + w * dir[0], base[1] + w * dir[1], base[2] + w * dir[2]];
+            *slot = self.get_interpolated(p, downsampling);
+        }
+    }
 }
 
 pub struct Image {
@@ -434,5 +456,8 @@ impl VoxelVolume for Volume {
             compositor,
             num_layers,
         )
+    }
+    fn gather_along_normal(&self, base: [f64; 3], dir: [f64; 3], downsampling: i32, out: &mut [u8]) {
+        self.volume.gather_along_normal(base, dir, downsampling, out);
     }
 }
