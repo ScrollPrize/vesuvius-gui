@@ -88,6 +88,20 @@ pub struct CompositingSettings {
     pub alpha_threshold: u16,
     pub opacity: u16,
     pub reverse_direction: bool,
+    /// `AlphaOverlayCombined` only: how much of the regular alpha result is
+    /// crossfaded into the overlay-masked result, in percent. 0 shows the
+    /// pure mask (background without overlay goes dark), 100 reproduces the
+    /// regular `Alpha` walk exactly; in between the background blends in
+    /// linearly.
+    #[serde(default)]
+    pub overlay_background: u8,
+    /// `AlphaOverlayCombined` only: how strongly the masked walk's value is
+    /// normalized by its accumulated coverage, in percent. 0 keeps the
+    /// classic premultiplied look (mid-confidence ink is dimmed by its
+    /// coverage), 100 fully normalizes (ink shows its true average CT
+    /// intensity regardless of coverage).
+    #[serde(default)]
+    pub overlay_value_norm: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
@@ -157,6 +171,8 @@ impl Default for DrawingConfig {
                 alpha_threshold: 9500,
                 opacity: 1,
                 reverse_direction: false,
+                overlay_background: 0,
+                overlay_value_norm: 0,
             },
             debug_chunk_overlay: false,
         }

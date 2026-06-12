@@ -1,4 +1,4 @@
-use super::composition::{Compositor, MaxCompositionState};
+use super::composition::{Compositor, MaxCompositionState, OverlayCombineParams};
 use super::zarr_paint::{ColorScheme, FourColors};
 use super::{DrawingConfig, Image, PaintVolume, Volume, VolumeCons, VoxelPaintVolume, VoxelVolume};
 use ecolor::Color32;
@@ -346,7 +346,11 @@ impl VoxelVolume for OverlayVolume {
     /// - `AlphaOverlayCombined`: regular alpha walk on the base, but each
     ///   sample's alpha is scaled by the raw overlay confidence — a
     ///   continuous mask that suppresses non-ink signal sitting on top of
-    ///   ink without changing the look where the overlay saturates.
+    ///   ink without changing the look where the overlay saturates. The walk
+    ///   also accumulates the plain (unmasked) alpha result; the background
+    ///   parameter crossfades it into the final value so overlay-free
+    ///   regions blend in linearly, and the value-norm parameter un-derates
+    ///   the masked value by its accumulated coverage for contrast.
     fn composite_color_along_normal(
         &self,
         base: [f64; 3],
@@ -361,14 +365,14 @@ impl VoxelVolume for OverlayVolume {
         enum OverlayWalk {
             Opacity,
             Start,
-            Combined,
+            Combined(OverlayCombineParams),
         }
         // Pull the parameters out first so the borrow on the compositor ends
         // (the Start walk reuses it for the base walk below).
         let special = match &*compositor {
             Compositor::AlphaOverlay(s) => Some((OverlayWalk::Opacity, s.params())),
             Compositor::AlphaOverlayStart(s) => Some((OverlayWalk::Start, s.params())),
-            Compositor::AlphaOverlayCombined(s) => Some((OverlayWalk::Combined, s.params())),
+            Compositor::AlphaOverlayCombined(s, params) => Some((OverlayWalk::Combined(*params), s.params())),
             _ => None,
         };
         if let Some((walk, (a_min, a_max, a_cutoff, a_opacity))) = special {
@@ -407,32 +411,69 @@ impl VoxelVolume for OverlayVolume {
             let mut value_buf = [0u8; MAX_SAMPLES];
             self.base.gather_along_normal(start, dir, downsampling, &mut value_buf[..n]);
 
+            if let OverlayWalk::Combined(params) = walk {
+                // Two accumulations over the same gathered samples: the
+                // overlay-masked alpha walk (each sample's alpha scaled by
+                // the raw overlay confidence — bright non-ink material in
+                // front of ink does not occlude it) and the plain alpha walk.
+                // They are crossfaded at the end so the background parameter
+                // is a linear mix of finished images; a per-sample mask floor
+                // would compound over the layer walk and drown the masked
+                // signal already at small values.
+                let mut m_v = 0.0f32;
+                let mut m_a = 0.0f32;
+                let mut r_v = 0.0f32;
+                let mut r_a = 0.0f32;
+                for k in 0..n {
+                    let a_b = ((value_buf[k] as f32 / 255.0 - a_min) / (a_max - a_min)).clamp(0.0, 1.0);
+                    if a_b == 0.0 {
+                        continue;
+                    }
+                    if m_a < a_cutoff {
+                        let a = a_b * (alpha_buf[k] as f32 / 255.0);
+                        if a > 0.0 {
+                            let weight = (1.0 - m_a) * (a * a_opacity).min(1.0);
+                            m_v += weight * a_b;
+                            m_a += weight;
+                        }
+                    }
+                    if r_a < a_cutoff {
+                        let weight = (1.0 - r_a) * (a_b * a_opacity).min(1.0);
+                        r_v += weight * a_b;
+                        r_a += weight;
+                    }
+                    if m_a >= a_cutoff && r_a >= a_cutoff {
+                        break;
+                    }
+                }
+                // Un-derate the masked value by its accumulated coverage:
+                // avg × coverage^γ. γ=1 keeps the premultiplied value (kept
+                // exact by the shortcut), γ=0 shows the pure average — mid-
+                // confidence ink recovers intensity while low-coverage
+                // background stays darker.
+                let masked = if params.value_norm >= 1.0 {
+                    m_v
+                } else if m_a > 0.0 {
+                    (m_v / m_a) * m_a.powf(params.value_norm)
+                } else {
+                    0.0
+                };
+                let v = (1.0 - params.background) * masked + params.background * r_v;
+                return Color32::from_gray((v * 255.0).clamp(0.0, 255.0) as u8);
+            }
+
+            // Remaining variant: the Opacity walk — opacity entirely from
+            // the overlay (normalized by the alpha sliders), raw base value
+            // shown.
             let mut acc_v = 0.0f32;
             let mut acc_a = 0.0f32;
             for k in 0..n {
-                let (a, v) = match walk {
-                    // Opacity entirely from the overlay (normalized by the
-                    // alpha sliders); raw base value shown.
-                    OverlayWalk::Opacity => {
-                        let a_o = ((alpha_buf[k] as f32 / 255.0 - a_min) / (a_max - a_min)).clamp(0.0, 1.0);
-                        (a_o, value_buf[k] as f32 / 255.0)
-                    }
-                    // Regular alpha on the base, scaled by the raw overlay
-                    // confidence. Identical to `Alpha` where the overlay is
-                    // 255; contributes nothing where it is 0 — so bright
-                    // non-ink material in front of ink does not occlude it.
-                    OverlayWalk::Combined => {
-                        let a_b = ((value_buf[k] as f32 / 255.0 - a_min) / (a_max - a_min)).clamp(0.0, 1.0);
-                        let a_o = alpha_buf[k] as f32 / 255.0;
-                        (a_b * a_o, a_b)
-                    }
-                    OverlayWalk::Start => unreachable!(),
-                };
+                let a = ((alpha_buf[k] as f32 / 255.0 - a_min) / (a_max - a_min)).clamp(0.0, 1.0);
                 if a == 0.0 {
                     continue;
                 }
                 let weight = (1.0 - acc_a) * (a * a_opacity).min(1.0);
-                acc_v += weight * v;
+                acc_v += weight * (value_buf[k] as f32 / 255.0);
                 acc_a += weight;
                 if acc_a >= a_cutoff {
                     break;
@@ -617,6 +658,16 @@ mod tests {
         Compositor::AlphaOverlay(alpha_state())
     }
 
+    fn combined(background: f32, value_norm: f32) -> Compositor {
+        Compositor::AlphaOverlayCombined(
+            alpha_state(),
+            OverlayCombineParams {
+                background,
+                value_norm,
+            },
+        )
+    }
+
     #[test]
     fn dual_walk_takes_value_from_base_where_overlay_is_opaque() {
         let vol = OverlayVolume::new(
@@ -718,7 +769,7 @@ mod tests {
             ConstVolume(255).into_volume(),
             OverlayColoring::default(),
         );
-        let mut comp = Compositor::AlphaOverlayCombined(alpha_state());
+        let mut comp = combined(0.0, 1.0);
         let actual = vol.composite_color_along_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 0.0, 10.0, 1, &mut comp, 10);
 
         let base = GradientVolume.into_volume();
@@ -735,8 +786,77 @@ mod tests {
             ConstVolume(0).into_volume(),
             OverlayColoring::default(),
         );
-        let mut comp = Compositor::AlphaOverlayCombined(alpha_state());
+        let mut comp = combined(0.0, 1.0);
         let color = vol.composite_color_along_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 0.0, 10.0, 1, &mut comp, 10);
         assert_eq!(color, Color32::from_gray(0));
+    }
+
+    #[test]
+    fn combined_walk_full_background_matches_regular_alpha_without_overlay() {
+        // background = 1.0 lifts the mask to 1 everywhere, so even a fully
+        // transparent overlay reproduces the regular alpha walk.
+        let vol = OverlayVolume::new(
+            GradientVolume.into_volume(),
+            ConstVolume(0).into_volume(),
+            OverlayColoring::default(),
+        );
+        let mut comp = combined(1.0, 1.0);
+        let actual = vol.composite_color_along_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 0.0, 10.0, 1, &mut comp, 10);
+
+        let base = GradientVolume.into_volume();
+        let mut alpha = Compositor::Alpha(alpha_state());
+        let expected = base.composite_color_along_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 0.0, 10.0, 1, &mut alpha, 10);
+        assert_eq!(actual, expected);
+        assert_ne!(actual, Color32::from_gray(0));
+    }
+
+    #[test]
+    fn combined_walk_background_blends_continuously() {
+        // With a zero overlay and a walk short enough not to saturate alpha,
+        // brightness increases monotonically with the background floor:
+        // dark at 0, approaching the regular alpha result at 1.
+        let walk = |background: f32| {
+            let vol = OverlayVolume::new(
+                ConstVolume(200).into_volume(),
+                ConstVolume(0).into_volume(),
+                OverlayColoring::default(),
+            );
+            let mut comp = combined(background, 1.0);
+            vol.composite_color_along_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 0.0, 4.0, 1, &mut comp, 4)
+                .r()
+        };
+        let results = [walk(0.0), walk(0.1), walk(0.5), walk(1.0)];
+        assert_eq!(results[0], 0);
+        assert!(
+            results.windows(2).all(|w| w[0] < w[1]),
+            "expected monotonically increasing brightness, got {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn combined_walk_value_norm_recovers_intensity_of_mid_confidence_ink() {
+        // A mid-confidence overlay (128) keeps the masked walk from
+        // saturating, which derates the premultiplied value; full value
+        // normalization recovers the true average base intensity.
+        let walk = |value_norm: f32| {
+            let vol = OverlayVolume::new(
+                ConstVolume(200).into_volume(),
+                ConstVolume(128).into_volume(),
+                OverlayColoring::default(),
+            );
+            let mut comp = combined(0.0, value_norm);
+            vol.composite_color_along_normal([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 0.0, 10.0, 1, &mut comp, 10)
+                .r()
+        };
+        let premultiplied = walk(1.0);
+        let normalized = walk(0.0);
+        assert!(
+            normalized > premultiplied,
+            "expected normalized {} > premultiplied {}",
+            normalized,
+            premultiplied
+        );
+        assert!((normalized as i32 - 200).abs() <= 1, "got {}", normalized);
     }
 }

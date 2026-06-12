@@ -1103,6 +1103,24 @@ impl TemplateApp {
                                 false,
                                 true,
                             );
+                            if self.drawing_config.compositing.mode == CompositingMode::AlphaOverlayCombined {
+                                slider(
+                                    ui,
+                                    "Background",
+                                    &mut self.drawing_config.compositing.overlay_background,
+                                    0..=100,
+                                    false,
+                                    true,
+                                );
+                                slider(
+                                    ui,
+                                    "Value Norm",
+                                    &mut self.drawing_config.compositing.overlay_value_norm,
+                                    0..=100,
+                                    false,
+                                    true,
+                                );
+                            }
                             cb(
                                 ui,
                                 "Reverse Direction",

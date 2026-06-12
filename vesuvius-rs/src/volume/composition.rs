@@ -199,7 +199,24 @@ pub enum Compositor {
     /// exactly like `Alpha`; `OverlayVolume::composite_color_along_normal`
     /// pattern-matches on this variant to run a dual-volume walk where each
     /// sample's alpha is the product of both volumes' normalized alphas.
-    AlphaOverlayCombined(AlphaCompositionState),
+    AlphaOverlayCombined(AlphaCompositionState, OverlayCombineParams),
+}
+
+/// Extra display parameters for `Compositor::AlphaOverlayCombined`.
+#[derive(Clone, Copy)]
+pub struct OverlayCombineParams {
+    /// Final crossfade weight (0..=1) of the regular alpha result mixed into
+    /// the overlay-masked result: 0 shows the pure masked walk, 1 the regular
+    /// alpha walk. A crossfade of the two finished walks (rather than a
+    /// per-sample mask floor) keeps the slider perceptually linear — a small
+    /// floor would compound over the layer walk and drown the masked signal.
+    pub background: f32,
+    /// Exponent γ applied to the masked walk's accumulated coverage when
+    /// rebuilding the displayed value: `avg * coverage^γ`. 1 keeps the classic
+    /// premultiplied alpha look (mid-confidence ink gets dimmed by its
+    /// coverage); 0 shows the fully normalized average (no coverage derating);
+    /// sublinear values stretch the contrast in between.
+    pub value_norm: f32,
 }
 
 impl Compositor {
@@ -212,7 +229,7 @@ impl Compositor {
             Compositor::None(s) => CompositorRef::None(s),
             Compositor::AlphaOverlay(s) => CompositorRef::Alpha(s),
             Compositor::AlphaOverlayStart(s) => CompositorRef::Alpha(s),
-            Compositor::AlphaOverlayCombined(s) => CompositorRef::Alpha(s),
+            Compositor::AlphaOverlayCombined(s, _) => CompositorRef::Alpha(s),
         }
     }
 
@@ -225,7 +242,7 @@ impl Compositor {
             Compositor::None(s) => s.reset(),
             Compositor::AlphaOverlay(s) => s.reset(),
             Compositor::AlphaOverlayStart(s) => s.reset(),
-            Compositor::AlphaOverlayCombined(s) => s.reset(),
+            Compositor::AlphaOverlayCombined(s, _) => s.reset(),
         }
     }
 
@@ -238,7 +255,7 @@ impl Compositor {
             Compositor::None(s) => s.result(num_layers),
             Compositor::AlphaOverlay(s) => s.result(num_layers),
             Compositor::AlphaOverlayStart(s) => s.result(num_layers),
-            Compositor::AlphaOverlayCombined(s) => s.result(num_layers),
+            Compositor::AlphaOverlayCombined(s, _) => s.result(num_layers),
         }
     }
 }
