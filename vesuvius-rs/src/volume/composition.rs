@@ -189,6 +189,17 @@ pub enum Compositor {
     /// pattern-matches on this variant to run its dual-volume walk instead,
     /// reusing the state's parameters via `AlphaCompositionState::params`.
     AlphaOverlay(AlphaCompositionState),
+    /// "Overlay locates the start, base supplies the walk" mode. For
+    /// single-volume walks this behaves exactly like `Alpha`;
+    /// `OverlayVolume::composite_color_along_normal` pattern-matches on this
+    /// variant to first scan the overlay for the surface onset and then run
+    /// the regular alpha walk on the base from there.
+    AlphaOverlayStart(AlphaCompositionState),
+    /// "Alpha from base × overlay" mode. For single-volume walks this behaves
+    /// exactly like `Alpha`; `OverlayVolume::composite_color_along_normal`
+    /// pattern-matches on this variant to run a dual-volume walk where each
+    /// sample's alpha is the product of both volumes' normalized alphas.
+    AlphaOverlayCombined(AlphaCompositionState),
 }
 
 impl Compositor {
@@ -200,6 +211,8 @@ impl Compositor {
             Compositor::HeightMap(s) => CompositorRef::HeightMap(s),
             Compositor::None(s) => CompositorRef::None(s),
             Compositor::AlphaOverlay(s) => CompositorRef::Alpha(s),
+            Compositor::AlphaOverlayStart(s) => CompositorRef::Alpha(s),
+            Compositor::AlphaOverlayCombined(s) => CompositorRef::Alpha(s),
         }
     }
 
@@ -211,6 +224,8 @@ impl Compositor {
             Compositor::HeightMap(s) => s.reset(),
             Compositor::None(s) => s.reset(),
             Compositor::AlphaOverlay(s) => s.reset(),
+            Compositor::AlphaOverlayStart(s) => s.reset(),
+            Compositor::AlphaOverlayCombined(s) => s.reset(),
         }
     }
 
@@ -222,6 +237,8 @@ impl Compositor {
             Compositor::HeightMap(s) => s.result(num_layers),
             Compositor::None(s) => s.result(num_layers),
             Compositor::AlphaOverlay(s) => s.result(num_layers),
+            Compositor::AlphaOverlayStart(s) => s.result(num_layers),
+            Compositor::AlphaOverlayCombined(s) => s.result(num_layers),
         }
     }
 }

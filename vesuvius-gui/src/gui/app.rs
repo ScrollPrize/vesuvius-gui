@@ -1063,10 +1063,14 @@ impl TemplateApp {
                             true,
                         );
 
-                        if self.drawing_config.compositing.mode == CompositingMode::Alpha
-                            || self.drawing_config.compositing.mode == CompositingMode::AlphaHeightMap
-                            || self.drawing_config.compositing.mode == CompositingMode::AlphaOverlay
-                        {
+                        if matches!(
+                            self.drawing_config.compositing.mode,
+                            CompositingMode::Alpha
+                                | CompositingMode::AlphaHeightMap
+                                | CompositingMode::AlphaOverlay
+                                | CompositingMode::AlphaOverlayStart
+                                | CompositingMode::AlphaOverlayCombined
+                        ) {
                             slider(
                                 ui,
                                 "Alpha Min",

@@ -550,6 +550,18 @@ impl PaintVolume for TifXyzVolume {
                 config.compositing.alpha_threshold as f32 / 10000.0,
                 config.compositing.opacity as f32 / 100.0,
             )),
+            CompositingMode::AlphaOverlayStart => Compositor::AlphaOverlayStart(AlphaCompositionState::new(
+                config.compositing.alpha_min as f32 / 255.0,
+                config.compositing.alpha_max as f32 / 255.0,
+                config.compositing.alpha_threshold as f32 / 10000.0,
+                config.compositing.opacity as f32 / 100.0,
+            )),
+            CompositingMode::AlphaOverlayCombined => Compositor::AlphaOverlayCombined(AlphaCompositionState::new(
+                config.compositing.alpha_min as f32 / 255.0,
+                config.compositing.alpha_max as f32 / 255.0,
+                config.compositing.alpha_threshold as f32 / 10000.0,
+                config.compositing.opacity as f32 / 100.0,
+            )),
             CompositingMode::None => Compositor::None(NoCompositionState),
         };
         let composite_direction: i32 = if config.compositing.reverse_direction { -1 } else { 1 };

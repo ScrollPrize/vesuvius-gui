@@ -42,6 +42,19 @@ pub enum CompositingMode {
     /// specially (see its `composite_color_along_normal`); for plain volumes it
     /// behaves exactly like `Alpha`.
     AlphaOverlay,
+    /// Regular alpha walk on the base values, but started at the first sample
+    /// (front-to-back) where the overlay is significant — the overlay only
+    /// locates the surface, it does not contribute opacity or value. If the
+    /// overlay never fires along the ray, the full regular walk runs. Only
+    /// `OverlayVolume` interprets this specially; for plain volumes it behaves
+    /// exactly like `Alpha`.
+    AlphaOverlayStart,
+    /// Alpha walk where base and overlay contribute opacity continuously:
+    /// per sample, alpha = normalized base alpha × normalized overlay alpha
+    /// (value still from the base). Reduces to the regular `Alpha` walk where
+    /// the overlay saturates. Only `OverlayVolume` interprets this specially;
+    /// for plain volumes it behaves exactly like `Alpha`.
+    AlphaOverlayCombined,
 }
 impl CompositingMode {
     pub fn label(&self) -> &str {
@@ -51,14 +64,18 @@ impl CompositingMode {
             CompositingMode::Alpha => "Alpha",
             CompositingMode::AlphaHeightMap => "Alpha Height Map",
             CompositingMode::AlphaOverlay => "Alpha (overlay opacity)",
+            CompositingMode::AlphaOverlayStart => "Alpha (overlay start)",
+            CompositingMode::AlphaOverlayCombined => "Alpha (base × overlay)",
         }
     }
-    pub const VALUES: [CompositingMode; 5] = [
+    pub const VALUES: [CompositingMode; 7] = [
         CompositingMode::None,
         CompositingMode::Max,
         CompositingMode::Alpha,
         CompositingMode::AlphaHeightMap,
         CompositingMode::AlphaOverlay,
+        CompositingMode::AlphaOverlayStart,
+        CompositingMode::AlphaOverlayCombined,
     ];
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
