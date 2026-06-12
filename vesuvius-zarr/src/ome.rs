@@ -21,6 +21,33 @@ fn remote_dataset_present(url: &str, cache_dir: &str, client: &reqwest::blocking
     false
 }
 
+/// Does `path_or_url` point at an OME-zarr *group* (multiscale container with
+/// `.zattrs`/group `zarr.json` at its root and arrays at `0/`, `1/`, ...)
+/// rather than a single zarr array? Detection is content-based because group
+/// directories are not reliably named `.ome.zarr` — e.g. prediction overlays
+/// published as plain `<name>.zarr`. Remote probes can't rely on 404 either:
+/// S3-backed hosts answer 403 AccessDenied for missing keys.
+pub fn is_ome_zarr_group(path_or_url: &str) -> bool {
+    let path_or_url = path_or_url.trim_end_matches('/');
+    if path_or_url.starts_with("http") {
+        // A cached .zattrs from a prior open settles it without a request.
+        let cache_dir = default_cache_dir_for_url(path_or_url);
+        if std::path::Path::new(&format!("{}/.zattrs", cache_dir)).exists() {
+            return true;
+        }
+        if let Ok(res) = ehttp::fetch_blocking(&Request::get(&format!("{}/.zattrs", path_or_url))) {
+            if res.status == 200 {
+                return true;
+            }
+        }
+        let client = build_blocking_client();
+        v3::read_v3_group_attributes_remote(path_or_url, &cache_dir, &client).is_some()
+    } else {
+        std::path::Path::new(&format!("{}/.zattrs", path_or_url)).exists()
+            || v3::read_v3_group_attributes(path_or_url).is_some()
+    }
+}
+
 fn build_blocking_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .pool_max_idle_per_host(32)
@@ -249,12 +276,13 @@ impl OmeZarrContext {
     fn load_attrs(url: &str, local_cache_dir: &str) -> OmeZarrAttrs {
         let target_file = format!("{}/.zattrs", local_cache_dir);
         if !std::path::Path::new(&target_file).exists() {
-            let data = ehttp::fetch_blocking(&Request::get(&format!("{}/.zattrs", url)))
-                .unwrap()
-                .bytes
-                .to_vec();
+            let zattrs_url = format!("{}/.zattrs", url);
+            let res = ehttp::fetch_blocking(&Request::get(&zattrs_url)).unwrap();
+            if res.status != 200 {
+                panic!("Failed to download .zattrs from {}, status: {}", zattrs_url, res.status);
+            }
             std::fs::create_dir_all(std::path::Path::new(&target_file).parent().unwrap()).unwrap();
-            std::fs::write(&target_file, &data).unwrap();
+            std::fs::write(&target_file, &res.bytes).unwrap();
         }
 
         let zarray = std::fs::read_to_string(&target_file).unwrap();

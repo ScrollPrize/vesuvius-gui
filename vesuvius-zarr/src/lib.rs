@@ -10,7 +10,7 @@ use directories::BaseDirs;
 use ehttp::Request;
 use fxhash::{FxBuildHasher, FxHashMap, FxHashSet};
 use libm::modf;
-pub use ome::OmeZarrContext;
+pub use ome::{is_ome_zarr_group, OmeZarrContext};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -323,12 +323,13 @@ impl ZarrFileAccess for RemoteZarrDirectory {
     fn load_array_def(&self) -> ZarrArrayDef {
         let target_file = format!("{}/.zarray", self.local_cache_dir);
         if !std::path::Path::new(&target_file).exists() {
-            let data = ehttp::fetch_blocking(&Request::get(&format!("{}/.zarray", self.url)))
-                .unwrap()
-                .bytes
-                .to_vec();
+            let zarray_url = format!("{}/.zarray", self.url);
+            let res = ehttp::fetch_blocking(&Request::get(&zarray_url)).unwrap();
+            if res.status != 200 {
+                panic!("Failed to download .zarray from {}, status: {}", zarray_url, res.status);
+            }
             std::fs::create_dir_all(std::path::Path::new(&target_file).parent().unwrap()).unwrap();
-            std::fs::write(&target_file, &data).unwrap();
+            std::fs::write(&target_file, &res.bytes).unwrap();
         }
 
         let zarray = std::fs::read_to_string(&target_file).unwrap();

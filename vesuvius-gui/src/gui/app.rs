@@ -17,12 +17,12 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 use vesuvius_atlas_rs::{AtlasMetadata, AtlasSample};
-use vesuvius_rs::catalog::obj_repository::ObjRepository;
-use vesuvius_rs::catalog::Catalog;
-use vesuvius_rs::catalog::Segment;
 use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
 use vesuvius_rs::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
 use vesuvius_rs::cache::{ChunkBackfiller, UnifiedCache, UnifiedVolume};
+use vesuvius_rs::catalog::obj_repository::ObjRepository;
+use vesuvius_rs::catalog::Catalog;
+use vesuvius_rs::catalog::Segment;
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
 use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext, ZarrArray};
@@ -428,7 +428,7 @@ impl TemplateApp {
 
         if let Some(segment_file) = config.overlay_dir {
             if segment_file.contains(".zarr") {
-                let inner: Volume = if segment_file.contains(".ome.zarr") {
+                let inner: Volume = if segment_file.contains(".ome.zarr") || vesuvius_zarr::is_ome_zarr_group(&segment_file) {
                     let (ome, source_key) = if segment_file.starts_with("http") {
                         log::info!("Loading ome-zarr overlay from url: {}", segment_file);
                         (
@@ -444,8 +444,7 @@ impl TemplateApp {
                     };
                     let cache_root = base_cache_dir();
                     let unique_id = unified_volume_key(&source_key, "overlay");
-                    let native: Arc<dyn ChunkBackfiller> =
-                        Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
+                    let native: Arc<dyn ChunkBackfiller> = Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
                     let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
                     let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
                     UnifiedVolume::new(cache).into_volume()
@@ -480,8 +479,7 @@ impl TemplateApp {
         projection: ProjectionKind,
         atlas_metadata: Option<(String, String)>,
     ) {
-        if std::path::Path::new(segment_file).is_dir()
-            && std::path::Path::new(segment_file).join("meta.json").is_file()
+        if std::path::Path::new(segment_file).is_dir() && std::path::Path::new(segment_file).join("meta.json").is_file()
         {
             // tifxyz segmentation directory
             let mut segment: SegmentMode = self.segment_mode.take().unwrap_or_default();
@@ -1906,21 +1904,19 @@ fn blend_mode_combo(ui: &mut Ui, id: &str, mode: &mut BlendMode) -> bool {
         BlendMode::Alpha => "Alpha",
         BlendMode::Multiply => "Multiply",
     };
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(label)
-        .show_ui(ui, |ui| {
-            if ui.selectable_label(*mode == BlendMode::Alpha, "Alpha").clicked() {
-                if *mode != BlendMode::Alpha {
-                    *mode = BlendMode::Alpha;
-                    changed = true;
-                }
+    egui::ComboBox::from_id_salt(id).selected_text(label).show_ui(ui, |ui| {
+        if ui.selectable_label(*mode == BlendMode::Alpha, "Alpha").clicked() {
+            if *mode != BlendMode::Alpha {
+                *mode = BlendMode::Alpha;
+                changed = true;
             }
-            if ui.selectable_label(*mode == BlendMode::Multiply, "Multiply").clicked() {
-                if *mode != BlendMode::Multiply {
-                    *mode = BlendMode::Multiply;
-                    changed = true;
-                }
+        }
+        if ui.selectable_label(*mode == BlendMode::Multiply, "Multiply").clicked() {
+            if *mode != BlendMode::Multiply {
+                *mode = BlendMode::Multiply;
+                changed = true;
             }
-        });
+        }
+    });
     changed
 }
