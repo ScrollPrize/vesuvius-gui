@@ -17,15 +17,13 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 use vesuvius_atlas_rs::{AtlasMetadata, AtlasSample};
-use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
-use vesuvius_rs::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
-use vesuvius_rs::cache::{ChunkBackfiller, UnifiedCache, UnifiedVolume};
+use vesuvius_rs::cache::UnifiedVolume;
 use vesuvius_rs::catalog::obj_repository::ObjRepository;
 use vesuvius_rs::catalog::Catalog;
 use vesuvius_rs::catalog::Segment;
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
-use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext, ZarrArray};
+use vesuvius_zarr::{base_cache_dir, ZarrArray};
 
 pub(crate) const ZOOM_MIN: f32 = 0.01;
 pub(crate) const ZOOM_MAX: f32 = 8.0;
@@ -428,41 +426,59 @@ impl TemplateApp {
 
         if let Some(segment_file) = config.overlay_dir {
             if segment_file.contains(".zarr") {
-                let inner: Volume = if segment_file.contains(".ome.zarr") || vesuvius_zarr::is_ome_zarr_group(&segment_file) {
-                    let (ome, source_key) = if segment_file.starts_with("http") {
-                        log::info!("Loading ome-zarr overlay from url: {}", segment_file);
-                        (
-                            OmeZarrContext::from_url_blocking_to_default_cache_dir(&segment_file),
-                            segment_file.clone(),
-                        )
+                let inner: Option<Volume> = if segment_file.contains(".ome.zarr")
+                    || vesuvius_zarr::is_ome_zarr_group(&segment_file)
+                {
+                    // Resolve + open the overlay through the SAME path the base
+                    // volume and the renderer use, so the unified-cache directory
+                    // key matches (no more `__overlay` vs `__<id>` divergence —
+                    // the suffix is the resolved volume id either way).
+                    let vref = if segment_file.starts_with("http") {
+                        NewVolumeReference::from_url(&segment_file)
                     } else {
-                        log::info!("Loading ome-zarr overlay from path: {}", segment_file);
-                        (
-                            OmeZarrContext::from_path(&segment_file),
-                            format!("file://{}", segment_file),
-                        )
+                        NewVolumeReference::from_path(&segment_file)
                     };
-                    let cache_root = base_cache_dir();
-                    let unique_id = unified_volume_key(&source_key, "overlay");
-                    let native: Arc<dyn ChunkBackfiller> = Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
-                    let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
-                    let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
-                    UnifiedVolume::new(cache).into_volume()
+                    match vref {
+                        Ok(NewVolumeReference::OmeZarr { id, location }) => {
+                            log::info!("Loading ome-zarr overlay '{}' from {}", id, segment_file);
+                            let cache =
+                                NewVolumeReference::open_ome_zarr_cache(&id, &location, base_cache_dir(), false);
+                            Some(UnifiedVolume::new(cache).into_volume())
+                        }
+                        Ok(other) => {
+                            log::error!(
+                                "Overlay '{}' resolved to a non-ome-zarr volume ('{}'); skipping overlay",
+                                segment_file,
+                                other.id()
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            log::error!("Could not resolve ome-zarr overlay '{}': {}; skipping overlay", segment_file, e);
+                            None
+                        }
+                    }
                 } else if segment_file.starts_with("http") {
                     log::info!("Loading zarr overlay from url: {}", segment_file);
-                    ZarrArray::from_url_to_default_cache_dir(&segment_file)
-                        .into_ctx()
-                        .into_ctx()
-                        .into_volume()
+                    Some(
+                        ZarrArray::from_url_to_default_cache_dir(&segment_file)
+                            .into_ctx()
+                            .into_ctx()
+                            .into_volume(),
+                    )
                 } else {
                     log::info!("Loading zarr overlay from path: {}", segment_file);
-                    ZarrArray::<3, u8>::from_path_auto(&segment_file)
-                        .into_ctx()
-                        .into_ctx()
-                        .into_volume()
+                    Some(
+                        ZarrArray::<3, u8>::from_path_auto(&segment_file)
+                            .into_ctx()
+                            .into_ctx()
+                            .into_volume(),
+                    )
                 };
-                app.overlay = Some(OverlayPaintVolume::new(inner.clone(), app.overlay_coloring).into_volume());
-                app.overlay_inner = Some(inner);
+                if let Some(inner) = inner {
+                    app.overlay = Some(OverlayPaintVolume::new(inner.clone(), app.overlay_coloring).into_volume());
+                    app.overlay_inner = Some(inner);
+                }
             }
         }
 
