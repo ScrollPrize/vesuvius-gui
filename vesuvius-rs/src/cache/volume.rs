@@ -655,6 +655,15 @@ impl UnifiedVolume {
         let target_cx = (target_sx / 64) as u32;
         let target_cy = (target_sy / 64) as u32;
         let target_cz = (target_sz / 64) as u32;
+
+        // Trust-resident path (offline renderer): the ensure stage already
+        // made every chunk this tile touches resident, so skip the
+        // per-voxel chunk-state probe + DashMap lookup entirely and read
+        // straight off the target-LOD shard mmap, like the composite path.
+        if self.cache.assume_resident() {
+            return self.interpolate_u8_trusting(xyz, target_lod, target_cx, target_cy, target_cz);
+        }
+
         let key_t = ChunkKey::new(target_lod, target_cx, target_cy, target_cz);
 
         // Shard-slot fast path. If the target shard is mmapped *and* this
@@ -715,7 +724,10 @@ impl UnifiedVolume {
             Some(c) => c,
             None => {
                 let walk_lo = target_lod.min(max_lod);
-                let walk_hi = max_lod;
+                // Offline renderer disables the climb: stay at the target LOD
+                // (ensure-stage pre-fetched it) instead of fetching coarse
+                // chunks that are never rendered.
+                let walk_hi = if self.cache.lod_climb_enabled() { max_lod } else { walk_lo };
                 let mut found: Option<(u8, Arc<ChunkState>)> = None;
                 for lod_try in walk_lo..=walk_hi {
                     let (lx, ly, lz) = coord_at_lod(target_sx, target_sy, target_sz, target_lod, lod_try);
@@ -826,6 +838,102 @@ impl UnifiedVolume {
         result
     }
 
+    /// Trust-resident variant of `interpolate_u8` (see `ChunkCache`'s
+    /// `assume_resident` field). Reads straight off the target-LOD shard
+    /// mmap with no chunk-state probe, no DashMap lookup, and no LOD climb,
+    /// mirroring `composite_along_normal_inner`'s inner read. The offline
+    /// renderer's ensure stage guarantees the bytes are present; anything
+    /// un-arrived reads as zero from the sparse mmap.
+    fn interpolate_u8_trusting(
+        &self,
+        xyz: [f64; 3],
+        target_lod: u8,
+        target_cx: u32,
+        target_cy: u32,
+        target_cz: u32,
+    ) -> u8 {
+        let cx0_f = xyz[0].trunc();
+        let cy0_f = xyz[1].trunc();
+        let cz0_f = xyz[2].trunc();
+        let (fx, fy, fz) = (xyz[0] - cx0_f, xyz[1] - cy0_f, xyz[2] - cz0_f);
+        let cx0 = (cx0_f as i64).max(0) as u64;
+        let cy0 = (cy0_f as i64).max(0) as u64;
+        let cz0 = (cz0_f as i64).max(0) as u64;
+
+        // In-chunk fast case: the +1 trilerp corner stays inside the home
+        // chunk, so all 8 taps come from one shard-slot read.
+        let fast = (cx0 & 63) != 63 && (cy0 & 63) != 63 && (cz0 & 63) != 63;
+        if fast {
+            let (shard, in_shard_idx) = self.shard_decompose(target_cx, target_cy, target_cz);
+            self.populate_shard_slot(target_lod, shard);
+            let chunk_base = {
+                let b = self.local.borrow();
+                match b.shards.get(target_lod as usize).and_then(|s| s.as_ref()) {
+                    // SAFETY: in_shard_idx * CHUNK_VOXELS + CHUNK_VOXELS ≤ shard mmap length.
+                    Some(slot) if slot.shard == shard => unsafe {
+                        slot.base.add((in_shard_idx as usize) * CHUNK_VOXELS)
+                    },
+                    _ => return 0,
+                }
+            };
+            let tx = (cx0 & 63) as usize;
+            let ty = (cy0 & 63) as usize;
+            let tz = (cz0 & 63) as usize;
+            let idx = tz * 64 * 64 + ty * 64 + tx;
+            // SAFETY: idx + 64*64 + 65 ≤ CHUNK_VOXELS since each of tx/ty/tz < 63.
+            let ps: [u8; 8] = unsafe {
+                [
+                    *chunk_base.add(idx),
+                    *chunk_base.add(idx + 1),
+                    *chunk_base.add(idx + 64),
+                    *chunk_base.add(idx + 65),
+                    *chunk_base.add(idx + 64 * 64),
+                    *chunk_base.add(idx + 64 * 64 + 1),
+                    *chunk_base.add(idx + 64 * 64 + 64),
+                    *chunk_base.add(idx + 64 * 64 + 65),
+                ]
+            };
+            return trilerp_q8(frac_q8(fx), frac_q8(fy), frac_q8(fz), ps);
+        }
+
+        // +1 corner crosses into a neighbor chunk — sample each of the 8
+        // corners with its own trusting shard read.
+        let ps = [
+            self.read_voxel_trusting(cx0, cy0, cz0, target_lod),
+            self.read_voxel_trusting(cx0 + 1, cy0, cz0, target_lod),
+            self.read_voxel_trusting(cx0, cy0 + 1, cz0, target_lod),
+            self.read_voxel_trusting(cx0 + 1, cy0 + 1, cz0, target_lod),
+            self.read_voxel_trusting(cx0, cy0, cz0 + 1, target_lod),
+            self.read_voxel_trusting(cx0 + 1, cy0, cz0 + 1, target_lod),
+            self.read_voxel_trusting(cx0, cy0 + 1, cz0 + 1, target_lod),
+            self.read_voxel_trusting(cx0 + 1, cy0 + 1, cz0 + 1, target_lod),
+        ];
+        trilerp_q8(frac_q8(fx), frac_q8(fy), frac_q8(fz), ps)
+    }
+
+    /// Single-voxel trusting read off the target-LOD shard mmap. Companion
+    /// to `interpolate_u8_trusting` for the boundary corner case.
+    #[inline]
+    fn read_voxel_trusting(&self, sx: u64, sy: u64, sz: u64, target_lod: u8) -> u8 {
+        if !self.sample_in_bounds(sx, sy, sz, target_lod) {
+            return 0;
+        }
+        let cx = (sx / 64) as u32;
+        let cy = (sy / 64) as u32;
+        let cz = (sz / 64) as u32;
+        let (shard, in_shard_idx) = self.shard_decompose(cx, cy, cz);
+        self.populate_shard_slot(target_lod, shard);
+        let b = self.local.borrow();
+        match b.shards.get(target_lod as usize).and_then(|s| s.as_ref()) {
+            Some(slot) if slot.shard == shard => {
+                let off = ((sz & 63) as usize) * 64 * 64 + ((sy & 63) as usize) * 64 + (sx & 63) as usize;
+                // SAFETY: in_shard_idx * CHUNK_VOXELS + off < shard mmap length.
+                unsafe { *slot.base.add((in_shard_idx as usize) * CHUNK_VOXELS + off) }
+            }
+            _ => 0,
+        }
+    }
+
     /// Test support: convenience wrapper around `composite_along_normal`
     /// returning the per-sample max along the ray — exercises the same
     /// unswitch + monomorphized inner loop `ObjVolume::paint` reaches via
@@ -922,7 +1030,9 @@ impl UnifiedVolume {
     /// layer entirely.
     fn resolve_chunk(&self, target_lod: u8, max_lod: u8, cx: u32, cy: u32, cz: u32) -> Option<BoundChunk> {
         let walk_lo = target_lod.min(max_lod);
-        for lod_try in walk_lo..=max_lod {
+        // Offline renderer disables the climb (see `interpolate_u8`).
+        let walk_hi = if self.cache.lod_climb_enabled() { max_lod } else { walk_lo };
+        for lod_try in walk_lo..=walk_hi {
             let shift = lod_try - target_lod;
             let cx_try = cx >> shift;
             let cy_try = cy >> shift;

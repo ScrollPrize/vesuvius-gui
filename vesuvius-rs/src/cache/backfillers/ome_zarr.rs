@@ -33,6 +33,14 @@ pub struct OmeZarrBackfiller {
     volume_id: String,
     extent_xyz: [u32; 3],
     arrays: Vec<ZarrArray<3, u8>>,
+    /// When true, the v3 plan covers (decodes + persists) every 64³ cache
+    /// chunk inside a decoded 256³ sub-chunk on the first request, instead
+    /// of just the requesting chunk. The lazy default suits interactive
+    /// slab-browsing (the viewport never visits ~3/4 of a sub-chunk's
+    /// depth); the offline renderer eventually reads the whole sub-chunk,
+    /// so persisting all siblings amortizes the ~500ms decode over 64
+    /// chunks instead of re-decoding from the raw store per sibling.
+    eager_materialization: bool,
 }
 
 impl OmeZarrBackfiller {
@@ -52,7 +60,15 @@ impl OmeZarrBackfiller {
             volume_id: volume_id.into(),
             extent_xyz,
             arrays,
+            eager_materialization: false,
         }
+    }
+
+    /// Enable eager full-sub-chunk materialization (see the
+    /// `eager_materialization` field). Builder-style for use at construction.
+    pub fn with_eager_materialization(mut self, enabled: bool) -> Self {
+        self.eager_materialization = enabled;
+        self
     }
 }
 
@@ -75,7 +91,7 @@ impl ChunkBackfiller for OmeZarrBackfiller {
         // v3, anything that doesn't expose a v3 remote handle) keeps the
         // existing native-chunk path below.
         if let Some(v3) = array.v3_remote_sharded() {
-            return super::ome_zarr_v3::plan_v3_chunk(&v3, &self.volume_id, key, lod);
+            return super::ome_zarr_v3::plan_v3_chunk(&v3, &self.volume_id, key, lod, self.eager_materialization);
         }
 
         let def = array.def();

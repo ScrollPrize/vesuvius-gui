@@ -74,7 +74,7 @@ pub struct ChunkCache {
 }
 
 struct Inner {
-    map: DashMap<ChunkKey, Arc<ChunkState>>,
+    map: DashMap<ChunkKey, Arc<ChunkState>, fxhash::FxBuildHasher>,
     /// Chunks currently being dispatched. Acts as an atomic claim so two
     /// threads racing on the same key don't both run `dispatch_chunk`. We
     /// can't use `map.entry().or_insert_with` for this because the
@@ -140,6 +140,26 @@ struct Inner {
     /// pure wasted bandwidth and CPU. Correctness is unaffected — the
     /// target-LOD chunks are still dispatched.
     preview_prefetch: AtomicBool,
+    /// When false, the per-voxel sample paths (`interpolate_u8`, `get` /
+    /// `resolve_chunk`) do NOT climb to coarser LODs when the target-LOD
+    /// chunk isn't resident — they stay at the target LOD and return 0 for
+    /// not-yet-resident data. The LOD climb exists to show coarse data as a
+    /// progressive preview in the interactive GUI; the offline renderer
+    /// pre-fetches every chunk it needs (ensure stage) and blocks until the
+    /// target LOD is resident, so any climb here only fetches+decodes
+    /// coarse chunks that are never used.
+    lod_climb: AtomicBool,
+    /// When set, the volume's per-voxel interpolation trusts that every
+    /// chunk it samples was made resident ahead of time (the offline
+    /// renderer's ensure stage blocks until each tile's chunks land before
+    /// painting it). `interpolate_u8` then reads straight off the
+    /// target-LOD shard mmap — no `state_or_fetch`, no DashMap lookup, no
+    /// sidecar probe, no LOD climb — exactly like
+    /// `composite_along_normal_inner`. Un-arrived bytes read as zero from
+    /// the sparse mmap. Never enable this in the interactive GUI, where
+    /// chunks stream in lazily and the per-voxel state probe is what drives
+    /// the fetch.
+    assume_resident: AtomicBool,
 }
 
 enum SourceState {
@@ -432,7 +452,7 @@ impl ChunkCache {
         epoch.add_from_sidecar(&disk.sidecar());
 
         let inner = Arc::new(Inner {
-            map: DashMap::new(),
+            map: DashMap::with_hasher(fxhash::FxBuildHasher::default()),
             dispatching: DashMap::new(),
             disk,
             raw: RawStore::new(raw_root),
@@ -446,6 +466,8 @@ impl ChunkCache {
             epoch,
             preview_synthesis: AtomicBool::new(true),
             preview_prefetch: AtomicBool::new(true),
+            lod_climb: AtomicBool::new(true),
+            assume_resident: AtomicBool::new(false),
         });
 
         for i in 0..workers.max(1) {
@@ -742,6 +764,27 @@ impl ChunkCache {
     /// the preview pyramid only wastes download + decode work.
     pub fn set_preview_prefetch(&self, enabled: bool) {
         self.inner.preview_prefetch.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Enable/disable the per-voxel LOD climb (see the `lod_climb` field).
+    /// Leave on for the interactive GUI; turn off for the offline renderer.
+    pub fn set_lod_climb(&self, enabled: bool) {
+        self.inner.lod_climb.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn lod_climb_enabled(&self) -> bool {
+        self.inner.lod_climb.load(Ordering::Relaxed)
+    }
+
+    /// Enable/disable the trust-resident per-voxel read path (see the
+    /// `assume_resident` field). Off for the GUI; on for the offline
+    /// renderer, which pre-resolves every chunk before painting.
+    pub fn set_assume_resident(&self, enabled: bool) {
+        self.inner.assume_resident.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn assume_resident(&self) -> bool {
+        self.inner.assume_resident.load(Ordering::Relaxed)
     }
 }
 

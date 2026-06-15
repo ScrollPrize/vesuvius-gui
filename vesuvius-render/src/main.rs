@@ -250,10 +250,62 @@ fn main() -> Result<()> {
         .unwrap()
         .block_on(main_run(args));
 
+    // Normal / error exit: durably record everything this run wrote. The
+    // per-tile sync watchdog only fires every few seconds, so without this a
+    // run that finishes between ticks loses its last batch of residency and
+    // the next run re-decodes it. (Ctrl+C / SIGTERM are handled separately by
+    // the signal task installed in `main_run`.)
+    UnifiedCache::shutdown_all();
+
     result
 }
 
+/// Flush + persist all cache state on interruption. A partial render that's
+/// Ctrl+C'd (or SIGTERM'd by a job scheduler) would otherwise never reach the
+/// flush at the end of `Rendering::run`, so its decoded chunks never get
+/// marked resident on disk and the next run starts cold. Mirrors the GUI's
+/// `on_exit` hook.
+fn install_shutdown_handler() {
+    tokio::spawn(async {
+        #[cfg(unix)]
+        let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("could not install SIGTERM handler: {}", e);
+                None
+            }
+        };
+
+        #[cfg(unix)]
+        {
+            let term = async {
+                match sigterm.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+
+        log::warn!("interrupted: flushing cache before exit");
+        UnifiedCache::shutdown_all();
+        // 130 = 128 + SIGINT, the conventional "terminated by Ctrl+C" code.
+        std::process::exit(130);
+    });
+}
+
 async fn main_run(args: Args) -> Result<()> {
+    install_shutdown_handler();
+
     let multi = MultiProgress::new();
     monitor_runtime_stats(&multi).await;
 
@@ -669,7 +721,12 @@ fn build_cache(volume_arg: &str, cache_root: PathBuf) -> Result<ChunkCache> {
     };
 
     let unique_id = unified_volume_key(&source_key, &id);
-    let native: Arc<dyn ChunkBackfiller> = Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
+    // Eager materialization: the renderer reads essentially the whole 256³
+    // sub-chunk over the course of a render, so decode it once and persist
+    // all ~64 child cache chunks rather than re-decoding from the raw store
+    // per sibling (the dominant cost observed in trace logs).
+    let native: Arc<dyn ChunkBackfiller> =
+        Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome).with_eager_materialization(true));
     let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
     let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
     // The renderer blocks until each chunk is resident before reading, so the
@@ -680,6 +737,16 @@ fn build_cache(volume_arg: &str, cache_root: PathBuf) -> Result<ChunkCache> {
     // progressive preview / upscale-from-parent, never by the renderer, so
     // fetching+decoding them is pure wasted work (and an accidental LOD climb).
     cache.set_preview_prefetch(false);
+    // And don't let the per-voxel sample paths climb to coarser LODs when a
+    // target-LOD chunk isn't resident: the ensure stage pre-fetches exactly
+    // the chunks each tile reads, so a climb here would only fetch+decode
+    // coarse chunks that are never rendered (the stray high-LOD work).
+    cache.set_lod_climb(false);
+    // Finally, trust that the ensure stage made every sampled chunk resident:
+    // the per-voxel interpolation then reads straight off the target-LOD shard
+    // mmap with no chunk-state probe / DashMap lookup (the dominant per-voxel
+    // cost in the render profile), like the composite-along-normal fast path.
+    cache.set_assume_resident(true);
     Ok(cache)
 }
 

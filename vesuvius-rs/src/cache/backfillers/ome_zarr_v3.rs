@@ -44,6 +44,7 @@ pub(super) fn plan_v3_chunk(
     volume_id: &str,
     key: ChunkKey,
     lod: usize,
+    eager: bool,
 ) -> Result<BackfillPlan, BackfillError> {
     let shape: [usize; 3] = match handle.shape().try_into() {
         Ok(s) => s,
@@ -148,7 +149,11 @@ pub(super) fn plan_v3_chunk(
     // The all-absent case keeps full-box coverage: zero-filling the whole
     // box costs no decode and saves ~63 future dispatches over empty
     // space.
-    let covered = if sources.is_empty() {
+    // `eager` (offline renderer) forces full-sub-chunk coverage even when
+    // there's data to download: the 256³ decode happens once and persists
+    // all ~64 child cache chunks, so later siblings hit disk instead of
+    // re-decoding from the raw store per chunk.
+    let covered = if sources.is_empty() || eager {
         super::ome_zarr::covered_cache_chunks([cz_lo, cy_lo, cx_lo], [cz_hi, cy_hi, cx_hi], &sub, &shape, key.lod)
     } else {
         vec![key]

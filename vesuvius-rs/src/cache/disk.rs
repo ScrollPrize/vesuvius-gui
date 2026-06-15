@@ -252,6 +252,43 @@ impl DiskStore {
             }
         };
 
+        // Targeted cross-run cache visibility: report the resolved root and
+        // how many chunks the just-opened sidecar already marks RESIDENT /
+        // EMPTY (per LOD). A second run over the same space should see
+        // non-zero counts here. All-zero means the prior run's residency did
+        // not persist — sidecar wiped on header mismatch (see the warnings
+        // above), a different root, or the sidecar was never flushed before
+        // exit. Gated on the `vesuvius_rs::cache::disk` target at INFO so the
+        // full-bitmap scan only runs when explicitly enabled.
+        if log::log_enabled!(target: "vesuvius_rs::cache::disk", log::Level::Info) {
+            let mut per_lod: Vec<(u64, u64, u64)> = Vec::with_capacity(sidecar.header.lods.len());
+            let (mut tot_res, mut tot_emp, mut tot_all) = (0u64, 0u64, 0u64);
+            for (lod, dims) in sidecar.header.lods.iter().enumerate() {
+                let n = dims.count();
+                let (mut res, mut emp) = (0u64, 0u64);
+                for idx in 0..n {
+                    match sidecar.get_state(lod as u8, idx) {
+                        STATE_RESIDENT => res += 1,
+                        STATE_EMPTY => emp += 1,
+                        _ => {}
+                    }
+                }
+                tot_res += res;
+                tot_emp += emp;
+                tot_all += n;
+                per_lod.push((res, emp, n));
+            }
+            log::info!(
+                target: "vesuvius_rs::cache::disk",
+                "[cache] open root={}: {} resident, {} empty of {} slots (per-lod res/emp/total: {:?})",
+                root.display(),
+                tot_res,
+                tot_emp,
+                tot_all,
+                per_lod,
+            );
+        }
+
         let lods: Vec<LodSlot> = sidecar
             .header
             .lods
@@ -885,12 +922,17 @@ impl DiskStoreInner {
     /// Returns `(bytes_reclaimed, shards_punched)`.
     fn reclaim_orphan_bytes(&self) -> (u64, u64) {
         let chunk_bytes = CHUNK_VOXELS as u64;
-        // Slop absorbs one chunk's worth of physical noise (a single
-        // failed punch from a prior session, a single in-flight preview
-        // write) so we don't enter the per-shard bitmap walk for
-        // trivially-small discrepancies. Two or more orphan chunks
-        // (≥ 512 KiB reclaimable) triggers the sweep.
-        let threshold_bytes = chunk_bytes;
+        // Slop must absorb the filesystem's own per-file overhead, not
+        // just a chunk or two. A multi-GB sparse shard riddled with holes
+        // carries extent-tree / indirect-block metadata that `blocks()`
+        // counts but `expected_bytes` (chunk data only) does not — observed
+        // at ~0.4–1.5 MiB per shard. That metadata is NOT punchable (it
+        // backs no chunk slot), so a one-chunk slop tripped the sweep on
+        // every startup and punched the whole non-resident extent to
+        // reclaim nothing. 4 MiB clears real-world metadata noise while
+        // still catching genuine multi-chunk orphan runs (crashed writes,
+        // unconfirmed previews), which are MiB–GiB.
+        let threshold_bytes = 16 * chunk_bytes;
         let sca = self.shard_chunks_per_axis;
         let s = sca as u64;
 
@@ -989,7 +1031,14 @@ impl DiskStoreInner {
             // Walk in raster order matching `in_shard_idx = (wz·s + wy)·s + wx`
             // — consecutive iterations have consecutive file offsets so
             // non-RESIDENT runs are contiguous on disk.
-            let mut shard_reclaimed: u64 = 0;
+            let mut punched_any = false;
+            let mut punch = |off: u64, len: u64| match punch_hole_at(&file, off, len) {
+                Ok(()) => punched_any = true,
+                Err(e) => log::warn!(
+                    "[cache] orphan sweep punch lod={} shard={:?} off={} len={}: {}",
+                    lod, shard, off, len, e
+                ),
+            };
             let mut run_start: Option<u64> = None;
             let mut run_end: u64 = 0;
             for wz in 0..s {
@@ -1009,39 +1058,38 @@ impl DiskStoreInner {
                             }
                             run_end = in_shard_idx + 1;
                         } else if let Some(start) = run_start.take() {
-                            let off = start * chunk_bytes;
-                            let len = (run_end - start) * chunk_bytes;
-                            match punch_hole_at(&file, off, len) {
-                                Ok(()) => shard_reclaimed += len,
-                                Err(e) => log::warn!(
-                                    "[cache] orphan sweep punch lod={} shard={:?} off={} len={}: {}",
-                                    lod, shard, off, len, e
-                                ),
-                            }
+                            punch(start * chunk_bytes, (run_end - start) * chunk_bytes);
                         }
                     }
                 }
             }
             if let Some(start) = run_start.take() {
-                let off = start * chunk_bytes;
-                let len = (run_end - start) * chunk_bytes;
-                match punch_hole_at(&file, off, len) {
-                    Ok(()) => shard_reclaimed += len,
-                    Err(e) => log::warn!(
-                        "[cache] orphan sweep punch lod={} shard={:?} off={} len={}: {}",
-                        lod, shard, off, len, e
-                    ),
-                }
+                punch(start * chunk_bytes, (run_end - start) * chunk_bytes);
             }
 
-            if shard_reclaimed > 0 {
-                total_reclaimed += shard_reclaimed;
-                shards_punched += 1;
-                log::debug!(
-                    "[cache] orphan sweep: reclaimed {} bytes in lod {} shard ({},{},{}) (was {}, expected ≤ {})",
-                    shard_reclaimed, lod, shard.0, shard.1, shard.2,
-                    physical_bytes, expected_bytes
-                );
+            if punched_any {
+                // Report bytes ACTUALLY freed (physical delta), not the
+                // logical length of the punched runs — punching an
+                // already-sparse hole reclaims nothing, so summing run
+                // lengths over a mostly-empty shard reported absurd totals
+                // (hundreds of GiB for a few KiB of real orphan blocks).
+                #[cfg(unix)]
+                let physical_after = {
+                    use std::os::unix::fs::MetadataExt;
+                    file.metadata().map(|m| m.blocks() * 512).unwrap_or(physical_bytes)
+                };
+                #[cfg(not(unix))]
+                let physical_after = physical_bytes;
+                let shard_reclaimed = physical_bytes.saturating_sub(physical_after);
+                if shard_reclaimed > 0 {
+                    total_reclaimed += shard_reclaimed;
+                    shards_punched += 1;
+                    log::debug!(
+                        "[cache] orphan sweep: reclaimed {} bytes in lod {} shard ({},{},{}) (was {}, expected ≤ {})",
+                        shard_reclaimed, lod, shard.0, shard.1, shard.2,
+                        physical_bytes, expected_bytes
+                    );
+                }
             }
         }
 
@@ -1091,6 +1139,15 @@ fn do_sync(inner: &DiskStoreInner) {
     if pending.iter().all(|&p| p == 0) {
         // Nothing changed since the last sync; nothing to flush.
         return;
+    }
+    if log::log_enabled!(target: "vesuvius_rs::cache::disk", log::Level::Info) {
+        log::info!(
+            target: "vesuvius_rs::cache::disk",
+            "[cache] sync root={}: flushing {} state transition(s) (per-lod: {:?})",
+            inner.root.display(),
+            pending.iter().sum::<u64>(),
+            pending,
+        );
     }
     // fsync only shards that took data writes since the last sync
     // (`write_atomic` sets the per-shard dirty flag before publishing
