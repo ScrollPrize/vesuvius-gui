@@ -198,18 +198,28 @@ pub struct Args {
     #[clap(long)]
     tile_size: Option<u32>,
 
-    /// Maximum number of tiles to keep in flight at once. Bounds the cache
-    /// working set so the background purge doesn't thrash (default: number of
-    /// CPU threads). Lower this if you see repeated purge/refetch cycles.
+    /// Number of tiles to render in parallel (CPU-bound stage). Defaults to
+    /// the number of CPU threads.
     #[clap(long)]
-    max_inflight_tiles: Option<usize>,
+    render_concurrency: Option<usize>,
+
+    /// How many tiles to fetch/ensure ahead of rendering. The ensure stage
+    /// runs `render_concurrency + prefetch_depth` tiles concurrently, so the
+    /// next tiles' chunks download while the current ones render. Together
+    /// these bound the cache working set (~(render_concurrency +
+    /// prefetch_depth) tiles); lower them if the purge log shows repeated
+    /// evict/refetch cycles (default 4).
+    #[clap(long)]
+    prefetch_depth: Option<usize>,
 
     /// Override the unified cache size cap, in GB (sets VESUVIUS_CACHE_CAP_GB).
     /// Raise this for large renders so the working set fits without purging.
     #[clap(long)]
     cache_cap_gb: Option<u64>,
 
-    /// CPU-bound worker threads to use (default number of cores/threads)
+    /// CPU-bound blocking threads for the tokio runtime (default:
+    /// render_concurrency + prefetch_depth + 2). Only the collect and render
+    /// stages use blocking threads; the ensure stage waits asynchronously.
     #[clap(long)]
     worker_threads: Option<usize>,
 
@@ -220,7 +230,12 @@ pub struct Args {
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let threads = args.worker_threads.unwrap_or(num_cpus::get());
+    // The blocking pool runs the collect + render stages; the ensure stage's
+    // wait is async and holds no blocking thread. Give the pool room for both
+    // the renders and the prefetch tiles' collects so prefetch isn't starved.
+    let render_conc = args.render_concurrency.unwrap_or(num_cpus::get());
+    let prefetch = args.prefetch_depth.unwrap_or(4);
+    let threads = args.worker_threads.unwrap_or(render_conc + prefetch + 2);
 
     // The cache cap is read once (cached) the first time a cache is built, so
     // it has to be set before any cache construction happens.
@@ -260,7 +275,8 @@ struct RenderParams {
     target_dir: String,
     target_format: String,
     compositing: CompositingSettings,
-    max_inflight_tiles: usize,
+    render_concurrency: usize,
+    prefetch_depth: usize,
 }
 impl RenderParams {
     fn render_left(&self) -> usize {
@@ -302,7 +318,8 @@ impl From<&Args> for RenderParams {
             target_dir: args.target_dir.clone(),
             target_format: args.target_format.clone().unwrap_or("png".to_string()),
             compositing: args.alpha.to_settings(),
-            max_inflight_tiles: args.max_inflight_tiles.unwrap_or(num_cpus::get()),
+            render_concurrency: args.render_concurrency.unwrap_or(num_cpus::get()).max(1),
+            prefetch_depth: args.prefetch_depth.unwrap_or(4),
         }
     }
 }
@@ -369,6 +386,12 @@ impl Rendering {
         let tiles = self.uv_tiles();
         let tiles_per_layer = tiles.len() as u64 / self.params.w_range.clone().count() as u64;
 
+        let ensure_bar = ProgressBar::new(tiles.len() as u64)
+            .with_style(count_style.clone().tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈"))
+            .with_message("Ensuring chunks");
+        multi.add(ensure_bar.clone());
+        ensure_bar.tick();
+
         let render_bar = ProgressBar::new(tiles.len() as u64)
             .with_style(count_style.clone().tick_chars("▪▫▨▧▦▩"))
             .with_message("Rendering tiles");
@@ -381,21 +404,43 @@ impl Rendering {
         multi.add(layers_bar.clone());
         layers_bar.tick();
 
-        let buf_size = self.params.max_inflight_tiles.max(1);
+        // Two bounded stages. The ensure stage runs ahead of rendering by
+        // `prefetch_depth` tiles so the next tiles' chunks download (in the
+        // cache's pool) while the current ones render — but only that far
+        // ahead, so the resident working set stays small enough that the
+        // background purge doesn't evict a tile's chunks before we read them.
+        let render_conc = self.params.render_concurrency.max(1);
+        let ensure_conc = (render_conc + self.params.prefetch_depth).max(1);
 
         stream::iter(tiles)
             .map(|tile| {
                 let self_clone = self.clone();
+                let ensure_bar = ensure_bar.clone();
+                async move {
+                    // Collect is CPU work (a paint pass); the ensure wait is
+                    // async so it doesn't tie up a blocking thread.
+                    let chunks = {
+                        let s = self_clone.clone();
+                        tokio::task::spawn_blocking(move || s.chunks_for(&tile)).await.unwrap()
+                    };
+                    self_clone.ensure_resident(&chunks).await;
+                    ensure_bar.inc(1);
+                    tile
+                }
+            })
+            .buffered(ensure_conc)
+            .map(|tile| {
+                let self_clone = self.clone();
                 let render_bar = render_bar.clone();
                 async move {
-                    let tile_image = tokio::task::spawn_blocking(move || self_clone.render_tile_ensured(&tile))
+                    let tile_image = tokio::task::spawn_blocking(move || self_clone.render_tile(&tile))
                         .await
                         .unwrap();
                     render_bar.inc(1);
                     (tile, tile_image)
                 }
             })
-            .buffered(buf_size) // ordered so each `chunks()` group is exactly one layer
+            .buffered(render_conc) // ordered so each `chunks()` group is exactly one layer
             .chunks(tiles_per_layer as usize)
             .map(|tiles| {
                 let self_clone = self.clone();
@@ -408,7 +453,7 @@ impl Rendering {
                     res
                 }
             })
-            .buffer_unordered(buf_size)
+            .buffer_unordered(render_conc)
             .collect::<Vec<_>>()
             .await;
 
@@ -469,14 +514,30 @@ impl Rendering {
     /// `state_or_fetch` on each poll keeps the chunks in the current LRU epoch,
     /// which the purge planner refuses to evict — so a tile's own chunks won't
     /// be purged out from under it between this phase and the render.
-    fn ensure_resident(&self, chunks: &BTreeSet<VolumeChunk>) {
+    /// Dispatch every chunk the tile needs and wait until each one settles
+    /// (Resident/Empty/CooldownMiss — i.e. no longer Pending). The wait is
+    /// async (`tokio::time::sleep`) so it occupies no blocking thread; the
+    /// render stage's blocking threads stay free for tiles whose chunks are
+    /// already resident.
+    async fn ensure_resident(&self, chunks: &BTreeSet<VolumeChunk>) {
+        let keys: Vec<ChunkKey> = chunks.iter().map(|c| c.key()).collect();
+
         // Kick off all fetches first so the cache's downloader pool works them
-        // concurrently, then poll for completion.
-        let mut pending: Vec<ChunkKey> = chunks.iter().map(|c| c.key()).collect();
-        for key in &pending {
-            let _ = self.cache.state_or_fetch(*key);
+        // concurrently. The initial dispatch can plan/queue a lot of work, so
+        // run it on a blocking thread rather than the async executor.
+        {
+            let cache = self.cache.clone();
+            let keys = keys.clone();
+            tokio::task::spawn_blocking(move || {
+                for key in &keys {
+                    let _ = cache.state_or_fetch(*key);
+                }
+            })
+            .await
+            .unwrap();
         }
 
+        let mut pending = keys;
         let deadline = Instant::now() + TILE_ENSURE_TIMEOUT;
         while !pending.is_empty() {
             // Keep only the chunks still in flight. Resident/Empty/CooldownMiss
@@ -497,14 +558,8 @@ impl Rendering {
                 );
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
-
-    fn render_tile_ensured(&self, tile: &UVTile) -> Image {
-        let chunks = self.chunks_for(tile);
-        self.ensure_resident(&chunks);
-        self.render_tile(tile)
     }
 
     fn render_layer_from_tiles(&self, tiles: Vec<(UVTile, Image)>) -> Result<()> {
