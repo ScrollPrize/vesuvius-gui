@@ -100,6 +100,13 @@ struct LocalSlot {
     /// fall back to the slow path instead of returning the kernel's zero
     /// page as if it were data.
     shards: [Option<ShardSlot>; SHARD_SLOTS_PER_LOD],
+    /// Single auxiliary shard slot for cross-shard +1-neighbor reads in
+    /// `composite_along_normal_inner`'s boundary path. Kept separate from
+    /// `shards` so reading a neighbor across a shard plane never evicts
+    /// the home slot mid-ray. A surface that runs parallel to a shard
+    /// plane grazes the *same* neighbor shard for an entire band of rays,
+    /// so one slot amortizes nearly all the opens.
+    neighbor_shard: Option<ShardSlot>,
     /// Chunk-grain slot for the slow path's LOD-fallback result. Lets
     /// repeat samples in the same target chunk skip the pyramid walk
     /// while a resolved coarser parent is the best we have.
@@ -111,6 +118,7 @@ impl Default for LocalSlot {
     fn default() -> Self {
         Self {
             shards: [const { None }; SHARD_SLOTS_PER_LOD],
+            neighbor_shard: None,
             target_key: None,
             chosen: None,
         }
@@ -159,6 +167,7 @@ impl UnifiedVolume {
         for s in b.shards.iter_mut() {
             *s = None;
         }
+        b.neighbor_shard = None;
         b.target_key = None;
         b.chosen = None;
     }
@@ -276,6 +285,40 @@ impl UnifiedVolume {
         }
     }
 
+    /// Resolve the chunk base pointer for a +1 neighbor chunk that lives in
+    /// a *different* shard than the home slot, using the dedicated
+    /// `neighbor_shard` slot so the home slot is never evicted. Returns the
+    /// chunk base pointer plus an `Arc<Mmap>` keepalive so the caller can
+    /// build a slice that outlives the `local` borrow. `None` when the
+    /// neighbor shard is out of grid / can't be opened — caller then treats
+    /// the neighbor corners as 0 (the true volume edge, same as before).
+    #[inline]
+    fn neighbor_chunk_base(&self, lod: u8, ncx: u32, ncy: u32, ncz: u32) -> Option<(*const u8, Arc<Mmap>)> {
+        let (shard, in_shard_idx) = self.shard_decompose(ncx, ncy, ncz);
+        let chunk_off = (in_shard_idx as usize) * CHUNK_VOXELS;
+        {
+            let b = self.local.borrow();
+            if let Some(slot) = b.neighbor_shard.as_ref() {
+                if slot.shard == shard {
+                    // SAFETY: in_shard_idx * CHUNK_VOXELS + CHUNK_VOXELS ≤ shard mmap len.
+                    return Some((unsafe { slot.base.add(chunk_off) }, slot._mmap.clone()));
+                }
+            }
+        }
+        let snap = self.cache.ensure_shard_open(lod, shard)?;
+        let base = snap.mmap.as_ptr();
+        let mmap = snap.mmap.clone();
+        {
+            let mut b = self.local.borrow_mut();
+            b.neighbor_shard = Some(ShardSlot {
+                shard,
+                base,
+                _mmap: snap.mmap,
+                dispatched: snap.dispatched,
+            });
+        }
+        Some((unsafe { base.add(chunk_off) }, mmap))
+    }
 }
 
 fn lod_for(sfactor: u8) -> u8 {
@@ -527,12 +570,14 @@ impl UnifiedVolume {
                 } else {
                     (target_cx, target_cy, target_cz + 1)
                 };
-                // Same-shard neighbor: read direct from the shard mmap
-                // (kernel zero if unwritten, real bytes / upscale fill
-                // if dispatched). Cross-shard +1 corner: we can't
-                // address the neighbor without evicting our home slot,
-                // so treat the neighbor as 0 — at most ~4.7% of samples
-                // × 1/sca chance per axis ≈ 0.04% pixels affected.
+                // Same-shard neighbor: read direct from the home shard
+                // mmap. Cross-shard +1 corner: pull the neighbor chunk via
+                // the dedicated `neighbor_shard` slot so we don't evict the
+                // home slot. (Treating cross-shard neighbors as 0 produced a
+                // visible dark seam wherever a surface runs parallel to a
+                // shard plane — the whole band grazes the boundary instead of
+                // the ~0.04% a random ray direction would.) Either way an
+                // unwritten chunk reads kernel-zero from the sparse mmap.
                 let same_shard = nx_c >> sh == shard.0 && ny_c >> sh == shard.1 && nz_c >> sh == shard.2;
                 let home_slice = unsafe { std::slice::from_raw_parts(chunk_base, CHUNK_VOXELS) };
                 let v = if same_shard {
@@ -545,7 +590,13 @@ impl UnifiedVolume {
                     let neighbor_slice = unsafe { std::slice::from_raw_parts(neighbor_base, CHUNK_VOXELS) };
                     sample_boundary_1axis(home_slice, Some(neighbor_slice), bx, by, bz, txu, tyu, tzu, px, py, pz)
                 } else {
-                    sample_boundary_1axis(home_slice, None, bx, by, bz, txu, tyu, tzu, px, py, pz)
+                    match self.neighbor_chunk_base(target_lod, nx_c, ny_c, nz_c) {
+                        Some((neighbor_base, _keepalive)) => {
+                            let neighbor_slice = unsafe { std::slice::from_raw_parts(neighbor_base, CHUNK_VOXELS) };
+                            sample_boundary_1axis(home_slice, Some(neighbor_slice), bx, by, bz, txu, tyu, tzu, px, py, pz)
+                        }
+                        None => sample_boundary_1axis(home_slice, None, bx, by, bz, txu, tyu, tzu, px, py, pz),
+                    }
                 };
                 if !sink(v) {
                     return;

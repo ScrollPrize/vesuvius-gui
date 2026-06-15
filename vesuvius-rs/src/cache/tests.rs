@@ -1067,6 +1067,94 @@ fn max_along_normal_matches_naive_baseline() {
     }
 }
 
+/// Regression test for the dark seam at shard boundaries. The composite
+/// fast path used to treat a +1 trilinear neighbor that fell in the *next*
+/// shard as 0, dragging boundary samples toward black — invisible at random
+/// ray directions (~0.04%) but a continuous dark line wherever a surface
+/// runs parallel to a shard plane. With a 2-chunk shard side (128 voxels),
+/// the boundaries land at z/x/y = 128, 256, 384, so the rays below straddle
+/// them and the fast path must match the cross-shard-correct naive baseline.
+#[test]
+fn composite_fast_path_has_no_shard_boundary_seam() {
+    use crate::cache::UnifiedVolume;
+    use crate::volume::VoxelVolume;
+
+    let root = tmp_root("shard-seam");
+    let backfiller = Arc::new(SyntheticBackfiller::new(
+        "shard-seam",
+        [512, 512, 512],
+        0,
+        |x, y, z, _| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            h ^= y as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            h ^= z as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            (h >> 24) as u8
+        },
+    ));
+    // 2-chunk shard side → shard boundaries at every 128 voxels.
+    let cache = UnifiedCache::for_cache_dir(&root).open_volume_with_shard_chunks_per_axis(backfiller, 2);
+    assert_eq!(cache.shard_chunks_per_axis(), 2);
+
+    // Pre-warm the 8³ chunk grid the rays cross.
+    for cz in 0..8 {
+        for cy in 0..8 {
+            for cx in 0..8 {
+                cache.wait_for(ChunkKey::new(0, cx, cy, cz), Duration::from_secs(5));
+            }
+        }
+    }
+
+    let vol = UnifiedVolume::new(cache);
+
+    fn naive_max(vol: &UnifiedVolume, base: [f64; 3], dir: [f64; 3], w_lo: f64, w_hi: f64) -> u8 {
+        let n = (w_hi - w_lo) as i32;
+        let mut acc = 0u8;
+        for k in 0..n {
+            let w = w_lo + k as f64;
+            let xyz = [base[0] + w * dir[0], base[1] + w * dir[1], base[2] + w * dir[2]];
+            let v = vol.get_interpolated(xyz, 1);
+            if v > acc {
+                acc = v;
+            }
+        }
+        acc
+    }
+
+    let cases: &[([f64; 3], [f64; 3])] = &[
+        // Crossings perpendicular to each shard plane (z=128, x=256, y=384).
+        ([70.3, 90.7, 120.4], [0.0, 0.0, 1.0]),
+        ([250.4, 70.2, 90.1], [1.0, 0.0, 0.0]),
+        ([70.1, 378.5, 90.9], [0.0, 1.0, 0.0]),
+        // Negative-direction crossing of the x=256 plane.
+        ([262.0, 100.0, 100.0], [-1.0, 0.0, 0.0]),
+        // Near-tangent skim of the z=256 plane — the actual seam geometry,
+        // many consecutive samples sit in the last voxel-layer of the shard.
+        ([90.0, 90.0, 255.4], [0.999, 0.0, 0.001]),
+        ([90.0, 255.4, 90.0], [0.0, 0.999, 0.001]),
+        // Diagonal through a shard corner.
+        ([120.0, 120.0, 120.0], [0.577, 0.577, 0.577]),
+    ];
+
+    for (i, (base, dir)) in cases.iter().enumerate() {
+        let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        let dir = [dir[0] / l, dir[1] / l, dir[2] / l];
+        for &w_lo in &[-12.0_f64, -6.0, 0.0, 5.0] {
+            let w_hi = w_lo + 40.0;
+            let expected = naive_max(&vol, *base, dir, w_lo, w_hi);
+            let got = vol.max_along_normal(*base, dir, w_lo, w_hi, 1);
+            assert_eq!(
+                got, expected,
+                "case {}: base={:?} dir={:?} w in [{}, {})",
+                i, base, dir, w_lo, w_hi
+            );
+        }
+    }
+}
+
 #[test]
 fn second_open_picks_up_disk_cache() {
     let root = tmp_root("persist");

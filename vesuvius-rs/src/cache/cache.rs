@@ -444,8 +444,35 @@ impl UnifiedCache {
             Arc::new(Downloader::with_shared_cull(cull_enabled.clone())),
             self.epoch.clone(),
             cull_enabled,
+            super::disk::SHARD_CHUNKS_PER_AXIS,
         );
         volumes.insert(volume_id, Arc::downgrade(&inner));
+        ChunkCache { inner }
+    }
+
+    /// Test-only sibling of `open_volume` that overrides the shard side so
+    /// multi-shard layouts (and the cross-shard reads in the composite fast
+    /// path) can be exercised without inflating volume extents. Bypasses the
+    /// volume-reuse cache so each call gets a store with the requested layout.
+    #[cfg(test)]
+    pub fn open_volume_with_shard_chunks_per_axis(
+        &self,
+        backfiller: Arc<dyn ChunkBackfiller>,
+        shard_chunks_per_axis: u32,
+    ) -> ChunkCache {
+        let volume_id = backfiller.volume_id();
+        let chunks_root = self.unified_root.join(&volume_id);
+        let _ = std::fs::create_dir_all(&chunks_root);
+        let cull_enabled = Arc::new(AtomicBool::new(true));
+        let inner = ChunkCache::build_inner(
+            chunks_root,
+            backfiller,
+            configured_workers(),
+            Arc::new(Downloader::with_shared_cull(cull_enabled.clone())),
+            self.epoch.clone(),
+            cull_enabled,
+            shard_chunks_per_axis,
+        );
         ChunkCache { inner }
     }
 }
@@ -458,6 +485,7 @@ impl ChunkCache {
         downloader: Arc<Downloader>,
         epoch: Arc<EpochState>,
         cull_enabled: Arc<AtomicBool>,
+        shard_chunks_per_axis: u32,
     ) -> Arc<Inner> {
         let task_queue = LifoQueue::new(MAX_AGE, cull_enabled.clone());
         // Raw-source retention lives at the unified root (volume-agnostic:
@@ -470,7 +498,11 @@ impl ChunkCache {
         let extent = backfiller.voxel_extent();
         let max_lod = backfiller.max_lod();
 
-        let disk = DiskStore::new(chunks_root, volume_id, extent, max_lod);
+        let disk = if shard_chunks_per_axis == super::disk::SHARD_CHUNKS_PER_AXIS {
+            DiskStore::new(chunks_root, volume_id, extent, max_lod)
+        } else {
+            DiskStore::new_with_shard_chunks_per_axis(chunks_root, volume_id, extent, max_lod, shard_chunks_per_axis)
+        };
         // Accumulate this volume's residency into the global histogram.
         // The registry already scanned the unified root at first init
         // and seeded every volume it found on disk, so for an existing

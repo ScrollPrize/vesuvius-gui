@@ -203,7 +203,7 @@ impl DiskStore {
 
     /// Test-only constructor letting callers pick a smaller shard side so
     /// multi-shard layouts can be exercised without inflating extents.
-    fn new_with_shard_chunks_per_axis(
+    pub(crate) fn new_with_shard_chunks_per_axis(
         root: impl Into<PathBuf>,
         volume_id: String,
         extent: [u32; 3],
