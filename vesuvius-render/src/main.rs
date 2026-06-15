@@ -7,7 +7,6 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
@@ -16,8 +15,8 @@ use vesuvius_rs::cache::epoch::CAP_ENV_VAR;
 use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, ChunkKey, ChunkState, UnifiedCache, UnifiedVolume};
 use vesuvius_rs::model::{NewVolumeReference, VolumeLocation};
 use vesuvius_rs::volume::{
-    AffineTransform, CompositingMode, CompositingSettings, DrawingConfig, Image, ObjFile, ObjVolume, PaintVolume,
-    ProjectionKind, Volume, VolumeCons, VoxelPaintVolume, VoxelVolume,
+    AffineTransform, CompositingMode, CompositingSettings, DrawingConfig, Image, ObjFile, ObjVolume, OverlayColoring,
+    OverlayVolume, PaintVolume, ProjectionKind, Volume, VolumeCons, VoxelPaintVolume, VoxelVolume,
 };
 use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext};
 
@@ -65,12 +64,46 @@ impl clap::builder::TypedValueParser for CropParser {
     }
 }
 
-/// Alpha / compositing options. When `--enable-alpha` is set the renderer
-/// composites along the surface normal across the configured layer window
-/// instead of sampling a single plane per layer.
+/// Compositing mode selectable on the command line. Mirrors
+/// `volume::CompositingMode` one-to-one; kept separate so the CLI crate owns
+/// the `clap::ValueEnum` derive. The `alpha-overlay*` modes additionally
+/// require `--overlay` (the overlay supplies per-sample opacity).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CompositeModeArg {
+    None,
+    Max,
+    Alpha,
+    AlphaHeightMap,
+    AlphaOverlay,
+    AlphaOverlayStart,
+    AlphaOverlayCombined,
+}
+impl From<CompositeModeArg> for CompositingMode {
+    fn from(m: CompositeModeArg) -> Self {
+        match m {
+            CompositeModeArg::None => CompositingMode::None,
+            CompositeModeArg::Max => CompositingMode::Max,
+            CompositeModeArg::Alpha => CompositingMode::Alpha,
+            CompositeModeArg::AlphaHeightMap => CompositingMode::AlphaHeightMap,
+            CompositeModeArg::AlphaOverlay => CompositingMode::AlphaOverlay,
+            CompositeModeArg::AlphaOverlayStart => CompositingMode::AlphaOverlayStart,
+            CompositeModeArg::AlphaOverlayCombined => CompositingMode::AlphaOverlayCombined,
+        }
+    }
+}
+
+/// Alpha / compositing options. By default no compositing is done (a single
+/// plane is sampled per layer). `--composite-mode` (or the `--enable-alpha`
+/// shortcut) switches to compositing along the surface normal across the
+/// configured layer window.
 #[derive(Parser, Debug, Clone)]
 pub struct AlphaArgs {
-    /// Enable alpha compositing along the surface normal
+    /// Compositing mode. Overrides `--enable-alpha` when set. The
+    /// `alpha-overlay*` modes require `--overlay`.
+    #[clap(long, value_enum)]
+    composite_mode: Option<CompositeModeArg>,
+
+    /// Shortcut for `--composite-mode alpha`. Ignored if `--composite-mode` is set.
     #[clap(long, default_value_t = false)]
     enable_alpha: bool,
 
@@ -98,6 +131,18 @@ pub struct AlphaArgs {
     #[clap(long)]
     opacity: Option<u16>,
 
+    /// AlphaOverlayCombined only: how much of the plain (unmasked) alpha
+    /// result is crossfaded into the overlay-masked result, in percent
+    /// (0-100). 0 shows the pure mask, 100 reproduces the regular alpha walk.
+    #[clap(long)]
+    overlay_background: Option<u8>,
+
+    /// AlphaOverlayCombined only: how strongly the masked value is normalized
+    /// by its accumulated coverage, in percent (0-100). 0 keeps the classic
+    /// premultiplied look, 100 fully normalizes.
+    #[clap(long)]
+    overlay_value_norm: Option<u8>,
+
     /// Reverse the compositing direction along the normal
     #[clap(long, default_value_t = false)]
     composite_reverse_direction: bool,
@@ -105,10 +150,10 @@ pub struct AlphaArgs {
 impl AlphaArgs {
     fn to_settings(&self) -> CompositingSettings {
         let mut settings = DrawingConfig::default().compositing;
-        settings.mode = if self.enable_alpha {
-            CompositingMode::Alpha
-        } else {
-            CompositingMode::None
+        settings.mode = match self.composite_mode {
+            Some(mode) => mode.into(),
+            None if self.enable_alpha => CompositingMode::Alpha,
+            None => CompositingMode::None,
         };
         if let Some(v) = self.composite_layers_in_front {
             settings.layers_in_front = v;
@@ -127,6 +172,12 @@ impl AlphaArgs {
         }
         if let Some(v) = self.opacity {
             settings.opacity = v;
+        }
+        if let Some(v) = self.overlay_background {
+            settings.overlay_background = v;
+        }
+        if let Some(v) = self.overlay_value_norm {
+            settings.overlay_value_norm = v;
         }
         settings.reverse_direction = self.composite_reverse_direction;
         settings
@@ -189,6 +240,13 @@ pub struct Args {
     /// The ome-zarr volume to render against, given as an http(s) URL or a local path.
     #[clap(short, long)]
     volume: Option<String>,
+
+    /// Optional ome-zarr overlay/label volume (e.g. an ink prediction) composited
+    /// with the base volume, given as an http(s) URL or a local path. Required for
+    /// the `alpha-overlay*` compositing modes, where the overlay supplies per-sample
+    /// opacity while the base volume supplies the CT value.
+    #[clap(long)]
+    overlay: Option<String>,
 
     /// Override the data directory. By default, a directory in the user's cache is used
     #[clap(short, long)]
@@ -400,15 +458,46 @@ impl VolumeChunk {
     }
 }
 
+/// The LOD-0 chunks one tile samples, split by the cache they live in. With no
+/// overlay configured `overlay` is empty.
+#[derive(Default)]
+struct TileChunks {
+    base: BTreeSet<VolumeChunk>,
+    overlay: BTreeSet<VolumeChunk>,
+}
+
 #[derive(Clone)]
 struct Rendering {
     params: RenderParams,
     obj: Arc<ObjFile>,
     cache: ChunkCache,
+    /// Set when `--overlay` is given: a second cache over the overlay/label
+    /// volume, wrapped together with the base via `OverlayVolume` at render
+    /// time so the `alpha-overlay*` modes can read its per-sample opacity.
+    overlay_cache: Option<ChunkCache>,
 }
 
 impl Rendering {
     fn new(params: RenderParams, args: &Args) -> Result<Self> {
+        // The overlay-aware modes read opacity from the overlay volume; without
+        // one they would silently degrade to a plain `Alpha` walk (that's how
+        // `OverlayVolume` falls back for non-overlay backends, but here there's
+        // no `OverlayVolume` at all), so fail fast — before the expensive obj
+        // load — instead.
+        if args.overlay.is_none()
+            && matches!(
+                params.compositing.mode,
+                CompositingMode::AlphaOverlay
+                    | CompositingMode::AlphaOverlayStart
+                    | CompositingMode::AlphaOverlayCombined
+            )
+        {
+            return Err(anyhow!(
+                "compositing mode {:?} requires an overlay; pass --overlay <ome-zarr url or path>",
+                params.compositing.mode
+            ));
+        }
+
         let obj = Arc::new(ObjVolume::load_obj(&args.obj, &resolve_transform(args)?, params.projection));
 
         let cache_root = args
@@ -421,9 +510,19 @@ impl Rendering {
             .volume
             .clone()
             .ok_or_else(|| anyhow!("--volume <ome-zarr url or local path> is required"))?;
-        let cache = build_cache(&volume_arg, cache_root)?;
+        let cache = build_cache(&volume_arg, cache_root.clone())?;
 
-        Ok(Self { params, obj, cache })
+        let overlay_cache = match args.overlay.as_ref() {
+            Some(overlay_arg) => Some(build_cache(overlay_arg, cache_root)?),
+            None => None,
+        };
+
+        Ok(Self {
+            params,
+            obj,
+            cache,
+            overlay_cache,
+        })
     }
 
     async fn run(&self, multi: &MultiProgress) -> Result<()> {
@@ -534,20 +633,37 @@ impl Rendering {
     }
 
     /// Paint the tile once with a chunk-collecting backend (no data fetched)
-    /// to learn exactly which LOD-0 chunks the render will sample.
-    fn chunks_for(&self, UVTile { u, v, w }: &UVTile) -> BTreeSet<VolumeChunk> {
-        let dummy = Rc::new(TileCollectingVolume::new());
+    /// to learn exactly which LOD-0 chunks the render will sample. When an
+    /// overlay is configured the collectors are wrapped in an `OverlayVolume`
+    /// exactly like the render pass, so the overlay's sampled chunks are
+    /// collected too (in their own cache's coordinate space).
+    fn chunks_for(&self, UVTile { u, v, w }: &UVTile) -> TileChunks {
         let width = self.params.width;
         let height = self.params.height;
         let tile_width = self.params.tile_size;
         let tile_height = self.params.tile_size;
-        let world = ObjVolume::new(
-            self.obj.clone(),
-            Volume::from_ref(Arc::new(dummy.as_ref().clone())),
-            width,
-            height,
-        )
-        .into_volume();
+
+        // Keep handles to the *same* collector instances that `paint` samples.
+        // (`TileCollectingVolume`'s state is a `RefCell` that deep-clones, so
+        // wrapping a clone in the `Volume` and reading the original back would
+        // observe an empty set — the painted data lives in the clone.)
+        let base_collector = Arc::new(TileCollectingVolume::new());
+        let overlay_collector = self
+            .overlay_cache
+            .as_ref()
+            .map(|_| Arc::new(TileCollectingVolume::new()));
+
+        let inner: Volume = match overlay_collector.as_ref() {
+            Some(overlay_collector) => OverlayVolume::new(
+                Volume::from_ref(base_collector.clone()),
+                Volume::from_ref(overlay_collector.clone()),
+                OverlayColoring::default(),
+            )
+            .into_volume(),
+            None => Volume::from_ref(base_collector.clone()),
+        };
+
+        let world = ObjVolume::new(self.obj.clone(), inner, width, height).into_volume();
 
         let mut image = Image::new(tile_width, tile_height);
         let xyz = [
@@ -557,8 +673,25 @@ impl Rendering {
         ];
         let config = self.params.drawing_config();
         world.paint(xyz, 0, 1, 2, tile_width, tile_height, 1, 1, &config, &mut image);
-        let res = dummy.state.replace(Default::default()).requested_tiles;
-        res.into_iter().map(Into::into).collect()
+
+        let base = base_collector
+            .state
+            .replace(Default::default())
+            .requested_tiles
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let overlay = overlay_collector
+            .map(|c| {
+                c.state
+                    .replace(Default::default())
+                    .requested_tiles
+                    .into_iter()
+                    .map(Into::into)
+                    .collect()
+            })
+            .unwrap_or_default();
+        TileChunks { base, overlay }
     }
 
     /// Dispatch every chunk the tile needs into the unified cache and block
@@ -571,41 +704,53 @@ impl Rendering {
     /// async (`tokio::time::sleep`) so it occupies no blocking thread; the
     /// render stage's blocking threads stay free for tiles whose chunks are
     /// already resident.
-    async fn ensure_resident(&self, chunks: &BTreeSet<VolumeChunk>) {
-        let keys: Vec<ChunkKey> = chunks.iter().map(|c| c.key()).collect();
+    async fn ensure_resident(&self, chunks: &TileChunks) {
+        // One (cache, keys) group per backing store. With no overlay the base
+        // group is the only one; the overlay group reads from its own cache in
+        // the same chunk-coordinate space.
+        let mut groups: Vec<(ChunkCache, Vec<ChunkKey>)> =
+            vec![(self.cache.clone(), chunks.base.iter().map(|c| c.key()).collect())];
+        if let Some(overlay_cache) = self.overlay_cache.as_ref() {
+            groups.push((overlay_cache.clone(), chunks.overlay.iter().map(|c| c.key()).collect()));
+        }
 
-        // Kick off all fetches first so the cache's downloader pool works them
+        // Kick off all fetches first so each cache's downloader pool works them
         // concurrently. The initial dispatch can plan/queue a lot of work, so
         // run it on a blocking thread rather than the async executor.
         {
-            let cache = self.cache.clone();
-            let keys = keys.clone();
+            let groups = groups.clone();
             tokio::task::spawn_blocking(move || {
-                for key in &keys {
-                    let _ = cache.state_or_fetch(*key);
+                for (cache, keys) in &groups {
+                    for key in keys {
+                        let _ = cache.state_or_fetch(*key);
+                    }
                 }
             })
             .await
             .unwrap();
         }
 
-        let mut pending = keys;
         let deadline = Instant::now() + TILE_ENSURE_TIMEOUT;
-        while !pending.is_empty() {
+        loop {
             // Keep only the chunks still in flight. Resident/Empty/CooldownMiss
             // are all settled and won't change by waiting longer — in
             // particular CooldownMiss covers out-of-bounds samples (routine at
             // surface edges and along composite normals), so we stop polling
             // those and let the read return 0 there rather than spin to the
             // timeout.
-            pending.retain(|key| matches!(self.cache.state_or_fetch(*key).as_ref(), ChunkState::Pending { .. }));
-            if pending.is_empty() {
+            let mut any_pending = false;
+            for (cache, keys) in groups.iter_mut() {
+                keys.retain(|key| matches!(cache.state_or_fetch(*key).as_ref(), ChunkState::Pending { .. }));
+                any_pending |= !keys.is_empty();
+            }
+            if !any_pending {
                 break;
             }
             if Instant::now() >= deadline {
+                let pending: usize = groups.iter().map(|(_, keys)| keys.len()).sum();
                 log::warn!(
                     "ensure_resident: {} chunk(s) still pending after {:?}; rendering with partial data",
-                    pending.len(),
+                    pending,
                     TILE_ENSURE_TIMEOUT,
                 );
                 break;
@@ -656,7 +801,18 @@ impl Rendering {
 
         // Fresh per-tile reader over the shared cache: UnifiedVolume holds a
         // thread-local hot slot (!Sync), so each render thread needs its own.
-        let vol = UnifiedVolume::new(self.cache.clone()).into_volume();
+        let base = UnifiedVolume::new(self.cache.clone()).into_volume();
+        // Wrap with the overlay when configured so the overlay-aware modes can
+        // read its per-sample opacity (the value still comes from the base).
+        // Mirrors the GUI's `OverlayVolume` wiring; the chunks_for pass wraps
+        // the collectors the same way so the ensured chunks match.
+        let vol = match self.overlay_cache.as_ref() {
+            Some(overlay_cache) => {
+                let overlay = UnifiedVolume::new(overlay_cache.clone()).into_volume();
+                OverlayVolume::new(base, overlay, OverlayColoring::default()).into_volume()
+            }
+            None => base,
+        };
         let world = ObjVolume::new(self.obj.clone(), vol, self.params.width, self.params.height).into_volume();
         let config = self.params.drawing_config();
 
