@@ -160,6 +160,10 @@ struct Inner {
     /// chunks stream in lazily and the per-voxel state probe is what drives
     /// the fetch.
     assume_resident: AtomicBool,
+    /// Shared with both work queues (downloader + task). When false, neither
+    /// queue culls stale entries by `MAX_AGE` at pop. See
+    /// `ChunkCache::set_culling` and `LifoQueue::cull_enabled`.
+    cull_enabled: Arc<AtomicBool>,
 }
 
 enum SourceState {
@@ -408,12 +412,16 @@ impl UnifiedCache {
         }
         let chunks_root = self.unified_root.join(&volume_id);
         let _ = std::fs::create_dir_all(&chunks_root);
+        // One cull flag shared by the downloader queue and the task queue so
+        // `set_culling` toggles both at once (default: culling on).
+        let cull_enabled = Arc::new(AtomicBool::new(true));
         let inner = ChunkCache::build_inner(
             chunks_root,
             backfiller,
             DEFAULT_WORKERS,
-            Arc::new(Downloader::new()),
+            Arc::new(Downloader::with_shared_cull(cull_enabled.clone())),
             self.epoch.clone(),
+            cull_enabled,
         );
         volumes.insert(volume_id, Arc::downgrade(&inner));
         ChunkCache { inner }
@@ -427,8 +435,9 @@ impl ChunkCache {
         workers: usize,
         downloader: Arc<Downloader>,
         epoch: Arc<EpochState>,
+        cull_enabled: Arc<AtomicBool>,
     ) -> Arc<Inner> {
-        let task_queue = LifoQueue::new(MAX_AGE);
+        let task_queue = LifoQueue::new(MAX_AGE, cull_enabled.clone());
         // Raw-source retention lives at the unified root (volume-agnostic:
         // keys are (url, range) hashes), so every volume shares one budget.
         let raw_root = root.parent().map(|p| p.join("raw")).unwrap_or_else(|| root.join("raw"));
@@ -468,6 +477,7 @@ impl ChunkCache {
             preview_prefetch: AtomicBool::new(true),
             lod_climb: AtomicBool::new(true),
             assume_resident: AtomicBool::new(false),
+            cull_enabled,
         });
 
         for i in 0..workers.max(1) {
@@ -669,6 +679,18 @@ impl ChunkCache {
     /// — that loop reads the shard mmap unconditionally and relies on
     /// pre-dispatch (or the upscale fill) for the bytes to be there.
     pub fn touch_aabb(&self, min: [f64; 3], max: [f64; 3], target_lod: u8) {
+        // When the caller trusts pre-ensured residency (the offline renderer),
+        // skip per-triangle dispatch entirely. The renderer's ensure stage
+        // already fetched and blocked on exactly the chunks each tile *samples*,
+        // and the per-voxel/composite read paths then go straight to the shard
+        // mmap (see `assume_resident`). Re-dispatching the triangle's whole
+        // bounding box here would fetch the box's never-sampled chunks too —
+        // wasted bandwidth on every run, and since the render doesn't wait for
+        // them they're abandoned in flight and never persist, so the next run
+        // re-fetches them.
+        if self.inner.assume_resident.load(Ordering::Relaxed) {
+            return;
+        }
         let max_lod = self.max_lod();
         if target_lod > max_lod {
             return;
@@ -785,6 +807,22 @@ impl ChunkCache {
 
     pub fn assume_resident(&self) -> bool {
         self.inner.assume_resident.load(Ordering::Relaxed)
+    }
+
+    /// Enable/disable age-based culling of stale queue entries in both work
+    /// queues (default: enabled). The interactive GUI leaves it on so fetches
+    /// for a viewport the user scrolled past die at the tail instead of
+    /// competing with current work. The offline renderer turns it OFF: it
+    /// dispatches exactly the chunks each tile samples and then blocks until
+    /// they land, but on a slow link a wanted fetch can sit queued longer than
+    /// `MAX_AGE`; culling it there strands the chunk in a cooldown, so the
+    /// ensure stage either spins to its timeout (apparent hang) or gives up and
+    /// paints incomplete data — and the bytes are never persisted, so the next
+    /// run re-fetches them. Compositing makes this far more likely because each
+    /// tile then samples a whole slab of chunks along the normal rather than a
+    /// single plane.
+    pub fn set_culling(&self, enabled: bool) {
+        self.inner.cull_enabled.store(enabled, Ordering::Relaxed);
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::{
     cache::{
         backfillers::ome_zarr::OmeZarrBackfiller, backfillers::synthesized_lod::SynthesizedLodBackfiller,
-        ChunkBackfiller, UnifiedCache, UnifiedVolume,
+        ChunkBackfiller, ChunkCache, UnifiedCache, UnifiedVolume,
     },
     downloader::SimpleDownloader,
     volume::{LayersMappedVolume, Volume, VolumeGrid500Mapped, VolumeGrid64x4Mapped, VoxelPaintVolume},
@@ -288,6 +288,42 @@ impl NewVolumeReference {
             NewVolumeReference::Layers { id, .. } => id.clone(),
         }
     }
+    /// Single source of truth for opening an OME-Zarr volume's unified-cache
+    /// `ChunkCache`. The on-disk volume key — and therefore the cache directory
+    /// name under `<base>/unified/` — is derived here from the source URL/path
+    /// and the volume id, so the GUI base volume, the GUI overlay, and the
+    /// offline renderer all land on the *same* directory for the same source
+    /// instead of inventing their own suffix (the overlay used to hardcode
+    /// `__overlay` while the renderer used `__<id>`, splitting the cache).
+    ///
+    /// `eager_materialization` decodes and persists a whole 256³ sub-chunk on a
+    /// chunk's first touch — worthwhile for the renderer (it reads ~everything),
+    /// left off for the interactive GUI.
+    pub fn open_ome_zarr_cache(
+        id: &str,
+        location: &VolumeLocation,
+        cache_root: std::path::PathBuf,
+        eager_materialization: bool,
+    ) -> ChunkCache {
+        let (ome, source_key) = match location {
+            VolumeLocation::RemoteUrl(url) => (
+                OmeZarrContext::from_url_blocking_to_default_cache_dir(url),
+                url.clone(),
+            ),
+            VolumeLocation::LocalPath(path) => (OmeZarrContext::from_path(path), format!("file://{}", path)),
+        };
+        // Embed the source's sha256 into the on-disk volume key so two sources
+        // advertising the same volume_id can coexist under one unified root.
+        let unique_id = unified_volume_key(&source_key, id);
+        // Pad pyramidal OME-Zarr volumes with synthesized coarse levels so panes
+        // at extreme zoom-out paint a downsampled preview instead of black. The
+        // wrapper gates itself off for sources that aren't already pyramidal.
+        let native: Arc<dyn ChunkBackfiller> =
+            Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome).with_eager_materialization(eager_materialization));
+        let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
+        UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller)
+    }
+
     pub fn volume(&self, params: &VolumeCreationParams) -> Volume {
         match self {
             NewVolumeReference::Volume64x4(v) => {
@@ -307,34 +343,11 @@ impl NewVolumeReference {
                 v.into_volume()
             }
             NewVolumeReference::OmeZarr { id, location } => {
-                let (ome, source_key) = match location {
-                    VolumeLocation::RemoteUrl(url) => (
-                        OmeZarrContext::from_url_blocking_to_default_cache_dir(url),
-                        url.clone(),
-                    ),
-                    VolumeLocation::LocalPath(path) => (OmeZarrContext::from_path(path), format!("file://{}", path)),
-                };
-                // Use the single process-global cache base so every
-                // zarr store ends up under one `<base>/unified/` dir
-                // and shares one epoch counter / purge plan.
-                // UnifiedCache::for_cache_dir appends `/unified/` so we
-                // pass the base, not the unified subdir directly.
-                let cache_root = base_cache_dir();
-                // Embed the source's sha256 into the on-disk volume
-                // key so two sources advertising the same volume_id
-                // can coexist under one unified root.
-                let unique_id = unified_volume_key(&source_key, &id);
-                // Pad pyramidal OME-Zarr volumes with synthesized coarse
-                // levels so panes at extreme zoom-out paint a downsampled
-                // preview instead of black. The wrapper gates itself off
-                // for sources that aren't already pyramidal — a coarsest
-                // native level over 32 chunks (any partial-pyramid /
-                // single-level zarr) bypasses synthesis entirely so we
-                // don't end up averaging thousands of full-res chunks.
-                let native: Arc<dyn ChunkBackfiller> =
-                    Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
-                let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
-                let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
+                // Use the single process-global cache base so every zarr store
+                // ends up under one `<base>/unified/` dir and shares one epoch
+                // counter / purge plan. (`open_ome_zarr_cache` is the shared
+                // construction the renderer and the overlay path also use.)
+                let cache = Self::open_ome_zarr_cache(id, location, base_cache_dir(), false);
                 UnifiedVolume::new(cache).into_volume()
             }
             NewVolumeReference::Zarr { location, .. } => match location {

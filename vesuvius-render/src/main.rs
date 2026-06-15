@@ -9,16 +9,14 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
-use vesuvius_rs::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
 use vesuvius_rs::cache::epoch::CAP_ENV_VAR;
-use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, ChunkKey, ChunkState, UnifiedCache, UnifiedVolume};
-use vesuvius_rs::model::{NewVolumeReference, VolumeLocation};
+use vesuvius_rs::cache::{ChunkCache, ChunkKey, ChunkState, UnifiedCache, UnifiedVolume};
+use vesuvius_rs::model::NewVolumeReference;
 use vesuvius_rs::volume::{
     AffineTransform, CompositingMode, CompositingSettings, DrawingConfig, Image, ObjFile, ObjVolume, OverlayColoring,
     OverlayVolume, PaintVolume, ProjectionKind, Volume, VolumeCons, VoxelPaintVolume, VoxelVolume,
 };
-use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext};
+use vesuvius_zarr::base_cache_dir;
 
 /// Wall-clock budget for making one tile's chunks resident before we give up
 /// and render with whatever is available. Chunk fetches are normally far
@@ -871,20 +869,13 @@ fn build_cache(volume_arg: &str, cache_root: PathBuf) -> Result<ChunkCache> {
         }
     };
 
-    let (ome, source_key) = match &location {
-        VolumeLocation::RemoteUrl(url) => (OmeZarrContext::from_url_blocking_to_default_cache_dir(url), url.clone()),
-        VolumeLocation::LocalPath(path) => (OmeZarrContext::from_path(path), format!("file://{}", path)),
-    };
-
-    let unique_id = unified_volume_key(&source_key, &id);
-    // Eager materialization: the renderer reads essentially the whole 256³
-    // sub-chunk over the course of a render, so decode it once and persist
-    // all ~64 child cache chunks rather than re-decoding from the raw store
-    // per sibling (the dominant cost observed in trace logs).
-    let native: Arc<dyn ChunkBackfiller> =
-        Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome).with_eager_materialization(true));
-    let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
-    let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
+    // Open the unified cache through the shared constructor so the on-disk
+    // volume key matches the GUI's exactly (same source + id → same directory),
+    // rather than re-deriving it here and risking divergence. Eager
+    // materialization is on: the renderer reads essentially the whole 256³
+    // sub-chunk over a run, so decode it once and persist all ~64 child cache
+    // chunks rather than re-decoding from the raw store per sibling.
+    let cache = NewVolumeReference::open_ome_zarr_cache(&id, &location, cache_root, true);
     // The renderer blocks until each chunk is resident before reading, so the
     // upscaled-from-parent preview is never read — skip the per-chunk upsample.
     cache.set_preview_synthesis(false);
@@ -903,6 +894,13 @@ fn build_cache(volume_arg: &str, cache_root: PathBuf) -> Result<ChunkCache> {
     // mmap with no chunk-state probe / DashMap lookup (the dominant per-voxel
     // cost in the render profile), like the composite-along-normal fast path.
     cache.set_assume_resident(true);
+    // Never cull queued fetches by age. The ensure stage dispatches exactly
+    // the chunks each tile samples and blocks until they land, but a slow link
+    // (or a composite tile's thick slab of chunks) can leave a wanted fetch
+    // queued past MAX_AGE. Culling it there would strand the chunk in a
+    // cooldown — the ensure stage would then spin to its timeout (hang) or
+    // paint incomplete data, and the bytes would never persist for the next run.
+    cache.set_culling(false);
     Ok(cache)
 }
 

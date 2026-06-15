@@ -21,7 +21,7 @@ use super::state::ChunkKey;
 use super::MAX_AGE;
 use dashmap::DashMap;
 use reqwest::blocking::Client;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,12 +73,19 @@ impl Downloader {
     }
 
     pub fn with_workers(workers: usize) -> Self {
-        Self::with_settings(workers, MAX_AGE)
+        Self::with_settings(workers, MAX_AGE, Arc::new(AtomicBool::new(true)))
     }
 
-    pub fn with_settings(workers: usize, max_age: Duration) -> Self {
+    /// Construct with a caller-owned cull flag so the cache can share one
+    /// `Arc<AtomicBool>` across the downloader queue and its task queue and
+    /// toggle both with a single `ChunkCache::set_culling`.
+    pub fn with_shared_cull(cull_enabled: Arc<AtomicBool>) -> Self {
+        Self::with_settings(DEFAULT_HTTP_WORKERS, MAX_AGE, cull_enabled)
+    }
+
+    pub fn with_settings(workers: usize, max_age: Duration, cull_enabled: Arc<AtomicBool>) -> Self {
         let inner = Arc::new(DownloaderInner {
-            queue: LifoQueue::new(max_age),
+            queue: LifoQueue::new(max_age, cull_enabled),
             active: DashMap::new(),
             in_flight: AtomicUsize::new(0),
         });

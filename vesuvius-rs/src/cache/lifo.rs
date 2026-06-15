@@ -23,13 +23,23 @@
 
 use super::state::ChunkKey;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub(super) struct LifoQueue<T> {
     inner: Mutex<Inner<T>>,
     not_empty: Condvar,
     max_age: Duration,
+    /// When false, the `max_age` cull at pop is disabled — every entry runs
+    /// when LIFO order reaches it, no matter how stale. Shared (same `Arc`)
+    /// with the cache's other queue and toggled via `ChunkCache::set_culling`.
+    /// The interactive GUI leaves culling on so work for a viewport the user
+    /// has scrolled past dies at the tail; the offline renderer turns it off,
+    /// because it dispatches exactly the chunks it wants and a slow link can
+    /// easily leave a wanted fetch queued past `max_age` — culling it there
+    /// strands the chunk in a cooldown and the ensure stage never sees it land.
+    cull_enabled: Arc<AtomicBool>,
 }
 
 struct Inner<T> {
@@ -71,7 +81,7 @@ fn rev_seq(seq: u64) -> u64 {
 }
 
 impl<T> LifoQueue<T> {
-    pub fn new(max_age: Duration) -> Self {
+    pub fn new(max_age: Duration, cull_enabled: Arc<AtomicBool>) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 entries: BTreeMap::new(),
@@ -80,6 +90,7 @@ impl<T> LifoQueue<T> {
             }),
             not_empty: Condvar::new(),
             max_age,
+            cull_enabled,
         }
     }
 
@@ -168,7 +179,10 @@ impl<T> LifoQueue<T> {
                     q.chunk_index.remove(&entry.chunk);
                 }
             }
-            if !entry.durable && entry.added_at.elapsed() > self.max_age {
+            if !entry.durable
+                && self.cull_enabled.load(Ordering::Relaxed)
+                && entry.added_at.elapsed() > self.max_age
+            {
                 dropped.push(entry);
                 continue;
             }
