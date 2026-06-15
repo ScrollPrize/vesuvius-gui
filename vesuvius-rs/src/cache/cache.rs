@@ -69,6 +69,28 @@ const PERMANENT_COOLDOWN: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 // while leaving half the cores to paint/decode rayon work.
 const DEFAULT_WORKERS: usize = 8;
 
+/// Env var overriding the cache worker-thread count. Useful on large hosts
+/// where the default 8 can't keep the extract/decode backlog drained.
+/// A value of `0` (or a parse failure) falls back to the default.
+pub const WORKERS_ENV_VAR: &str = "VESUVIUS_CACHE_WORKERS";
+
+/// Resolve the worker count from `VESUVIUS_CACHE_WORKERS`, falling back to
+/// `DEFAULT_WORKERS` when unset, unparseable, or zero.
+fn configured_workers() -> usize {
+    match std::env::var(WORKERS_ENV_VAR) {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) | Err(_) => {
+                if !v.trim().is_empty() {
+                    log::warn!("{} must be a positive integer; using default", WORKERS_ENV_VAR);
+                }
+                DEFAULT_WORKERS
+            }
+            Ok(n) => n,
+        },
+        Err(_) => DEFAULT_WORKERS,
+    }
+}
+
 pub struct ChunkCache {
     inner: Arc<Inner>,
 }
@@ -418,7 +440,7 @@ impl UnifiedCache {
         let inner = ChunkCache::build_inner(
             chunks_root,
             backfiller,
-            DEFAULT_WORKERS,
+            configured_workers(),
             Arc::new(Downloader::with_shared_cull(cull_enabled.clone())),
             self.epoch.clone(),
             cull_enabled,
