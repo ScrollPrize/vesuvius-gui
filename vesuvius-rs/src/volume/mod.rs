@@ -117,6 +117,12 @@ pub struct DrawingConfig {
     pub show_segment_outlines: bool,
     pub draw_outline_vertices: bool,
     pub compositing: CompositingSettings,
+    /// Shifts which LOD is sampled relative to the paint resolution. Positive
+    /// values sample finer data than the natural level for the current zoom
+    /// (e.g. +1 samples lod 0 while painting 2x downsampled at zoom 0.5..1),
+    /// negative values sample coarser data. Clamped so the level never drops
+    /// below 0.
+    pub lod_bias: i32,
     /// Debug: tint each painted chunk by its cache state.
     pub debug_chunk_overlay: bool,
 }
@@ -174,6 +180,7 @@ impl Default for DrawingConfig {
                 overlay_background: 0,
                 overlay_value_norm: 0,
             },
+            lod_bias: 0,
             debug_chunk_overlay: false,
         }
     }

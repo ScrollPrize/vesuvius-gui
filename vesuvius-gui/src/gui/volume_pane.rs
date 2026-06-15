@@ -137,7 +137,8 @@ impl TileCacheKey {
             .map(|o| Arc::as_ptr(&o.volume) as *const () as usize)
             .unwrap_or(0);
 
-        let min_level = (32 - ((ZOOM_RES_FACTOR / zoom) as u32).leading_zeros()).max(0);
+        let natural_level = 32 - ((ZOOM_RES_FACTOR / zoom) as u32).leading_zeros();
+        let min_level = (natural_level as i32 - drawing_config.lod_bias).max(0) as u32;
 
         Self {
             pane_type,
@@ -975,9 +976,11 @@ impl VolumePane {
         probe_zoom: u8,
     ) -> Option<(egui::TextureHandle, u32)> {
         // paint_zoom is always pow2; log2 == trailing_zeros. sfactor = 1 << min_level matches
-        // paint_zoom at the natural min_level. +1 covers the off-by-one at zoom boundaries.
+        // paint_zoom at the natural min_level (shifted by the configured lod_bias). +1 covers
+        // the off-by-one at zoom boundaries.
         let natural_min_level = (probe_zoom as u32).trailing_zeros();
-        for candidate_min_level in [natural_min_level, natural_min_level + 1] {
+        let biased_min_level = (natural_min_level as i32 - key.drawing_config.lod_bias).max(0) as u32;
+        for candidate_min_level in [biased_min_level, biased_min_level + 1] {
             let probe_key = TileCacheKey {
                 tile_u: probe_u,
                 tile_v: probe_v,

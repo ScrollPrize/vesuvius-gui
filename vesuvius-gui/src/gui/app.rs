@@ -977,6 +977,13 @@ impl TemplateApp {
 
                 slider(ui, "Zoom", &mut self.zoom, ZOOM_MIN..=ZOOM_MAX, true, true);
 
+                slider(ui, "LOD bias", &mut self.drawing_config.lod_bias, -3..=3, false, true).on_hover_text(
+                    "Shifts which LOD is sampled relative to the paint resolution.\n\n\
+                     0: natural mapping (e.g. zoom 0.5..1 paints 2x downsampled from lod 1).\n\
+                     +1: sample one level finer (e.g. lod 0 at zoom 0.5..1), sharper but more data.\n\
+                     Negative: sample coarser data, blurrier but cheaper.",
+                );
+
                 fn cb<T: ToString>(ui: &mut Ui, label: T, value: &mut bool) -> Response {
                     ui.label(label.to_string());
                     let res = ui.checkbox(value, "");
