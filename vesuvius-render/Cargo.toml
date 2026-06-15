@@ -5,16 +5,16 @@ edition = "2021"
 rust-version = "1.70"
 
 [dependencies]
-vesuvius-rs = { path = "../vesuvius-rs" }
+vesuvius-rs   = { path = "../vesuvius-rs" }
+vesuvius-zarr = { path = "../vesuvius-zarr" }
 
 anyhow          = { workspace = true }
-async-recursion = { workspace = true }
 clap            = { workspace = true }
-directories     = { workspace = true }
-ehttp           = { workspace = true }
+env_logger      = { workspace = true }
 futures         = { workspace = true }
 image           = { workspace = true }
 indicatif       = { workspace = true }
+log             = { workspace = true }
 num_cpus        = { workspace = true }
 regex           = { workspace = true }
 tokio           = { workspace = true }

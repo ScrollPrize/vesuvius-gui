@@ -1,22 +1,31 @@
 use anyhow::{anyhow, Result};
-use async_recursion::async_recursion;
 use clap::Parser;
-use directories::BaseDirs;
 use futures::{stream, StreamExt};
 use image::Luma;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use vesuvius_rs::downloader::{DownloadState as DS, Downloader};
-use vesuvius_rs::model::Quality;
-use vesuvius_rs::model::{FullVolumeReference, VolumeReference};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use vesuvius_rs::cache::backfillers::ome_zarr::OmeZarrBackfiller;
+use vesuvius_rs::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
+use vesuvius_rs::cache::epoch::CAP_ENV_VAR;
+use vesuvius_rs::cache::{ChunkBackfiller, ChunkCache, ChunkKey, ChunkState, UnifiedCache, UnifiedVolume};
+use vesuvius_rs::model::{NewVolumeReference, VolumeLocation};
 use vesuvius_rs::volume::{
-    self, AffineTransform, DrawingConfig, Image, ObjFile, ObjVolume, PaintVolume, ProjectionKind, Volume, VolumeCons,
-    VoxelPaintVolume, VoxelVolume,
+    AffineTransform, CompositingMode, CompositingSettings, DrawingConfig, Image, ObjFile, ObjVolume, PaintVolume,
+    ProjectionKind, Volume, VolumeCons, VoxelPaintVolume, VoxelVolume,
 };
+use vesuvius_zarr::{base_cache_dir, unified_volume_key, OmeZarrContext};
+
+/// Wall-clock budget for making one tile's chunks resident before we give up
+/// and render with whatever is available. Chunk fetches are normally far
+/// faster; this only guards against a permanently failing source so the run
+/// can't hang forever.
+const TILE_ENSURE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct Crop {
@@ -53,6 +62,74 @@ impl clap::builder::TypedValueParser for CropParser {
             width,
             height,
         })
+    }
+}
+
+/// Alpha / compositing options. When `--enable-alpha` is set the renderer
+/// composites along the surface normal across the configured layer window
+/// instead of sampling a single plane per layer.
+#[derive(Parser, Debug, Clone)]
+pub struct AlphaArgs {
+    /// Enable alpha compositing along the surface normal
+    #[clap(long, default_value_t = false)]
+    enable_alpha: bool,
+
+    /// Number of layers to composite in front of the surface (default 6)
+    #[clap(long)]
+    composite_layers_in_front: Option<u8>,
+
+    /// Number of layers to composite behind the surface (default 6)
+    #[clap(long)]
+    composite_layers_behind: Option<u8>,
+
+    /// Alpha ramp lower bound, 0-255 (default 76)
+    #[clap(long)]
+    alpha_min: Option<u8>,
+
+    /// Alpha ramp upper bound, 0-255 (default 178)
+    #[clap(long)]
+    alpha_max: Option<u8>,
+
+    /// Alpha threshold, 0-10000 (default 9500)
+    #[clap(long)]
+    alpha_threshold: Option<u16>,
+
+    /// Opacity multiplier (default 1)
+    #[clap(long)]
+    opacity: Option<u16>,
+
+    /// Reverse the compositing direction along the normal
+    #[clap(long, default_value_t = false)]
+    composite_reverse_direction: bool,
+}
+impl AlphaArgs {
+    fn to_settings(&self) -> CompositingSettings {
+        let mut settings = DrawingConfig::default().compositing;
+        settings.mode = if self.enable_alpha {
+            CompositingMode::Alpha
+        } else {
+            CompositingMode::None
+        };
+        if let Some(v) = self.composite_layers_in_front {
+            settings.layers_in_front = v;
+        }
+        if let Some(v) = self.composite_layers_behind {
+            settings.layers_behind = v;
+        }
+        if let Some(v) = self.alpha_min {
+            settings.alpha_min = v;
+        }
+        if let Some(v) = self.alpha_max {
+            settings.alpha_max = v;
+        }
+        if let Some(v) = self.alpha_threshold {
+            settings.alpha_threshold = v;
+        }
+        if let Some(v) = self.opacity {
+            settings.opacity = v;
+        }
+        settings.reverse_direction = self.composite_reverse_direction;
+        settings
     }
 }
 
@@ -109,7 +186,7 @@ pub struct Args {
     #[clap(long)]
     target_format: Option<String>,
 
-    /// The id of a volume to render against, otherwise Scroll 1A is used
+    /// The ome-zarr volume to render against, given as an http(s) URL or a local path.
     #[clap(short, long)]
     volume: Option<String>,
 
@@ -121,28 +198,35 @@ pub struct Args {
     #[clap(long)]
     tile_size: Option<u32>,
 
-    /// The number of concurrent downloads to use (default 64)
+    /// Maximum number of tiles to keep in flight at once. Bounds the cache
+    /// working set so the background purge doesn't thrash (default: number of
+    /// CPU threads). Lower this if you see repeated purge/refetch cycles.
     #[clap(long)]
-    concurrent_downloads: Option<u8>,
+    max_inflight_tiles: Option<usize>,
 
-    /// The number of retries to use for downloads (default 20)
+    /// Override the unified cache size cap, in GB (sets VESUVIUS_CACHE_CAP_GB).
+    /// Raise this for large renders so the working set fits without purging.
     #[clap(long)]
-    retries: Option<u8>,
-
-    /// Internal stream buffer size (default 1024)
-    /// This limits the amount of internal work to buffer before backpressuring
-    /// and continue working on output.
-    #[clap(long)]
-    stream_buffer_size: Option<usize>,
+    cache_cap_gb: Option<u64>,
 
     /// CPU-bound worker threads to use (default number of cores/threads)
     #[clap(long)]
     worker_threads: Option<usize>,
+
+    #[clap(flatten)]
+    alpha: AlphaArgs,
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
     let threads = args.worker_threads.unwrap_or(num_cpus::get());
+
+    // The cache cap is read once (cached) the first time a cache is built, so
+    // it has to be set before any cache construction happens.
+    if let Some(gb) = args.cache_cap_gb {
+        std::env::set_var(CAP_ENV_VAR, gb.to_string());
+    }
 
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -159,19 +243,15 @@ async fn main_run(args: Args) -> Result<()> {
     monitor_runtime_stats(&multi).await;
 
     let params = (&args).into();
-    let settings = (&args).try_into()?;
-
-    let rendering = Rendering::new(params, settings);
+    let rendering = Rendering::new(params, &args)?;
     rendering.run(&multi).await?;
     Ok(())
 }
 
 #[derive(Clone)]
 struct RenderParams {
-    obj_file: String,
     width: usize,
     height: usize,
-    transform: Option<AffineTransform>,
     projection: ProjectionKind,
     tile_size: usize,
     w_range: RangeInclusive<usize>,
@@ -179,7 +259,8 @@ struct RenderParams {
     mid_layer: usize,
     target_dir: String,
     target_format: String,
-    stream_buffer_size: usize,
+    compositing: CompositingSettings,
+    max_inflight_tiles: usize,
 }
 impl RenderParams {
     fn render_left(&self) -> usize {
@@ -194,20 +275,21 @@ impl RenderParams {
     fn render_height(&self) -> usize {
         self.crop.as_ref().map(|c| c.height).unwrap_or(self.height)
     }
+    /// The drawing config shared by the chunk-collection pass and the render
+    /// pass — they MUST agree so the chunks we make resident are exactly the
+    /// ones the render samples.
+    fn drawing_config(&self) -> DrawingConfig {
+        let mut config = DrawingConfig::default();
+        config.trilinear_interpolation = true;
+        config.compositing = self.compositing.clone();
+        config
+    }
 }
 impl From<&Args> for RenderParams {
     fn from(args: &Args) -> Self {
         Self {
-            obj_file: args.obj.clone(),
             width: args.width as usize,
             height: args.height as usize,
-            transform: args.transform.as_ref().map(|t| {
-                let mut transform = AffineTransform::from_json_array_or_path(t).unwrap();
-                if args.invert_transform {
-                    transform = transform.invert().unwrap();
-                }
-                transform
-            }),
             projection: if args.ortho_xz {
                 ProjectionKind::OrthographicXZ
             } else {
@@ -219,7 +301,8 @@ impl From<&Args> for RenderParams {
             mid_layer: args.middle_layer.unwrap_or(32) as usize,
             target_dir: args.target_dir.clone(),
             target_format: args.target_format.clone().unwrap_or("png".to_string()),
-            stream_buffer_size: args.stream_buffer_size.unwrap_or(1024),
+            compositing: args.alpha.to_settings(),
+            max_inflight_tiles: args.max_inflight_tiles.unwrap_or(num_cpus::get()),
         }
     }
 }
@@ -242,34 +325,38 @@ impl From<(usize, usize, usize)> for VolumeChunk {
         VolumeChunk { x, y, z }
     }
 }
+impl VolumeChunk {
+    fn key(&self) -> ChunkKey {
+        ChunkKey::new(0, self.x as u32, self.y as u32, self.z as u32)
+    }
+}
+
 #[derive(Clone)]
 struct Rendering {
     params: RenderParams,
     obj: Arc<ObjFile>,
-    download_state: Arc<Mutex<DownloadState>>,
-    downloader: Arc<AsyncDownloader>,
+    cache: ChunkCache,
 }
 
-const TILE_SERVER: &'static str = "https://vesuvius.virtual-void.net";
-
 impl Rendering {
-    fn new(params: RenderParams, download_settings: DownloadSettings) -> Self {
-        let obj = Arc::new(ObjVolume::load_obj(
-            &params.obj_file,
-            &params.transform,
-            params.projection,
-        ));
+    fn new(params: RenderParams, args: &Args) -> Result<Self> {
+        let obj = Arc::new(ObjVolume::load_obj(&args.obj, &resolve_transform(args)?, params.projection));
 
-        Self {
-            params,
-            obj,
-            download_state: Arc::new(Mutex::new(DownloadState::new())),
-            downloader: Arc::new(AsyncDownloader {
-                semaphore: tokio::sync::Semaphore::new(download_settings.concurrent_downloads),
-                settings: download_settings,
-            }),
-        }
+        let cache_root = args
+            .data_directory
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(base_cache_dir);
+
+        let volume_arg = args
+            .volume
+            .clone()
+            .ok_or_else(|| anyhow!("--volume <ome-zarr url or local path> is required"))?;
+        let cache = build_cache(&volume_arg, cache_root)?;
+
+        Ok(Self { params, obj, cache })
     }
+
     async fn run(&self, multi: &MultiProgress) -> Result<()> {
         std::fs::create_dir_all(&self.params.target_dir)?;
 
@@ -281,22 +368,6 @@ impl Rendering {
 
         let tiles = self.uv_tiles();
         let tiles_per_layer = tiles.len() as u64 / self.params.w_range.clone().count() as u64;
-        //println!("Tiles per layer: {}", tiles_per_layer);
-
-        let map_bar = ProgressBar::new(tiles.len() as u64)
-            .with_style(count_style.clone())
-            .with_message("Mapping segment");
-        multi.add(map_bar.clone());
-
-        let dstyle =
-    ProgressStyle::with_template("{spinner} {msg:25} {bar:80.cyan/blue} [{elapsed_precise}] ({eta:>4}) {decimal_bytes}/{decimal_total_bytes} ({decimal_bytes_per_sec})")
-    .unwrap().tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈");
-
-        let download_bar = ProgressBar::new(0)
-            .with_style(dstyle)
-            .with_message("Downloading chunks");
-        multi.add(download_bar.clone());
-        download_bar.tick();
 
         let render_bar = ProgressBar::new(tiles.len() as u64)
             .with_style(count_style.clone().tick_chars("▪▫▨▧▦▩"))
@@ -310,42 +381,21 @@ impl Rendering {
         multi.add(layers_bar.clone());
         layers_bar.tick();
 
-        let buf_size = self.params.stream_buffer_size;
+        let buf_size = self.params.max_inflight_tiles.max(1);
 
         stream::iter(tiles)
-            .map(move |tile| {
-                let map_bar = map_bar.clone();
-                async move {
-                    let self_clone = self.clone();
-                    let chunks = tokio::task::spawn_blocking(move || self_clone.chunks_for(&tile))
-                        .await
-                        .unwrap();
-                    map_bar.inc(1);
-                    (tile, chunks)
-                }
-            })
-            .buffered(buf_size)
-            .map(|(tile, chunks)| {
-                let download_bar = download_bar.clone();
-                async move {
-                    // FIXME: handle download error more gracefully
-                    self.download_all_chunks(chunks, download_bar).await.unwrap();
-                    tile
-                }
-            })
-            .buffered(buf_size) // needs ordering because we deduplicate downloads here
             .map(|tile| {
                 let self_clone = self.clone();
                 let render_bar = render_bar.clone();
                 async move {
-                    let tile_image = tokio::task::spawn_blocking(move || self_clone.render_tile(&tile).unwrap())
+                    let tile_image = tokio::task::spawn_blocking(move || self_clone.render_tile_ensured(&tile))
                         .await
                         .unwrap();
                     render_bar.inc(1);
                     (tile, tile_image)
                 }
             })
-            .buffered(tiles_per_layer as usize)
+            .buffered(buf_size) // ordered so each `chunks()` group is exactly one layer
             .chunks(tiles_per_layer as usize)
             .map(|tiles| {
                 let self_clone = self.clone();
@@ -362,8 +412,12 @@ impl Rendering {
             .collect::<Vec<_>>()
             .await;
 
+        // Make sure the chunks we fetched are durably recorded for the next run.
+        self.cache.flush();
+
         Ok(())
     }
+
     fn uv_tiles(&self) -> Vec<UVTile> {
         let top = self.params.crop.as_ref().map(|c| c.top).unwrap_or(0);
         let left = self.params.crop.as_ref().map(|c| c.left).unwrap_or(0);
@@ -381,6 +435,9 @@ impl Rendering {
         }
         res
     }
+
+    /// Paint the tile once with a chunk-collecting backend (no data fetched)
+    /// to learn exactly which LOD-0 chunks the render will sample.
     fn chunks_for(&self, UVTile { u, v, w }: &UVTile) -> BTreeSet<VolumeChunk> {
         let dummy = Rc::new(TileCollectingVolume::new());
         let width = self.params.width;
@@ -401,50 +458,53 @@ impl Rendering {
             *v as i32 + tile_height as i32 / 2,
             *w as i32 - self.params.mid_layer as i32,
         ];
-        let mut config = DrawingConfig::default();
-        config.trilinear_interpolation = true;
+        let config = self.params.drawing_config();
         world.paint(xyz, 0, 1, 2, tile_width, tile_height, 1, 1, &config, &mut image);
         let res = dummy.state.replace(Default::default()).requested_tiles;
-        //println!("Tile: {},{} [{:?}]-> {:?}", u, v, xyz, res.len());
         res.into_iter().map(Into::into).collect()
     }
-    async fn download_all_chunks(&self, mut chunks: BTreeSet<VolumeChunk>, bar: ProgressBar) -> Result<()> {
-        let dir = self.downloader.settings.cache_dir.clone();
-        // FIXME: proper base path missing
 
-        let filtered = {
-            let mut downloaded = self.download_state.lock().unwrap();
-            let res = chunks
-                .difference(&downloaded.downloaded)
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            downloaded.downloaded.append(&mut chunks);
-            res
-        };
-        let requested_tiles = filtered
-            .into_iter()
-            .filter(|VolumeChunk { x, y, z }| {
-                let file_name = format!("{}/64-4/d01/z{:03}/xyz-{:03}-{:03}-{:03}-b255-d01.bin", dir, z, x, y, z);
-                !std::path::Path::new(&file_name).exists()
-            })
-            .collect::<Vec<_>>();
-        let old_len = bar.length().unwrap_or(0);
-        bar.set_length(old_len + requested_tiles.len() as u64 * 64 * 64 * 64);
+    /// Dispatch every chunk the tile needs into the unified cache and block
+    /// until each one is resident (or definitively empty). Re-touching via
+    /// `state_or_fetch` on each poll keeps the chunks in the current LRU epoch,
+    /// which the purge planner refuses to evict — so a tile's own chunks won't
+    /// be purged out from under it between this phase and the render.
+    fn ensure_resident(&self, chunks: &BTreeSet<VolumeChunk>) {
+        // Kick off all fetches first so the cache's downloader pool works them
+        // concurrently, then poll for completion.
+        let mut pending: Vec<ChunkKey> = chunks.iter().map(|c| c.key()).collect();
+        for key in &pending {
+            let _ = self.cache.state_or_fetch(*key);
+        }
 
-        stream::iter(requested_tiles)
-            .map(|chunk| {
-                let bar = bar.clone();
-                let c = self.clone();
-                async move {
-                    c.downloader.download_chunk(chunk).await.unwrap();
-                    bar.inc(64 * 64 * 64);
-                }
-            })
-            .buffered(32)
-            .collect::<Vec<_>>()
-            .await;
+        let deadline = Instant::now() + TILE_ENSURE_TIMEOUT;
+        while !pending.is_empty() {
+            // Keep only the chunks still in flight. Resident/Empty/CooldownMiss
+            // are all settled and won't change by waiting longer — in
+            // particular CooldownMiss covers out-of-bounds samples (routine at
+            // surface edges and along composite normals), so we stop polling
+            // those and let the read return 0 there rather than spin to the
+            // timeout.
+            pending.retain(|key| matches!(self.cache.state_or_fetch(*key).as_ref(), ChunkState::Pending { .. }));
+            if pending.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                log::warn!(
+                    "ensure_resident: {} chunk(s) still pending after {:?}; rendering with partial data",
+                    pending.len(),
+                    TILE_ENSURE_TIMEOUT,
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
-        Ok(())
+    fn render_tile_ensured(&self, tile: &UVTile) -> Image {
+        let chunks = self.chunks_for(tile);
+        self.ensure_resident(&chunks);
+        self.render_tile(tile)
     }
 
     fn render_layer_from_tiles(&self, tiles: Vec<(UVTile, Image)>) -> Result<()> {
@@ -482,28 +542,16 @@ impl Rendering {
 
         Ok(())
     }
-    fn render_tile(&self, UVTile { u, v, w }: &UVTile) -> Result<Image> {
+
+    fn render_tile(&self, UVTile { u, v, w }: &UVTile) -> Image {
         let paint_width = self.params.tile_size;
         let paint_height = self.params.tile_size;
 
-        struct PanicDownloader {}
-        impl Downloader for PanicDownloader {
-            fn queue(&self, task: (Arc<Mutex<DS>>, usize, usize, usize, Quality)) {
-                panic!("All files should be downloaded already but got {:?}", task);
-            }
-        }
-        let dir = self.downloader.settings.cache_dir.clone();
-
-        let vol = volume::VolumeGrid64x4Mapped::from_data_dir(&dir, Arc::new(PanicDownloader {}));
-        let world = ObjVolume::new(
-            self.obj.clone(),
-            vol.into_volume(),
-            self.params.width,
-            self.params.height,
-        )
-        .into_volume();
-        let mut config = DrawingConfig::default();
-        config.trilinear_interpolation = true;
+        // Fresh per-tile reader over the shared cache: UnifiedVolume holds a
+        // thread-local hot slot (!Sync), so each render thread needs its own.
+        let vol = UnifiedVolume::new(self.cache.clone()).into_volume();
+        let world = ObjVolume::new(self.obj.clone(), vol, self.params.width, self.params.height).into_volume();
+        let config = self.params.drawing_config();
 
         let mut image = Image::new(paint_width, paint_height);
         world.paint(
@@ -522,8 +570,54 @@ impl Rendering {
             &config,
             &mut image,
         );
-        Ok(image)
+        image
     }
+}
+
+fn resolve_transform(args: &Args) -> Result<Option<AffineTransform>> {
+    let Some(t) = args.transform.as_ref() else {
+        return Ok(None);
+    };
+    let mut transform = AffineTransform::from_json_array_or_path(t).map_err(|e| anyhow!("Invalid transform: {}", e))?;
+    if args.invert_transform {
+        transform = transform
+            .invert()
+            .map_err(|e| anyhow!("Transform is not invertible: {}", e))?;
+    }
+    Ok(Some(transform))
+}
+
+/// Build a `ChunkCache` backed by an ome-zarr volume, mirroring the GUI's
+/// construction chain (see `NewVolumeReference::volume`) but keeping the cache
+/// handle so the renderer can dispatch/poll chunks and flush at the end.
+fn build_cache(volume_arg: &str, cache_root: PathBuf) -> Result<ChunkCache> {
+    let vref = if volume_arg.starts_with("http://") || volume_arg.starts_with("https://") {
+        NewVolumeReference::from_url(volume_arg)
+    } else {
+        NewVolumeReference::from_path(volume_arg)
+    }
+    .map_err(|e| anyhow!("Could not resolve volume '{}': {}", volume_arg, e))?;
+
+    let (id, location) = match vref {
+        NewVolumeReference::OmeZarr { id, location } => (id, location),
+        other => {
+            return Err(anyhow!(
+                "vesuvius-render only supports ome-zarr volumes via the unified cache; '{}' resolved to a different format",
+                other.id()
+            ))
+        }
+    };
+
+    let (ome, source_key) = match &location {
+        VolumeLocation::RemoteUrl(url) => (OmeZarrContext::from_url_blocking_to_default_cache_dir(url), url.clone()),
+        VolumeLocation::LocalPath(path) => (OmeZarrContext::from_path(path), format!("file://{}", path)),
+    };
+
+    let unique_id = unified_volume_key(&source_key, &id);
+    let native: Arc<dyn ChunkBackfiller> = Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
+    let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
+    let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
+    Ok(cache)
 }
 
 async fn monitor_runtime_stats(multi: &MultiProgress) {
@@ -620,114 +714,5 @@ impl VoxelVolume for TileCollectingVolume {
             self.add_tile(((xyz[0] as usize) >> 6, (xyz[1] as usize) >> 6, (xyz[2] as usize) >> 6));
         }
         0
-    }
-}
-
-struct DownloadState {
-    downloaded: BTreeSet<VolumeChunk>,
-}
-impl DownloadState {
-    fn new() -> Self {
-        DownloadState {
-            downloaded: BTreeSet::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct DownloadSettings {
-    tile_server_base: String,
-    volume_base_path: String,
-    cache_dir: String,
-    retries: u8,
-    concurrent_downloads: usize,
-}
-impl TryFrom<&Args> for DownloadSettings {
-    type Error = anyhow::Error;
-    fn try_from(args: &Args) -> std::result::Result<Self, Self::Error> {
-        let vol: &'static dyn VolumeReference = if let Some(vol_id) = args.volume.clone() {
-            vol_id.try_into().map_err(|e| anyhow!("Cannot find volume: {}", e))?
-        } else {
-            &FullVolumeReference::SCROLL1
-        };
-
-        let cache_dir = if let Some(dir) = args.data_directory.clone() {
-            dir
-        } else {
-            BaseDirs::new()
-                .unwrap()
-                .cache_dir()
-                .join("vesuvius-gui")
-                .to_str()
-                .unwrap()
-                .to_string()
-        };
-        let download_dir = vol.sub_dir(&cache_dir);
-
-        Ok(Self {
-            tile_server_base: TILE_SERVER.to_string(),
-            volume_base_path: vol.url_path_base(),
-            cache_dir: download_dir,
-            retries: args.retries.unwrap_or(20),
-            concurrent_downloads: args.concurrent_downloads.unwrap_or(32) as usize,
-        })
-    }
-}
-
-struct AsyncDownloader {
-    semaphore: tokio::sync::Semaphore,
-    settings: DownloadSettings,
-}
-impl AsyncDownloader {
-    async fn download_chunk(&self, chunk: VolumeChunk) -> Result<()> {
-        self.download_attempt(chunk, self.settings.retries).await
-    }
-
-    #[async_recursion]
-    async fn download_attempt(&self, chunk: VolumeChunk, retries: u8) -> Result<()> {
-        if retries == 0 {
-            return Err(anyhow!("Failed to download tile"));
-        }
-        //println!("Queueing Downloading chunk: {:?}", chunk);
-
-        let permit = self.semaphore.acquire().await.unwrap();
-        let url = self.url_for(chunk);
-        let request = ehttp::Request::get(url.clone());
-
-        //println!("Downloading chunk: {:?} by request to {:?}", chunk, &request);
-        let response = ehttp::fetch_async(request).await;
-        //println!("Finished downloading chunk: {:?}, response: {:?}", chunk, &response);
-        drop(permit);
-        if let Ok(res) = response {
-            if res.status == 200 {
-                let VolumeChunk { x, y, z } = chunk;
-                let bytes = res.bytes;
-                let file_name = format!(
-                    "{}/64-4/d{:02}/z{:03}/xyz-{:03}-{:03}-{:03}-b{:03}-d{:02}.bin",
-                    self.settings.cache_dir, 1, z, x, y, z, 255, 1
-                );
-                std::fs::create_dir_all(format!("{}/64-4/d{:02}/z{:03}", self.settings.cache_dir, 1, z)).unwrap();
-                let tmp_file = format!("{}.tmp", file_name);
-                std::fs::write(&tmp_file, bytes).unwrap();
-                std::fs::rename(tmp_file, file_name).unwrap();
-            } else if res.status == 420 {
-                // retry in 10 seconds
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                return self.download_attempt(chunk, retries - 1).await;
-            } else {
-                todo!();
-            }
-        } else {
-            return Err(anyhow!("Failed to download tile"));
-        }
-
-        Ok(())
-    }
-
-    fn url_for(&self, VolumeChunk { x, y, z }: VolumeChunk) -> String {
-        format!(
-            "{}/tiles/{}download/64-4?x={}&y={}&z={}&bitmask={}&downsampling={}",
-            self.settings.tile_server_base, self.settings.volume_base_path, x, y, z, 255, 1
-        )
     }
 }
