@@ -131,6 +131,15 @@ struct Inner {
     /// skip the per-chunk 262k-voxel upsample. Correctness is unaffected
     /// either way — the real fetch overwrites the preview.
     preview_synthesis: AtomicBool,
+    /// When false, `touch_aabb` skips its coarse preview-LOD prefetch pass
+    /// (Pass 1) and only dispatches target-LOD chunks. The preview level
+    /// exists solely to feed `try_upscale_from_parent` / progressive
+    /// previews in the interactive GUI; a batch consumer that blocks until
+    /// the target LOD is `Resident` (e.g. the offline renderer) never
+    /// renders the preview, so fetching+decoding those coarse chunks is
+    /// pure wasted bandwidth and CPU. Correctness is unaffected — the
+    /// target-LOD chunks are still dispatched.
+    preview_prefetch: AtomicBool,
 }
 
 enum SourceState {
@@ -436,6 +445,7 @@ impl ChunkCache {
             frame: AtomicU64::new(1),
             epoch,
             preview_synthesis: AtomicBool::new(true),
+            preview_prefetch: AtomicBool::new(true),
         });
 
         for i in 0..workers.max(1) {
@@ -677,7 +687,7 @@ impl ChunkCache {
         // up by `try_upscale_from_parent`, which always prefers the
         // finest resident ancestor; we just no longer fetch them here.
         let preview_lod = max_lod.min(target_lod.saturating_add(6));
-        if preview_lod > target_lod {
+        if preview_lod > target_lod && self.inner.preview_prefetch.load(Ordering::Relaxed) {
             let shift = preview_lod - target_lod;
             let px0 = (cx0 as u32) >> shift;
             let py0 = (cy0 as u32) >> shift;
@@ -723,6 +733,15 @@ impl ChunkCache {
     /// overwrites the preview regardless.
     pub fn set_preview_synthesis(&self, enabled: bool) {
         self.inner.preview_synthesis.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Enable/disable the coarse preview-LOD prefetch in `touch_aabb`.
+    /// Leave on for the interactive GUI (feeds progressive previews /
+    /// upscale-from-parent); turn off for the offline renderer, which
+    /// blocks on the target LOD and never renders previews, so prefetching
+    /// the preview pyramid only wastes download + decode work.
+    pub fn set_preview_prefetch(&self, enabled: bool) {
+        self.inner.preview_prefetch.store(enabled, Ordering::Relaxed);
     }
 }
 

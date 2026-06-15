@@ -675,6 +675,11 @@ fn build_cache(volume_arg: &str, cache_root: PathBuf) -> Result<ChunkCache> {
     // The renderer blocks until each chunk is resident before reading, so the
     // upscaled-from-parent preview is never read — skip the per-chunk upsample.
     cache.set_preview_synthesis(false);
+    // For the same reason, don't prefetch the coarse preview-LOD pyramid in
+    // `touch_aabb`: those chunks are only ever consumed by the GUI's
+    // progressive preview / upscale-from-parent, never by the renderer, so
+    // fetching+decoding them is pure wasted work (and an accidental LOD climb).
+    cache.set_preview_prefetch(false);
     Ok(cache)
 }
 
