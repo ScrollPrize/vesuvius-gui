@@ -617,6 +617,9 @@ fn build_cache(volume_arg: &str, cache_root: PathBuf) -> Result<ChunkCache> {
     let native: Arc<dyn ChunkBackfiller> = Arc::new(OmeZarrBackfiller::from_ome(unique_id, ome));
     let backfiller: Arc<dyn ChunkBackfiller> = Arc::new(SynthesizedLodBackfiller::new(native, 32));
     let cache = UnifiedCache::for_cache_dir(cache_root).open_volume(backfiller);
+    // The renderer blocks until each chunk is resident before reading, so the
+    // upscaled-from-parent preview is never read — skip the per-chunk upsample.
+    cache.set_preview_synthesis(false);
     Ok(cache)
 }
 

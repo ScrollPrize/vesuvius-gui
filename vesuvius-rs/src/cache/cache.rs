@@ -52,7 +52,7 @@ use super::{CHUNK_VOXELS, MAX_AGE};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -123,6 +123,14 @@ struct Inner {
     /// unified root. Bumped on chunk fill (write path) and on access
     /// transitions (read path). See `epoch.rs`.
     epoch: Arc<EpochState>,
+    /// Whether `dispatch_chunk` synthesizes an upscaled-from-parent preview
+    /// on a chunk's first dispatch. On (default) for interactive use, where
+    /// the preview is painted while real bytes stream in. Batch consumers
+    /// that block until a chunk is `Resident` before reading (e.g. the
+    /// offline renderer) never read the preview, so they turn this off to
+    /// skip the per-chunk 262k-voxel upsample. Correctness is unaffected
+    /// either way — the real fetch overwrites the preview.
+    preview_synthesis: AtomicBool,
 }
 
 enum SourceState {
@@ -427,6 +435,7 @@ impl ChunkCache {
             downloader,
             frame: AtomicU64::new(1),
             epoch,
+            preview_synthesis: AtomicBool::new(true),
         });
 
         for i in 0..workers.max(1) {
@@ -702,6 +711,18 @@ impl ChunkCache {
     /// thread otherwise flushes only every ~10 s.
     pub fn flush(&self) {
         self.inner.disk.flush();
+    }
+
+    /// Enable or disable upscaled-from-parent preview synthesis on a
+    /// chunk's first dispatch (default: enabled). Interactive callers leave
+    /// this on so panes paint a downsampled preview while real bytes stream
+    /// in. Batch callers that block until a chunk is `Resident` before
+    /// reading (e.g. the offline renderer's per-tile ensure phase) never
+    /// read the preview, so they disable it to skip the per-chunk
+    /// 262k-voxel upsample. Correctness is unaffected — the real fetch
+    /// overwrites the preview regardless.
+    pub fn set_preview_synthesis(&self, enabled: bool) {
+        self.inner.preview_synthesis.store(enabled, Ordering::Relaxed);
     }
 }
 
@@ -1071,7 +1092,7 @@ impl Inner {
         // on re-dispatch after DashMap eviction. Overlapping/adjacent tiles
         // that re-enter dispatch for the same chunk reuse the existing
         // preview bytes instead of re-running the 262k-voxel trilinear pass.
-        if first_dispatch {
+        if first_dispatch && self.preview_synthesis.load(Ordering::Relaxed) {
             self.try_upscale_from_parent(key);
         }
 
