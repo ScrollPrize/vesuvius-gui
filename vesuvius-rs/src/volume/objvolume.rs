@@ -673,6 +673,177 @@ impl ObjVolume {
             1.0 - v
         }
     }
+
+    /// Generalized cross-section paint for the UW/VW panes.
+    ///
+    /// One screen axis is `w` (offset along the surface normal); the other is a
+    /// surface coordinate (`u` for UW, `v` for VW). The third surface coordinate
+    /// is held fixed at `xyz[plane_coord]`. We follow the user's plan: find the
+    /// triangles crossing the fixed surface line (a degenerate uv-index slab),
+    /// rasterize each restricted to that line to build the surface profile
+    /// `(pos, normal)` per line pixel, then expand each profile point along its
+    /// normal across the whole `w` extent via the backend's
+    /// `gather_along_normal` fast path. `w` is a spatial screen axis here, so
+    /// this is always single-sample — compositing only applies to the UV pane.
+    fn paint_cross_section(
+        &self,
+        xyz: [i32; 3],
+        u_coord: usize,
+        v_coord: usize,
+        plane_coord: usize,
+        width: usize,
+        height: usize,
+        sfactor: u8,
+        paint_zoom: u8,
+        config: &super::DrawingConfig,
+        buffer: &mut Image,
+    ) {
+        let volume = self.volume.clone();
+        let inv_f = 1.0 / sfactor as f64;
+        let pz = paint_zoom as i32;
+
+        // `w` is the screen axis whose coord index is 2. For UW it is vertical
+        // (v_coord == 2); for VW it is horizontal (u_coord == 2).
+        let w_is_vertical = v_coord == 2;
+        let (line_dim, w_dim) = if w_is_vertical { (width, height) } else { (height, width) };
+        let line_axis = if w_is_vertical { u_coord } else { v_coord }; // surface axis in {0,1}
+        let fixed_axis = plane_coord; // the other surface axis in {0,1}
+
+        let origin_line = xyz[line_axis] - line_dim as i32 / 2 * pz;
+        let line_hi = origin_line + (line_dim as i32 - 1) * pz;
+        let origin_w = (xyz[2] - w_dim as i32 / 2 * pz) as f64;
+        let w_hi = origin_w + (w_dim as i32 * pz) as f64;
+        let fixed_val = xyz[fixed_axis];
+
+        let fw = self.width() as f64;
+        let fh = self.height() as f64;
+
+        // Texture-space slab covering the slice line for the uv index. Segment
+        // voxel coords map to texture coords as u_tex = u/width and
+        // v_tex = self.v(v/height) (self.v is its own inverse, matching the UV
+        // path's `min_v_vt = self.v(min_v / height)`).
+        let (ut_min, ut_max, vt_min, vt_max) = if line_axis == 0 {
+            let vt = self.v(fixed_val as f64 / fh);
+            (origin_line as f64 / fw, line_hi as f64 / fw, vt, vt)
+        } else {
+            let vt_a = self.v(origin_line as f64 / fh);
+            let vt_b = self.v(line_hi as f64 / fh);
+            (fixed_val as f64 / fw, fixed_val as f64 / fw, vt_a.min(vt_b), vt_a.max(vt_b))
+        };
+
+        // Surface profile: (pos, normal) at each line pixel a triangle covers.
+        let mut line: Vec<Option<([f64; 3], [f64; 3])>> = vec![None; line_dim];
+
+        let obj = &self.obj;
+        for i in obj.base.uv_index.in_bounds(ut_min, ut_max, vt_min, vt_max) {
+            let tri = &obj.base.triangles[i];
+            let vt1 = &obj.base.tex_vertices[tri.t[0] as usize];
+            let vt2 = &obj.base.tex_vertices[tri.t[1] as usize];
+            let vt3 = &obj.base.tex_vertices[tri.t[2] as usize];
+
+            let u1 = (vt1.u * fw) as i32;
+            let sv1 = (self.v(vt1.v) * fh) as i32;
+            let u2 = (vt2.u * fw) as i32;
+            let sv2 = (self.v(vt2.v) * fh) as i32;
+            let u3 = (vt3.u * fw) as i32;
+            let sv3 = (self.v(vt3.v) * fh) as i32;
+
+            // Triangle extent along the line axis → covered line-pixel range.
+            let (l1, l2, l3) = if line_axis == 0 { (u1, u2, u3) } else { (sv1, sv2, sv3) };
+            let line_min = l1.min(l2).min(l3);
+            let line_max = l1.max(l2).max(l3);
+            let li_start = (((line_min - origin_line) as f64 / pz as f64).ceil() as i32).max(0);
+            let li_end = (((line_max - origin_line) as f64 / pz as f64).floor() as i32).min(line_dim as i32 - 1);
+            if li_end < li_start {
+                continue;
+            }
+
+            let xyz1 = &obj.vertices[tri.v[0] as usize];
+            let xyz2 = &obj.vertices[tri.v[1] as usize];
+            let xyz3 = &obj.vertices[tri.v[2] as usize];
+            let n1 = &obj.normals[tri.n[0] as usize];
+            let n2 = &obj.normals[tri.n[1] as usize];
+            let n3 = &obj.normals[tri.n[2] as usize];
+
+            // Pre-dispatch chunk fetches for this triangle's slab of rays — the
+            // gather fast path reads the shard mmap unconditionally (see
+            // UnifiedVolume::composite_along_normal_inner). Bound the box over
+            // the 3 verts × the strip's w extremes, as the UV composite path does.
+            if config.trilinear_interpolation {
+                let mut tmin = [f64::INFINITY; 3];
+                let mut tmax = [f64::NEG_INFINITY; 3];
+                for (p, n) in [(xyz1, n1), (xyz2, n2), (xyz3, n3)] {
+                    for &ww in &[origin_w, w_hi] {
+                        let q = [(p.x + ww * n.x) * inv_f, (p.y + ww * n.y) * inv_f, (p.z + ww * n.z) * inv_f];
+                        for d in 0..3 {
+                            if q[d] < tmin[d] {
+                                tmin[d] = q[d];
+                            }
+                            if q[d] > tmax[d] {
+                                tmax[d] = q[d];
+                            }
+                        }
+                    }
+                }
+                volume.touch_aabb(tmin, tmax, sfactor as i32);
+            }
+
+            for li in li_start..=li_end {
+                let line_coord = origin_line + li * pz;
+                let (qu, qv) = if line_axis == 0 { (line_coord, fixed_val) } else { (fixed_val, line_coord) };
+
+                let w0 = orient2d(u2, sv2, u3, sv3, qu, qv);
+                let w1 = orient2d(u3, sv3, u1, sv1, qu, qv);
+                let w2 = orient2d(u1, sv1, u2, sv2, qu, qv);
+                if w0 >= 0 && w1 >= 0 && w2 >= 0 {
+                    let invwsum = 1. / (w0 + w1 + w2) as f64;
+                    let pos = [
+                        (w0 as f64 * xyz1.x + w1 as f64 * xyz2.x + w2 as f64 * xyz3.x) * invwsum,
+                        (w0 as f64 * xyz1.y + w1 as f64 * xyz2.y + w2 as f64 * xyz3.y) * invwsum,
+                        (w0 as f64 * xyz1.z + w1 as f64 * xyz2.z + w2 as f64 * xyz3.z) * invwsum,
+                    ];
+                    let nrm = [
+                        (w0 as f64 * n1.x + w1 as f64 * n2.x + w2 as f64 * n3.x) * invwsum,
+                        (w0 as f64 * n1.y + w1 as f64 * n2.y + w2 as f64 * n3.y) * invwsum,
+                        (w0 as f64 * n1.z + w1 as f64 * n2.z + w2 as f64 * n3.z) * invwsum,
+                    ];
+                    line[li as usize] = Some((pos, nrm));
+                }
+            }
+        }
+
+        // Expand each surface profile point along its normal across the w
+        // extent. Color path so the (inside-out) overlay tint shows, matching
+        // the UV pane; `gather_color_along_normal` keeps the cache fast path.
+        let mut col = vec![ecolor::Color32::from_gray(0); w_dim];
+        for li in 0..line_dim {
+            let Some((pos, n)) = line[li] else {
+                continue;
+            };
+            let write = |buffer: &mut Image, wi: usize, color: ecolor::Color32| {
+                let (bx, by) = if w_is_vertical { (li, wi) } else { (wi, li) };
+                buffer.set(bx, by, color);
+            };
+            if config.trilinear_interpolation {
+                let base = [
+                    (pos[0] + origin_w * n[0]) * inv_f,
+                    (pos[1] + origin_w * n[1]) * inv_f,
+                    (pos[2] + origin_w * n[2]) * inv_f,
+                ];
+                let dir = [pz as f64 * n[0] * inv_f, pz as f64 * n[1] * inv_f, pz as f64 * n[2] * inv_f];
+                volume.gather_color_along_normal(base, dir, sfactor as i32, &mut col);
+                for wi in 0..w_dim {
+                    write(buffer, wi, col[wi]);
+                }
+            } else {
+                for wi in 0..w_dim {
+                    let ww = origin_w + (wi as i32 * pz) as f64;
+                    let p = [(pos[0] + ww * n[0]) * inv_f, (pos[1] + ww * n[1]) * inv_f, (pos[2] + ww * n[2]) * inv_f];
+                    write(buffer, wi, volume.get_color(p, sfactor as i32));
+                }
+            }
+        }
+    }
 }
 
 fn orient2d(u1: i32, v1: i32, u2: i32, v2: i32, u3: i32, v3: i32) -> i32 {
@@ -694,9 +865,15 @@ impl PaintVolume for ObjVolume {
         config: &super::DrawingConfig,
         buffer: &mut Image,
     ) {
-        assert!(u_coord == 0);
-        assert!(v_coord == 1);
-        assert!(plane_coord == 2);
+        // UV keeps its dedicated triangle-raster path (compositing, outlines,
+        // depth scrub) below. UW/VW cross-sections take the generalized
+        // slice-line + normal-walk path.
+        if !(u_coord == 0 && v_coord == 1 && plane_coord == 2) {
+            self.paint_cross_section(
+                xyz, u_coord, v_coord, plane_coord, width, height, sfactor, paint_zoom, config, buffer,
+            );
+            return;
+        }
 
         let draw_outlines = config.draw_xyz_outlines;
         let composite = config.compositing.mode != CompositingMode::None;

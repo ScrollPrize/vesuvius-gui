@@ -260,6 +260,8 @@ pub enum PaneType {
     XZ, // u=0, v=2, d=1
     YZ, // u=2, v=1, d=0
     UV, // u=0, v=1, d=2 (for segment mode)
+    UW, // u=0, v=2, d=1 (segment cross-section: u horizontal, w vertical, v fixed)
+    VW, // u=2, v=1, d=0 (segment cross-section: w horizontal, v vertical, u fixed)
 }
 
 impl PaneType {
@@ -269,6 +271,8 @@ impl PaneType {
             PaneType::XZ => (0, 2, 1),
             PaneType::YZ => (2, 1, 0),
             PaneType::UV => (0, 1, 2),
+            PaneType::UW => (0, 2, 1),
+            PaneType::VW => (2, 1, 0),
         }
     }
 
@@ -278,6 +282,8 @@ impl PaneType {
             PaneType::XZ => "XZ",
             PaneType::YZ => "YZ",
             PaneType::UV => "UV",
+            PaneType::UW => "UW",
+            PaneType::VW => "VW",
         }
     }
 }

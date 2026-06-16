@@ -454,6 +454,85 @@ impl TifXyzVolume {
         ]
     }
 
+    /// Generalized cross-section paint for the UW/VW panes.
+    ///
+    /// One screen axis is `w` (the offset along the surface normal); the other
+    /// is a surface coordinate (`u` for UW, `v` for VW). The third surface
+    /// coordinate is held fixed at `xyz[plane_coord]`. So for each "line
+    /// position" along the surface axis we sample the surface once and then
+    /// walk the normal across the whole `w` extent using the backend's
+    /// `gather_along_normal` fast path (which amortizes chunk lookups across
+    /// the walk). Because `w` is a spatial screen axis here, this path is
+    /// always single-sample — no compositing (that only applies to UV).
+    fn paint_cross_section(
+        &self,
+        xyz: [i32; 3],
+        u_coord: usize,
+        v_coord: usize,
+        plane_coord: usize,
+        width: usize,
+        height: usize,
+        sfactor: u8,
+        paint_zoom: u8,
+        config: &DrawingConfig,
+        buffer: &mut Image,
+    ) {
+        let volume = self.volume.clone();
+        let inv_f = 1.0 / sfactor as f64;
+        let pz = paint_zoom as i32;
+
+        // `w` is the screen axis whose coord index is 2. For UW it is vertical
+        // (v_coord == 2); for VW it is horizontal (u_coord == 2).
+        let w_is_vertical = v_coord == 2;
+        let (line_dim, w_dim) = if w_is_vertical { (width, height) } else { (height, width) };
+        let line_axis = if w_is_vertical { u_coord } else { v_coord }; // surface axis in {0,1}
+        let fixed_axis = plane_coord; // the other surface axis in {0,1}
+
+        let origin_line = xyz[line_axis] - line_dim as i32 / 2 * pz;
+        let origin_w = (xyz[2] - w_dim as i32 / 2 * pz) as f64;
+        let fixed_val = xyz[fixed_axis];
+
+        // Color path so the (inside-out) overlay tint shows, matching the UV
+        // pane; `gather_color_along_normal` keeps the cache fast path.
+        let mut col = vec![ecolor::Color32::from_gray(0); w_dim];
+        for li in 0..line_dim {
+            let mut seg = [0i32; 2];
+            seg[line_axis] = origin_line + li as i32 * pz;
+            seg[fixed_axis] = fixed_val;
+
+            let (gc, gr) = self.seg_to_grid(seg[0] as f64, seg[1] as f64);
+            let Some(sample) = self.sample_grid(gc, gr) else {
+                continue;
+            };
+            let p = [sample.xyz[0] as f64, sample.xyz[1] as f64, sample.xyz[2] as f64];
+            let n = [sample.n[0] as f64, sample.n[1] as f64, sample.n[2] as f64];
+
+            let write = |buffer: &mut Image, wi: usize, color: ecolor::Color32| {
+                let (bx, by) = if w_is_vertical { (li, wi) } else { (wi, li) };
+                buffer.set(bx, by, color);
+            };
+
+            if config.trilinear_interpolation {
+                let base = [
+                    (p[0] + origin_w * n[0]) * inv_f,
+                    (p[1] + origin_w * n[1]) * inv_f,
+                    (p[2] + origin_w * n[2]) * inv_f,
+                ];
+                let dir = [pz as f64 * n[0] * inv_f, pz as f64 * n[1] * inv_f, pz as f64 * n[2] * inv_f];
+                volume.gather_color_along_normal(base, dir, sfactor as i32, &mut col);
+                for wi in 0..w_dim {
+                    write(buffer, wi, col[wi]);
+                }
+            } else {
+                for wi in 0..w_dim {
+                    let w = origin_w + (wi as i32 * pz) as f64;
+                    let p = [(p[0] + w * n[0]) * inv_f, (p[1] + w * n[1]) * inv_f, (p[2] + w * n[2]) * inv_f];
+                    write(buffer, wi, volume.get_color(p, sfactor as i32));
+                }
+            }
+        }
+    }
+
     /// Bilinear sample of xyz + normal at fractional grid coords. Returns None
     /// when any of the four corners is invalid (mirrors ObjVolume's "no
     /// triangle covers this pixel" behavior).
@@ -522,9 +601,14 @@ impl PaintVolume for TifXyzVolume {
         config: &DrawingConfig,
         buffer: &mut Image,
     ) {
-        assert!(u_coord == 0);
-        assert!(v_coord == 1);
-        assert!(plane_coord == 2);
+        // UV keeps its dedicated path (compositing, outlines, depth scrub) below.
+        // UW/VW cross-sections take the generalized single-sample path.
+        if !(u_coord == 0 && v_coord == 1 && plane_coord == 2) {
+            self.paint_cross_section(
+                xyz, u_coord, v_coord, plane_coord, width, height, sfactor, paint_zoom, config, buffer,
+            );
+            return;
+        }
 
         let draw_outlines = config.draw_xyz_outlines;
         let composite = config.compositing.mode != CompositingMode::None;

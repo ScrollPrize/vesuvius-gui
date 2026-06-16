@@ -173,6 +173,10 @@ enum GuiLayout {
     XZ,
     YZ,
     UV,
+    /// UV surface (main) with the UW depth cross-section as a bottom strip and
+    /// the VW depth cross-section as a right strip; bottom-right corner empty so
+    /// the u and v axes line up across the three panes.
+    UVW,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -223,6 +227,10 @@ pub struct TemplateApp {
     overlay_coloring: OverlayColoring,
     catalog_panel_open: bool,
     layout: GuiLayout,
+    /// Half-thickness (in segment w voxels) of the UW/VW depth strips in the
+    /// UVW layout. The strips span [-uvw_depth_half, +uvw_depth_half] around the
+    /// current depth. Default 40 (segments lose relevance beyond ~±50).
+    uvw_depth_half: i32,
     #[serde(skip)]
     pending_volume_switch: Option<String>,
     target_fps: u32,
@@ -261,6 +269,7 @@ impl Default for TemplateApp {
             overlay_coloring: OverlayColoring::default(),
             catalog_panel_open: true,
             layout: GuiLayout::Grid,
+            uvw_depth_half: 40,
             pending_volume_switch: None,
             target_fps: 20,
         }
@@ -909,7 +918,7 @@ impl TemplateApp {
                         ui.label("");
                         if ui.button("Unload segment").clicked() {
                             self.segment_mode = None;
-                            if self.layout == GuiLayout::UV {
+                            if self.layout == GuiLayout::UV || self.layout == GuiLayout::UVW {
                                 self.layout = GuiLayout::Grid;
                             }
                         }
@@ -1486,6 +1495,9 @@ impl TemplateApp {
                     if i.key_pressed(egui::Key::Num5) {
                         self.layout = GuiLayout::UV;
                     }
+                    if i.key_pressed(egui::Key::Num6) && !i.modifiers.ctrl {
+                        self.layout = GuiLayout::UVW;
+                    }
                 }
             });
         }
@@ -1531,6 +1543,11 @@ impl TemplateApp {
             GuiLayout::Grid => (frame_target.div_f32(3.0), Duration::ZERO),
             GuiLayout::XY | GuiLayout::XZ | GuiLayout::YZ => (frame_target, Duration::ZERO),
             GuiLayout::UV => (Duration::ZERO, frame_target),
+            // UV gets the lion's share; the two thin strips split the remainder.
+            GuiLayout::UVW => (
+                frame_target.mul_f32((1.0 - UV_PANE_BUDGET_FRACTION) / 2.0),
+                frame_target.mul_f32(UV_PANE_BUDGET_FRACTION),
+            ),
         };
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1577,6 +1594,50 @@ impl TemplateApp {
                         ui.label("UV pane is only available in segment mode.");
                     }
                 }
+                GuiLayout::UVW => {
+                    if self.is_segment_mode() {
+                        let available = ui.available_size();
+                        // Strip cross-dimension follows the w extent at the
+                        // current zoom (so it stays isotropic with u/v), clamped
+                        // so it remains a strip and never crowds out the UV pane.
+                        let w_px = 2.0 * self.uvw_depth_half as f32 * self.zoom;
+                        let strip_w = w_px.clamp(32.0, available.x * 0.4);
+                        let strip_h = w_px.clamp(32.0, available.y * 0.4);
+                        let uv_width = (available.x - strip_w - 2.0).max(0.0);
+                        let uv_height = (available.y - strip_h - 2.0).max(0.0);
+
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                self.render_uv_pane(ui, Vec2::new(uv_width, uv_height), &budget, uv_share);
+                                ui.add_space(2.0);
+                                // VW on the right shares the v (vertical) axis with UV.
+                                self.render_segment_pane(
+                                    ui,
+                                    Vec2::new(strip_w, uv_height),
+                                    Self::VW_PANE,
+                                    &budget,
+                                    xs_share,
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                // UW on the bottom shares the u (horizontal) axis with UV.
+                                self.render_segment_pane(
+                                    ui,
+                                    Vec2::new(uv_width, strip_h),
+                                    Self::UW_PANE,
+                                    &budget,
+                                    xs_share,
+                                );
+                                ui.add_space(2.0);
+                                // Bottom-right corner left empty so u/v axes line up.
+                                ui.allocate_space(Vec2::new(strip_w, strip_h));
+                            });
+                        });
+                    } else {
+                        ui.label("UVW panes are only available in segment mode.");
+                    }
+                }
             }
         });
     }
@@ -1585,6 +1646,8 @@ impl TemplateApp {
     const XZ_PANE: VolumePane = VolumePane::new(PaneType::XZ, false);
     const YZ_PANE: VolumePane = VolumePane::new(PaneType::YZ, false);
     const UV_PANE: VolumePane = VolumePane::new(PaneType::UV, true);
+    const UW_PANE: VolumePane = VolumePane::new(PaneType::UW, true);
+    const VW_PANE: VolumePane = VolumePane::new(PaneType::VW, true);
     fn render_pane(
         &mut self,
         ui: &mut Ui,
@@ -1616,6 +1679,39 @@ impl TemplateApp {
             budget,
             pane_share,
         );
+    }
+    /// Render a segment-space pane (UV/UW/VW) over the shared segment coord,
+    /// world and ranges, syncing coords on interaction. Generalizes
+    /// `render_uv_pane` to the cross-section panes.
+    fn render_segment_pane(
+        &mut self,
+        ui: &mut Ui,
+        cell_size: Vec2,
+        pane: VolumePane,
+        budget: &FrameBudget,
+        pane_share: Duration,
+    ) {
+        if let Some(segment_mode) = self.segment_mode.as_mut() {
+            if pane.render(
+                ui,
+                &mut segment_mode.coord,
+                &segment_mode.world,
+                None,
+                None,
+                &mut self.zoom,
+                &self.drawing_config,
+                self.extra_resolutions,
+                None,
+                &segment_mode.ranges,
+                cell_size,
+                budget,
+                pane_share,
+            ) {
+                if self.should_sync_coords() {
+                    self.sync_coords();
+                }
+            }
+        }
     }
     fn render_uv_pane(&mut self, ui: &mut Ui, cell_size: Vec2, budget: &FrameBudget, pane_share: Duration) {
         if let Some(segment_mode) = self.segment_mode.as_mut() {
@@ -1902,6 +1998,14 @@ impl eframe::App for TemplateApp {
                     layout_button(ui, &mut self.layout, GuiLayout::YZ, "YZ (4)");
                     if self.is_segment_mode() {
                         layout_button(ui, &mut self.layout, GuiLayout::UV, "UV (5)");
+                        layout_button(ui, &mut self.layout, GuiLayout::UVW, "UVW (6)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.uvw_depth_half)
+                                .speed(1.0)
+                                .range(1..=200)
+                                .prefix("±w "),
+                        )
+                        .on_hover_text("Half-thickness (w voxels) of the UW/VW depth strips in the UVW layout");
                     }
 
                     let volume_buttons = self.get_atlas_context().map(|(_, _, atlas_sample)| {

@@ -313,6 +313,32 @@ pub trait VoxelVolume {
             *slot = self.get_interpolated(p, downsampling);
         }
     }
+
+    /// Colored form of `gather_along_normal`: fill `out` with `Color32` samples
+    /// along `base + k*dir`. Used by the UW/VW cross-section panes, which paint
+    /// one pixel per `w` step and therefore need per-sample color rather than a
+    /// composited ray. The default routes through the (overridable) grayscale
+    /// `gather_along_normal` fast path and wraps each sample in `from_gray`, so
+    /// chunked backends keep their amortized walk. `OverlayVolume` overrides
+    /// this to gather base + overlay separately (both fast) and blend the tint.
+    fn gather_color_along_normal(&self, base: [f64; 3], dir: [f64; 3], downsampling: i32, out: &mut [Color32]) {
+        const CHUNK: usize = 512;
+        let mut tmp = [0u8; CHUNK];
+        let mut done = 0;
+        while done < out.len() {
+            let n = (out.len() - done).min(CHUNK);
+            let cb = [
+                base[0] + done as f64 * dir[0],
+                base[1] + done as f64 * dir[1],
+                base[2] + done as f64 * dir[2],
+            ];
+            self.gather_along_normal(cb, dir, downsampling, &mut tmp[..n]);
+            for k in 0..n {
+                out[done + k] = Color32::from_gray(tmp[k]);
+            }
+            done += n;
+        }
+    }
 }
 
 pub struct Image {
@@ -499,5 +525,8 @@ impl VoxelVolume for Volume {
     }
     fn gather_along_normal(&self, base: [f64; 3], dir: [f64; 3], downsampling: i32, out: &mut [u8]) {
         self.volume.gather_along_normal(base, dir, downsampling, out);
+    }
+    fn gather_color_along_normal(&self, base: [f64; 3], dir: [f64; 3], downsampling: i32, out: &mut [Color32]) {
+        self.volume.gather_color_along_normal(base, dir, downsampling, out);
     }
 }

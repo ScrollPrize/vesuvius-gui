@@ -326,6 +326,36 @@ impl VoxelVolume for OverlayVolume {
         self.overlay.touch_aabb(min, max, downsampling);
     }
 
+    /// Per-sample colored gather for the UW/VW cross-section panes: gather the
+    /// base values and overlay labels separately (both through the cache fast
+    /// path) and blend the tint per sample. This is the non-compositing analog
+    /// of `composite_color_along_normal` — each `w` step is its own pixel.
+    fn gather_color_along_normal(&self, base: [f64; 3], dir: [f64; 3], downsampling: i32, out: &mut [Color32]) {
+        const CHUNK: usize = 512;
+        let mut vbuf = [0u8; CHUNK];
+        let mut abuf = [0u8; CHUNK];
+        let mode = self.coloring.mode();
+        let mut done = 0;
+        while done < out.len() {
+            let n = (out.len() - done).min(CHUNK);
+            let cb = [
+                base[0] + done as f64 * dir[0],
+                base[1] + done as f64 * dir[1],
+                base[2] + done as f64 * dir[2],
+            ];
+            self.base.gather_along_normal(cb, dir, downsampling, &mut vbuf[..n]);
+            self.overlay.gather_along_normal(cb, dir, downsampling, &mut abuf[..n]);
+            for k in 0..n {
+                let base_color = Color32::from_gray(vbuf[k]);
+                out[done + k] = match self.coloring.paint(abuf[k]) {
+                    Some((c, s)) => apply_blend(base_color, c, s, mode),
+                    None => base_color,
+                };
+            }
+            done += n;
+        }
+    }
+
     /// Composite the base and the overlay separately, both through the
     /// cache fast path, then blend the two u8 results into a Color32 via
     /// `OverlayColoring`. The base walk reuses the caller's compositor so
