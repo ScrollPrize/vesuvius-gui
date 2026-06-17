@@ -404,6 +404,29 @@ impl TifXyzVolume {
         &self.data.base.uuid
     }
 
+    /// The base-independent projection (parsed grid + baked transform). Cloning
+    /// it is cheap (an `Arc`) and the result is `Send + Sync`, unlike the full
+    /// `TifXyzVolume`, which embeds a (possibly `!Sync`) base `Volume`. Callers
+    /// that render across threads (e.g. the offline renderer) keep one of these
+    /// and rebuild a per-thread volume via [`from_data`](Self::from_data).
+    pub fn data(&self) -> Arc<TifXyzData> {
+        self.data.clone()
+    }
+
+    /// Build a volume from a pre-projected [`TifXyzData`] (see [`data`](Self::data)),
+    /// swapping in `base_volume`. Avoids re-decoding the TIFFs and re-applying
+    /// the affine; the tex dims are recomputed from the grid, matching what a
+    /// fresh `load_from_directory` / `with_base` would produce.
+    pub fn from_data(data: Arc<TifXyzData>, base_volume: Volume) -> Self {
+        let (tex_width, tex_height) = nominal_dims(&data.base);
+        Self {
+            volume: base_volume,
+            data,
+            tex_width,
+            tex_height,
+        }
+    }
+
     /// Reuse the parsed grid; only re-apply the affine if it changed.
     /// `width`/`height` are accepted for API parity with `ObjVolume::with_base`
     /// but ignored — tex dims are determined by `scale` + grid dims, not by

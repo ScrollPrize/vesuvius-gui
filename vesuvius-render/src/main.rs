@@ -13,8 +13,9 @@ use vesuvius_rs::cache::epoch::CAP_ENV_VAR;
 use vesuvius_rs::cache::{ChunkCache, ChunkKey, ChunkState, UnifiedCache, UnifiedVolume};
 use vesuvius_rs::model::NewVolumeReference;
 use vesuvius_rs::volume::{
-    AffineTransform, CompositingMode, CompositingSettings, DrawingConfig, Image, ObjFile, ObjVolume, OverlayColoring,
-    OverlayVolume, PaintVolume, ProjectionKind, Volume, VolumeCons, VoxelPaintVolume, VoxelVolume,
+    AffineTransform, CompositingMode, CompositingSettings, DrawingConfig, EmptyVolume, Image, ObjFile, ObjVolume,
+    OverlayColoring, OverlayVolume, PaintVolume, ProjectionKind, TifXyzData, TifXyzVolume, Volume, VolumeCons,
+    VoxelPaintVolume, VoxelVolume,
 };
 use vesuvius_zarr::base_cache_dir;
 
@@ -182,22 +183,29 @@ impl AlphaArgs {
     }
 }
 
-/// Vesuvius Renderer, a tool to render segments from obj files
+/// Vesuvius Renderer, a tool to render segments from obj files or vc3d tifxyz directories
 #[derive(Parser, Debug)]
 #[command(about, long_about = None)]
 pub struct Args {
-    /// Provide segment file to render
-    #[clap(long)]
-    obj: String,
+    /// Provide an obj segment file to render. Requires --width and --height.
+    /// Mutually exclusive with --tifxyz.
+    #[clap(long, conflicts_with = "tifxyz")]
+    obj: Option<String>,
+
+    /// Render a vc3d tifxyz directory (containing meta.json + x/y/z.tif). Grid
+    /// dimensions are read from the TIFFs, so --width/--height are not required.
+    /// Mutually exclusive with --obj.
+    #[clap(long, conflicts_with = "obj")]
+    tifxyz: Option<String>,
 
     /// Width of the segment file when browsing obj files
     #[clap(long)]
-    width: u32,
+    width: Option<u32>,
     /// Height of the segment file when browsing obj files
     #[clap(long)]
-    height: u32,
+    height: Option<u32>,
 
-    /// Transform to apply to the obj file (to map between different scans). You can either supply a filename to a transform json file
+    /// Transform to apply to the segment (to map between different scans). You can either supply a filename to a transform json file
     /// (as defined in https://github.com/ScrollPrize/villa/blob/main/foundation/volume-registration/transform_schema.json) or supply
     /// a 4x3 affine transformation matrix as a json array string directly
     #[clap(long)]
@@ -412,8 +420,10 @@ impl RenderParams {
 impl From<&Args> for RenderParams {
     fn from(args: &Args) -> Self {
         Self {
-            width: args.width as usize,
-            height: args.height as usize,
+            // For --obj these are the (required) catalog dims; for --tifxyz they
+            // are placeholders overridden in `Rendering::new` from the TIFF grid.
+            width: args.width.unwrap_or(0) as usize,
+            height: args.height.unwrap_or(0) as usize,
             projection: if args.ortho_xz {
                 ProjectionKind::OrthographicXZ
             } else {
@@ -464,10 +474,25 @@ struct TileChunks {
     overlay: BTreeSet<VolumeChunk>,
 }
 
+/// The surface geometry being rendered. Both variants hold a base-independent,
+/// `Send + Sync` projection of the surface; `Rendering::world` wraps it around
+/// an inner (base) volume per tile. They must stay `Send` because `Rendering`
+/// is moved into `spawn_blocking` — so neither embeds a base `Volume` (whose
+/// trait object is `!Send`); the base is supplied per tile instead.
+#[derive(Clone)]
+enum Segment {
+    /// Parsed obj mesh; wrapped fresh per tile by `ObjVolume::new`.
+    Obj(Arc<ObjFile>),
+    /// tifxyz grid + baked transform, loaded once; the real base volume is
+    /// supplied per tile via `TifXyzVolume::from_data` (cheap — it reuses the
+    /// `Arc`'d, parsed projection).
+    TifXyz(Arc<TifXyzData>),
+}
+
 #[derive(Clone)]
 struct Rendering {
     params: RenderParams,
-    obj: Arc<ObjFile>,
+    segment: Segment,
     cache: ChunkCache,
     /// Set when `--overlay` is given: a second cache over the overlay/label
     /// volume, wrapped together with the base via `OverlayVolume` at render
@@ -476,7 +501,7 @@ struct Rendering {
 }
 
 impl Rendering {
-    fn new(params: RenderParams, args: &Args) -> Result<Self> {
+    fn new(mut params: RenderParams, args: &Args) -> Result<Self> {
         // The overlay-aware modes read opacity from the overlay volume; without
         // one they would silently degrade to a plain `Alpha` walk (that's how
         // `OverlayVolume` falls back for non-overlay backends, but here there's
@@ -496,7 +521,27 @@ impl Rendering {
             ));
         }
 
-        let obj = Arc::new(ObjVolume::load_obj(&args.obj, &resolve_transform(args)?, params.projection));
+        let transform = resolve_transform(args)?;
+
+        let segment = match (args.tifxyz.as_ref(), args.obj.as_ref()) {
+            (Some(tifxyz_dir), _) => {
+                // Load + project the grid once (with a throwaway base); the real
+                // base is supplied per tile in `world`. Tex dims come from the
+                // TIFFs, so override the (ignored) --width/--height with them.
+                let tpl = TifXyzVolume::load_from_directory(tifxyz_dir, EmptyVolume {}.into_volume(), &transform)
+                    .map_err(|e| anyhow!("Failed to load tifxyz from {}: {:#}", tifxyz_dir, e))?;
+                params.width = tpl.width();
+                params.height = tpl.height();
+                Segment::TifXyz(tpl.data())
+            }
+            (None, Some(obj_path)) => {
+                if args.width.is_none() || args.height.is_none() {
+                    return Err(anyhow!("--width and --height are required when using --obj"));
+                }
+                Segment::Obj(Arc::new(ObjVolume::load_obj(obj_path, &transform, params.projection)))
+            }
+            (None, None) => return Err(anyhow!("one of --obj or --tifxyz is required")),
+        };
 
         let cache_root = args
             .data_directory
@@ -517,10 +562,23 @@ impl Rendering {
 
         Ok(Self {
             params,
-            obj,
+            segment,
             cache,
             overlay_cache,
         })
+    }
+
+    /// Build the per-tile "world" volume: maps the UV tile to world xyz and
+    /// samples `inner` (the base, optionally overlay-wrapped). Shared by the
+    /// chunk-collection pass and the render pass so both sample identically.
+    fn world(&self, inner: Volume) -> Volume {
+        match &self.segment {
+            Segment::Obj(obj) => {
+                ObjVolume::new(obj.clone(), inner, self.params.width, self.params.height).into_volume()
+            }
+            // Cheap: reuses the Arc'd projection, only the base differs per tile.
+            Segment::TifXyz(data) => TifXyzVolume::from_data(data.clone(), inner).into_volume(),
+        }
     }
 
     async fn run(&self, multi: &MultiProgress) -> Result<()> {
@@ -636,8 +694,6 @@ impl Rendering {
     /// exactly like the render pass, so the overlay's sampled chunks are
     /// collected too (in their own cache's coordinate space).
     fn chunks_for(&self, UVTile { u, v, w }: &UVTile) -> TileChunks {
-        let width = self.params.width;
-        let height = self.params.height;
         let tile_width = self.params.tile_size;
         let tile_height = self.params.tile_size;
 
@@ -661,7 +717,7 @@ impl Rendering {
             None => Volume::from_ref(base_collector.clone()),
         };
 
-        let world = ObjVolume::new(self.obj.clone(), inner, width, height).into_volume();
+        let world = self.world(inner);
 
         let mut image = Image::new(tile_width, tile_height);
         let xyz = [
@@ -811,7 +867,7 @@ impl Rendering {
             }
             None => base,
         };
-        let world = ObjVolume::new(self.obj.clone(), vol, self.params.width, self.params.height).into_volume();
+        let world = self.world(vol);
         let config = self.params.drawing_config();
 
         let mut image = Image::new(paint_width, paint_height);

@@ -26,7 +26,7 @@ pub use objvolume::{ObjFile, ObjVolume, ProjectionKind};
 pub use overlay::{BlendMode, OverlayColoring, OverlayPaintVolume, OverlayVolume};
 pub use ppmvolume::PPMVolume;
 use std::sync::Arc;
-pub use tifxyz::{TifXyzBase, TifXyzVolume};
+pub use tifxyz::{TifXyzBase, TifXyzData, TifXyzVolume};
 pub use transform::AffineTransform;
 pub use volume64x4::VolumeGrid64x4Mapped;
 pub use zarr_paint::{ColorScheme, FourColors, GrayScale, OmeZarrPaintVolume};
