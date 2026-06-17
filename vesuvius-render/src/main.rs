@@ -19,13 +19,15 @@ use vesuvius_rs::volume::{
 };
 use vesuvius_zarr::base_cache_dir;
 
+mod metadata;
+
 /// Wall-clock budget for making one tile's chunks resident before we give up
 /// and render with whatever is available. Chunk fetches are normally far
 /// faster; this only guards against a permanently failing source so the run
 /// can't hang forever.
 const TILE_ENSURE_TIMEOUT: Duration = Duration::from_secs(300);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Crop {
     pub top: usize,
     pub left: usize,
@@ -67,7 +69,7 @@ impl clap::builder::TypedValueParser for CropParser {
 /// `volume::CompositingMode` one-to-one; kept separate so the CLI crate owns
 /// the `clap::ValueEnum` derive. The `alpha-overlay*` modes additionally
 /// require `--overlay` (the overlay supplies per-sample opacity).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
 pub enum CompositeModeArg {
     None,
     Max,
@@ -95,7 +97,7 @@ impl From<CompositeModeArg> for CompositingMode {
 /// plane is sampled per layer). `--composite-mode` (or the `--enable-alpha`
 /// shortcut) switches to compositing along the surface normal across the
 /// configured layer window.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, serde::Serialize)]
 pub struct AlphaArgs {
     /// Compositing mode. Overrides `--enable-alpha` when set. The
     /// `alpha-overlay*` modes require `--overlay`.
@@ -184,7 +186,7 @@ impl AlphaArgs {
 }
 
 /// Vesuvius Renderer, a tool to render segments from obj files or vc3d tifxyz directories
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, serde::Serialize)]
 #[command(about, long_about = None)]
 pub struct Args {
     /// Provide an obj segment file to render. Requires --width and --height.
@@ -290,9 +292,25 @@ pub struct Args {
     #[clap(flatten)]
     alpha: AlphaArgs,
 }
+impl Args {
+    /// Path to the `--obj` segment file, if one was given.
+    pub fn obj_path(&self) -> Option<&str> {
+        self.obj.as_deref()
+    }
+    /// Path to the `--tifxyz` directory, if one was given.
+    pub fn tifxyz_path(&self) -> Option<&str> {
+        self.tifxyz.as_deref()
+    }
+}
 
 fn main() -> Result<()> {
     env_logger::init();
+    eprintln!(
+        "vesuvius-render {} (git {}, built {})",
+        env!("CARGO_PKG_VERSION"),
+        metadata::GIT_REVISION,
+        metadata::BUILD_TIME
+    );
     let args = Args::parse();
     // The blocking pool runs the collect + render stages; the ensure stage's
     // wait is async and holds no blocking thread. Give the pool room for both
@@ -393,6 +411,9 @@ struct RenderParams {
     compositing: CompositingSettings,
     render_concurrency: usize,
     prefetch_depth: usize,
+    /// Provenance JSON (build version + invocation params) embedded into every
+    /// rendered layer image. Built once from `Args` in `From<&Args>`.
+    metadata_json: String,
 }
 impl RenderParams {
     fn render_left(&self) -> usize {
@@ -438,6 +459,7 @@ impl From<&Args> for RenderParams {
             compositing: args.alpha.to_settings(),
             render_concurrency: args.render_concurrency.unwrap_or(num_cpus::get()).max(1),
             prefetch_depth: args.prefetch_depth.unwrap_or(4),
+            metadata_json: metadata::build_metadata_json(args),
         }
     }
 }
@@ -839,12 +861,8 @@ impl Rendering {
             }
         }
 
-        image
-            .save(format!(
-                "{}/{:02}.{}",
-                self.params.target_dir, w, self.params.target_format
-            ))
-            .unwrap();
+        let path = format!("{}/{:02}.{}", self.params.target_dir, w, self.params.target_format);
+        metadata::save_image_with_metadata(&image, &path, &self.params.target_format, &self.params.metadata_json)?;
 
         Ok(())
     }

@@ -17,4 +17,12 @@ indicatif       = { workspace = true }
 log             = { workspace = true }
 num_cpus        = { workspace = true }
 regex           = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+sha2            = { workspace = true }
 tokio           = { workspace = true }
+
+# Format-specific encoders used to embed render provenance (git revision,
+# build time, params) directly into output files.
+png             = { workspace = true }
+tiff            = { workspace = true }
