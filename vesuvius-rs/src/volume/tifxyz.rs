@@ -76,6 +76,12 @@ pub struct TifXyzData {
 pub struct TifXyzVolume {
     volume: Volume,
     data: Arc<TifXyzData>,
+    /// Grid-cells per output UV pixel, i.e. the factor `seg_to_grid` multiplies
+    /// by. Defaults to `meta.json.scale` (→ natural `nominal_dims`), but a
+    /// caller can render the unrolled segment at an arbitrary resolution by
+    /// choosing `tex_width`/`tex_height` (see `from_data`); then it's
+    /// `[cols/tex_width, rows/tex_height]`, the grid sampled finer/coarser.
+    scale: [f64; 2],
     tex_width: usize,
     tex_height: usize,
 }
@@ -377,6 +383,7 @@ impl TifXyzVolume {
         }
         let base = TifXyzBase::load(dir)?;
         let (tex_width, tex_height) = nominal_dims(&base);
+        let scale = base.scale;
         log::info!(
             "TifXyzVolume::load_from_directory grid {}x{} scale {:?} → nominal {}x{}",
             base.cols,
@@ -389,6 +396,7 @@ impl TifXyzVolume {
         Ok(Self {
             volume: base_volume,
             data,
+            scale,
             tex_width,
             tex_height,
         })
@@ -415,13 +423,30 @@ impl TifXyzVolume {
 
     /// Build a volume from a pre-projected [`TifXyzData`] (see [`data`](Self::data)),
     /// swapping in `base_volume`. Avoids re-decoding the TIFFs and re-applying
-    /// the affine; the tex dims are recomputed from the grid, matching what a
-    /// fresh `load_from_directory` / `with_base` would produce.
-    pub fn from_data(data: Arc<TifXyzData>, base_volume: Volume) -> Self {
-        let (tex_width, tex_height) = nominal_dims(&data.base);
+    /// the affine.
+    ///
+    /// `dims` selects the output UV resolution: `None` uses the natural
+    /// `grid ÷ scale` `nominal_dims` (and the exact `meta.json` scale, matching
+    /// a fresh `load_from_directory` / `with_base`); `Some((w, h))` renders the
+    /// unrolled segment at `w × h` instead, sampling the grid proportionally —
+    /// the analog of choosing `--width`/`--height` for an obj segment. Pass `w`
+    /// and `h` > 0.
+    pub fn from_data(data: Arc<TifXyzData>, base_volume: Volume, dims: Option<(usize, usize)>) -> Self {
+        let (tex_width, tex_height, scale) = match dims {
+            Some((w, h)) => {
+                let w = w.max(1);
+                let h = h.max(1);
+                (w, h, [data.base.cols as f64 / w as f64, data.base.rows as f64 / h as f64])
+            }
+            None => {
+                let (w, h) = nominal_dims(&data.base);
+                (w, h, data.base.scale)
+            }
+        };
         Self {
             volume: base_volume,
             data,
+            scale,
             tex_width,
             tex_height,
         }
@@ -446,15 +471,16 @@ impl TifXyzVolume {
         Self {
             volume: base_volume,
             data,
+            scale: self.scale,
             tex_width: self.tex_width,
             tex_height: self.tex_height,
         }
     }
 
-    /// Segment-space (nominal/voxel-unit) UV → grid-cell fractional coords.
+    /// Segment-space (output-UV) coords → grid-cell fractional coords.
     #[inline]
     fn seg_to_grid(&self, seg_u: f64, seg_v: f64) -> (f64, f64) {
-        (seg_u * self.data.base.scale[0] as f64, seg_v * self.data.base.scale[1] as f64)
+        (seg_u * self.scale[0], seg_v * self.scale[1])
     }
 
     /// UV-pane segment-coord → world voxel coord lookup.
@@ -779,6 +805,7 @@ impl PaintVolume for TifXyzVolume {
 
     fn shared(&self) -> VolumeCons {
         let data = self.data.clone();
+        let scale = self.scale;
         let tex_width = self.tex_width;
         let tex_height = self.tex_height;
         let volume = self.volume.shared();
@@ -786,6 +813,7 @@ impl PaintVolume for TifXyzVolume {
             TifXyzVolume {
                 volume: volume(),
                 data,
+                scale,
                 tex_width,
                 tex_height,
             }
@@ -1075,12 +1103,7 @@ mod tests {
         };
         let (tex_w, tex_h) = nominal_dims(&base);
         let data = TifXyzData::build(base, &None);
-        let vol = TifXyzVolume {
-            volume: EmptyVolume {}.into_volume(),
-            data,
-            tex_width: tex_w,
-            tex_height: tex_h,
-        };
+        let vol = TifXyzVolume::from_data(data, EmptyVolume {}.into_volume(), None);
         assert_eq!(vol.get([-1.0, 5.0, 0.0], 1), 0);
         assert_eq!(vol.get([5.0, -1.0, 0.0], 1), 0);
         let oob = (tex_w + 100) as f64;
@@ -1099,14 +1122,8 @@ mod tests {
         };
         // fixture bbox z range ≈ [4307, 5593]; pick a plane near the middle.
         let z_plane = 4950i32;
-        let (tex_w, tex_h) = nominal_dims(&base);
         let data = TifXyzData::build(base, &None);
-        let vol = TifXyzVolume {
-            volume: EmptyVolume {}.into_volume(),
-            data,
-            tex_width: tex_w,
-            tex_height: tex_h,
-        };
+        let vol = TifXyzVolume::from_data(data, EmptyVolume {}.into_volume(), None);
         let mut image = crate::volume::Image::new_from_color(256, 256, ecolor::Color32::TRANSPARENT);
         // XY pane: u_coord=0, v_coord=1, plane_coord=2. Center around the
         // approximate xy midpoint of the bbox, 32 voxels per pixel to span the

@@ -221,6 +221,17 @@ pub struct Args {
     #[clap(long)]
     invert_transform: bool,
 
+    /// Scale the output UV resolution by the transform's linear scale factor,
+    /// so the unrolled segment is rendered at the *target* volume's resolution
+    /// instead of the source's. The source UV extent is the catalog
+    /// --width/--height for obj, or `grid ÷ scale` for tifxyz; when the
+    /// transform magnifies the surface (e.g. mapping a coarse scan into a finer
+    /// one) the source-resolution render is blurry and crop coords authored
+    /// against the target volume fall out of bounds. Scales --width/--height
+    /// (and thus --crop) too. No effect without --transform.
+    #[clap(long, default_value_t = false)]
+    scale_uv_by_transform: bool,
+
     /// The target directory to save the rendered images
     #[clap(long)]
     target_dir: String,
@@ -507,8 +518,13 @@ enum Segment {
     Obj(Arc<ObjFile>),
     /// tifxyz grid + baked transform, loaded once; the real base volume is
     /// supplied per tile via `TifXyzVolume::from_data` (cheap — it reuses the
-    /// `Arc`'d, parsed projection).
-    TifXyz(Arc<TifXyzData>),
+    /// `Arc`'d, parsed projection). `dims` is the output UV resolution: `None`
+    /// uses the natural `grid ÷ scale` nominal dims; `Some((w, h))` renders the
+    /// unrolled segment at `w × h` (set by `--scale-uv-by-transform`).
+    TifXyz {
+        data: Arc<TifXyzData>,
+        dims: Option<(usize, usize)>,
+    },
 }
 
 #[derive(Clone)]
@@ -545,21 +561,53 @@ impl Rendering {
 
         let transform = resolve_transform(args)?;
 
+        // Optionally magnify the source UV dims by the transform's linear scale
+        // factor so we render at the target volume's resolution rather than the
+        // source's (see --scale-uv-by-transform). Identical for obj and tifxyz:
+        // both have a source-resolution UV extent (catalog --width/--height for
+        // obj, grid ÷ scale for tifxyz) that the transform may magnify.
+        let scale_uv = |w: usize, h: usize| -> (usize, usize) {
+            if !args.scale_uv_by_transform {
+                return (w, h);
+            }
+            let Some(s) = transform.as_ref().map(|t| t.scale_factor()) else {
+                log::warn!("--scale-uv-by-transform set but no --transform given; UV dims left unchanged");
+                return (w, h);
+            };
+            let sw = (w as f64 * s).round().max(1.0) as usize;
+            let sh = (h as f64 * s).round().max(1.0) as usize;
+            log::info!("--scale-uv-by-transform: {}x{} × {:.4} → {}x{}", w, h, s, sw, sh);
+            (sw, sh)
+        };
+
         let segment = match (args.tifxyz.as_ref(), args.obj.as_ref()) {
             (Some(tifxyz_dir), _) => {
                 // Load + project the grid once (with a throwaway base); the real
                 // base is supplied per tile in `world`. Tex dims come from the
-                // TIFFs, so override the (ignored) --width/--height with them.
+                // TIFFs (the --width/--height args are ignored for tifxyz).
                 let tpl = TifXyzVolume::load_from_directory(tifxyz_dir, EmptyVolume {}.into_volume(), &transform)
                     .map_err(|e| anyhow!("Failed to load tifxyz from {}: {:#}", tifxyz_dir, e))?;
-                params.width = tpl.width();
-                params.height = tpl.height();
-                Segment::TifXyz(tpl.data())
+                let (nominal_w, nominal_h) = (tpl.width(), tpl.height());
+
+                let (w, h) = scale_uv(nominal_w, nominal_h);
+                params.width = w;
+                params.height = h;
+                // Only override the grid sampling when we actually scaled; `None`
+                // keeps the exact `meta.json` scale (avoids round-trip rounding).
+                let dims = if (w, h) == (nominal_w, nominal_h) {
+                    None
+                } else {
+                    Some((w, h))
+                };
+                Segment::TifXyz { data: tpl.data(), dims }
             }
             (None, Some(obj_path)) => {
-                if args.width.is_none() || args.height.is_none() {
+                let (Some(w), Some(h)) = (args.width, args.height) else {
                     return Err(anyhow!("--width and --height are required when using --obj"));
-                }
+                };
+                let (w, h) = scale_uv(w as usize, h as usize);
+                params.width = w;
+                params.height = h;
                 Segment::Obj(Arc::new(ObjVolume::load_obj(obj_path, &transform, params.projection)))
             }
             (None, None) => return Err(anyhow!("one of --obj or --tifxyz is required")),
@@ -599,7 +647,7 @@ impl Rendering {
                 ObjVolume::new(obj.clone(), inner, self.params.width, self.params.height).into_volume()
             }
             // Cheap: reuses the Arc'd projection, only the base differs per tile.
-            Segment::TifXyz(data) => TifXyzVolume::from_data(data.clone(), inner).into_volume(),
+            Segment::TifXyz { data, dims } => TifXyzVolume::from_data(data.clone(), inner, *dims).into_volume(),
         }
     }
 
