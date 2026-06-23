@@ -15,23 +15,32 @@ fn git(args: &[&str]) -> Option<std::process::Output> {
 }
 
 fn main() {
-    let revision = git(&["rev-parse", "HEAD"])
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .map(|rev| {
-            // `--quiet` exits non-zero when tracked files differ from HEAD.
-            let dirty = Command::new("git")
-                .args(["diff", "--quiet", "HEAD"])
-                .status()
-                .map(|s| !s.success())
-                .unwrap_or(false);
-            if dirty {
-                format!("{}-dirty", rev)
-            } else {
-                rev
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    // Prefer an explicitly supplied revision: container builds compile from a source tarball
+    // with no `.git`, so the workflow passes the commit in via VESUVIUS_GIT_REVISION. Local
+    // builds leave it unset and fall back to querying git (with the dirty suffix).
+    let revision = std::env::var("VESUVIUS_GIT_REVISION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            git(&["rev-parse", "HEAD"])
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .map(|rev| {
+                    // `--quiet` exits non-zero when tracked files differ from HEAD.
+                    let dirty = Command::new("git")
+                        .args(["diff", "--quiet", "HEAD"])
+                        .status()
+                        .map(|s| !s.success())
+                        .unwrap_or(false);
+                    if dirty {
+                        format!("{}-dirty", rev)
+                    } else {
+                        rev
+                    }
+                })
+                .unwrap_or_else(|| "unknown".to_string())
+        });
     println!("cargo:rustc-env=VESUVIUS_GIT_REVISION={}", revision);
+    println!("cargo:rerun-if-env-changed=VESUVIUS_GIT_REVISION");
 
     let build_time = Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])

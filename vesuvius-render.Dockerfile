@@ -15,6 +15,9 @@
 FROM rust:1-bookworm AS builder
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg tokio_unstable -C target-cpu=x86-64-v3"
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg tokio_unstable -C target-cpu=neoverse-v2"
+# Provenance: no .git in the build context, so build.rs reads the commit from this env var.
+ARG VESUVIUS_GIT_REVISION=""
+ENV VESUVIUS_GIT_REVISION=${VESUVIUS_GIT_REVISION}
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p vesuvius-render
