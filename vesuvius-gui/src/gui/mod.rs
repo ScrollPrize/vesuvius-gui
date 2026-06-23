@@ -1,4 +1,5 @@
 mod app;
+mod atlas_download;
 mod volume_pane;
 
 pub use app::{ObjFileConfig, TemplateApp, VesuviusConfig};

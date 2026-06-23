@@ -277,8 +277,27 @@ fn get_standard_url(data: &[DataEntry], data_type: &str) -> Option<String> {
 }
 
 impl Segment {
+    /// URL of the obj mesh, preferring the plain `obj` and falling back to
+    /// `obj-normalized` — many segments only publish the normalized variant
+    /// (the catalog lists them, but the plain type has no accessible origin).
     pub fn get_obj_url(&self) -> Option<String> {
-        get_standard_url(&self.data, "obj")
+        get_standard_url(&self.data, "obj").or_else(|| get_standard_url(&self.data, "obj-normalized"))
+    }
+
+    /// URL of the tifxyz segmentation directory (containing `meta.json` +
+    /// `x.tif` + `y.tif` + `z.tif`). The returned URL points at the directory;
+    /// callers append the individual file names. Prefers the plain `tifxyz`,
+    /// falling back to `tifxyz-normalized` (the variant published for segments
+    /// that don't expose a plain tifxyz, e.g. the 1667 series).
+    pub fn get_tifxyz_url(&self) -> Option<String> {
+        get_standard_url(&self.data, "tifxyz").or_else(|| get_standard_url(&self.data, "tifxyz-normalized"))
+    }
+
+    /// Whether this segment has any accessible geometry to download (tifxyz or
+    /// obj, plain or normalized). The catalog lists every segment, but many only
+    /// have private-S3 origins; this distinguishes "listed" from "downloadable".
+    pub fn is_downloadable(&self) -> bool {
+        self.get_tifxyz_url().is_some() || self.get_obj_url().is_some()
     }
 }
 

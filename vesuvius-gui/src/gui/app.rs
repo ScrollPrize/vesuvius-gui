@@ -1,3 +1,4 @@
+use crate::gui::atlas_download;
 use crate::gui::{FrameBudget, PaneType, VolumePane, UV_PANE_BUDGET_FRACTION};
 use directories::BaseDirs;
 use egui::CollapsingHeader;
@@ -144,9 +145,14 @@ impl Default for SegmentMode {
     }
 }
 
-enum UINotification {
+pub(crate) enum UINotification {
     ObjDownloadReady(Segment),
-    AtlasObjDownloadReady(String, String, String),
+    /// (sample_id, segment_id, volume_id) — an atlas segment (tifxyz dir or obj)
+    /// finished downloading into the cache and is ready to load.
+    AtlasSegmentDownloadReady(String, String, String),
+    /// (sample_id, segment_id) — an atlas segment download failed; clears the
+    /// in-progress (blinking) state so the user can retry.
+    AtlasSegmentDownloadFailed(String, String),
 }
 
 pub struct ObjFileConfig {
@@ -277,11 +283,6 @@ impl Default for TemplateApp {
 }
 
 impl TemplateApp {
-    fn atlas_obj_cache_path(sample_id: &str, segment_id: &str) -> std::path::PathBuf {
-        let dir = BaseDirs::new().unwrap().cache_dir().join("vesuvius-gui");
-        dir.join(format!("atlas-segments/{}/{}.obj", sample_id, segment_id))
-    }
-
     fn load_atlas_segment(&mut self, sample_id: &str, segment_id: &str) {
         self.load_atlas_segment_with_volume(sample_id, segment_id, None);
     }
@@ -352,10 +353,9 @@ impl TemplateApp {
         }
 
         if let Some((width, height, coord_scale_transform)) = segment_info {
-            let obj_cache_path = Self::atlas_obj_cache_path(sample_id, segment_id);
-            if obj_cache_path.exists() {
+            if let Some(cache_path) = atlas_download::cached_path(sample_id, segment_id) {
                 self.setup_segment(
-                    obj_cache_path.to_str().unwrap(),
+                    cache_path.to_str().unwrap(),
                     width,
                     height,
                     transform.as_ref(),
@@ -516,28 +516,69 @@ impl TemplateApp {
             };
             let transform_owned = transform.cloned();
             let is_reload = segment.filename == segment_file;
+            let old_coord = segment.coord;
+            let old_zoom = self.zoom;
+            let old_width = segment.width;
 
-            let seg_vol = match (is_reload, segment.segment_volume.as_ref()) {
+            // Build (or, on reload, cheaply re-project) the tifxyz grid at its
+            // natural `grid ÷ scale` resolution. A load failure (corrupt or
+            // incomplete directory) is logged and aborts the switch, restoring
+            // the previous segment instead of crashing the app.
+            let nominal_vol = match (is_reload, segment.segment_volume.as_ref()) {
                 (true, Some(SegmentVolume::TifXyz(prev))) => {
                     log::info!("TifXyzVolume::with_base reusing parsed grid for {}", segment_file);
-                    SegmentVolume::TifXyz(Arc::new(prev.with_base(
-                        base,
-                        prev.width(),
-                        prev.height(),
-                        &transform_owned,
-                    )))
+                    prev.with_base(base.clone(), prev.width(), prev.height(), &transform_owned)
                 }
-                _ => {
-                    let vol = TifXyzVolume::load_from_directory(segment_file, base, &transform_owned)
-                        .unwrap_or_else(|e| panic!("Failed to load tifxyz from {}: {:#}", segment_file, e));
-                    SegmentVolume::TifXyz(Arc::new(vol))
-                }
+                _ => match TifXyzVolume::load_from_directory(segment_file, base.clone(), &transform_owned) {
+                    Ok(vol) => vol,
+                    Err(e) => {
+                        log::error!("Failed to load tifxyz from {}: {:#}", segment_file, e);
+                        self.segment_mode = Some(segment);
+                        return;
+                    }
+                },
             };
+
+            // `--scale-uv-by-transform` equivalent: when a transform maps the
+            // segment into a finer target volume, render the unrolled segment at
+            // the target's resolution (nominal dims × the transform's linear
+            // scale) instead of the source's — otherwise it's blurry. Mirrors
+            // vesuvius-render's scale_uv (AffineTransform::scale_factor).
+            let scale = transform_owned.as_ref().map(|t| t.scale_factor()).unwrap_or(1.0);
+            let seg_vol = if (scale - 1.0).abs() > 1e-9 {
+                let w = (nominal_vol.width() as f64 * scale).round().max(1.0) as usize;
+                let h = (nominal_vol.height() as f64 * scale).round().max(1.0) as usize;
+                log::info!(
+                    "tifxyz scale-uv-by-transform: {}x{} × {:.4} → {}x{}",
+                    nominal_vol.width(),
+                    nominal_vol.height(),
+                    scale,
+                    w,
+                    h
+                );
+                TifXyzVolume::from_data(nominal_vol.data(), base, Some((w, h)))
+            } else {
+                nominal_vol
+            };
+            let seg_vol = SegmentVolume::TifXyz(Arc::new(seg_vol));
 
             let width = seg_vol.width() as i32;
             let height = seg_vol.height() as i32;
 
-            if !is_reload {
+            if is_reload {
+                // The output UV resolution can change with the target volume's
+                // scale; keep the surface point under the cursor stable by
+                // rescaling u/v + zoom. Depth (coord[2]) is in fixed voxel units.
+                if old_width > 0 && width as usize != old_width {
+                    let ratio = width as f64 / old_width as f64;
+                    segment.coord = [
+                        (old_coord[0] as f64 * ratio) as i32,
+                        (old_coord[1] as f64 * ratio) as i32,
+                        old_coord[2],
+                    ];
+                    self.zoom = (old_zoom as f64 / ratio) as f32;
+                }
+            } else {
                 segment.coord = [width / 2, height / 2, 0];
                 segment.filename = segment_file.to_string();
                 segment.info = segment_file.to_string();
@@ -1353,9 +1394,14 @@ impl TemplateApp {
                         }
                     }
                 }
-                UINotification::AtlasObjDownloadReady(sample_id, segment_id, _volume_id) => {
+                UINotification::AtlasSegmentDownloadReady(sample_id, segment_id, _volume_id) => {
                     self.load_atlas_segment(&sample_id, &segment_id);
                     self.downloading_atlas_segment = None;
+                }
+                UINotification::AtlasSegmentDownloadFailed(sample_id, segment_id) => {
+                    if self.downloading_atlas_segment == Some((sample_id, segment_id)) {
+                        self.downloading_atlas_segment = None;
+                    }
                 }
             }
         }
@@ -1874,9 +1920,10 @@ impl TemplateApp {
                                             fn l(text: impl Into<WidgetText>) -> Label {
                                                 Label::new(text).selectable(false)
                                             }
+                                            let downloadable = segment.is_downloadable();
                                             row.col(|ui| {
-                                                let obj_cache_path = Self::atlas_obj_cache_path(&sample_id, &segment_id);
-                                                let cached = obj_cache_path.exists();
+                                                let cached =
+                                                    atlas_download::cached_path(&sample_id, &segment_id).is_some();
                                                 let mut text = RichText::new(segment_id.as_str());
                                                 if cached {
                                                     text = text.color(Color32::DARK_GREEN);
@@ -1888,6 +1935,10 @@ impl TemplateApp {
                                                     if time % 2 == 0 {
                                                         text = text.color(Color32::YELLOW);
                                                     }
+                                                } else if !downloadable {
+                                                    // Listed in the catalog but has no accessible (tifxyz/obj)
+                                                    // origin — only private storage. Dim it and don't react to clicks.
+                                                    text = text.color(Color32::DARK_GRAY);
                                                 }
                                                 l(text).ui(ui);
                                             });
@@ -1899,7 +1950,7 @@ impl TemplateApp {
                                             });
                                             row.col(|_ui| {});
 
-                                            if row.response().clicked() {
+                                            if downloadable && row.response().clicked() {
                                                 atlas_clicked = Some((sample_id.clone(), segment_id.clone(), segment.clone()));
                                             }
                                         });
@@ -1910,23 +1961,36 @@ impl TemplateApp {
                 }
 
                 if let Some((sample_id, segment_id, segment)) = atlas_clicked {
-                    let obj_cache_path = Self::atlas_obj_cache_path(&sample_id, &segment_id);
-                    if obj_cache_path.exists() {
+                    let volume_id = segment.original_volume_id.clone();
+                    if atlas_download::cached_path(&sample_id, &segment_id).is_some() {
                         self.load_atlas_segment(&sample_id, &segment_id);
+                    } else if let Some(tifxyz_url) = segment.get_tifxyz_url() {
+                        // Prefer tifxyz: download the directory (meta.json + x/y/z.tif).
+                        self.downloading_atlas_segment = Some((sample_id.clone(), segment_id.clone()));
+                        atlas_download::download_tifxyz(
+                            self.notification_sender.clone(),
+                            sample_id,
+                            segment_id,
+                            tifxyz_url,
+                            volume_id,
+                        );
                     } else if let Some(obj_url) = segment.get_obj_url() {
+                        // Fall back to obj for segments that only publish a mesh.
                         log::info!("Downloading atlas obj from {}", obj_url);
                         self.downloading_atlas_segment = Some((sample_id.clone(), segment_id.clone()));
                         let sender = self.notification_sender.clone();
-                        let volume_id = segment.original_volume_id.clone();
                         ehttp::fetch(ehttp::Request::get(&obj_url), move |response| {
                             if let Ok(response) = response {
-                                let obj_file = Self::atlas_obj_cache_path(&sample_id, &segment_id);
+                                let obj_file = atlas_download::obj_cache_path(&sample_id, &segment_id);
                                 std::fs::create_dir_all(&obj_file.parent().unwrap()).unwrap();
                                 let mut file = std::fs::File::create(&obj_file).unwrap();
                                 let bytes = response.bytes;
                                 log::info!("Downloaded {} bytes to {}", bytes.len(), obj_file.display());
                                 std::io::copy(&mut std::io::Cursor::new(bytes), &mut file).unwrap();
-                                let _ = sender.send(UINotification::AtlasObjDownloadReady(sample_id, segment_id, volume_id));
+                                let _ = sender.send(UINotification::AtlasSegmentDownloadReady(sample_id, segment_id, volume_id));
+                            } else {
+                                log::error!("Failed to download atlas obj for {}/{}", sample_id, segment_id);
+                                let _ = sender.send(UINotification::AtlasSegmentDownloadFailed(sample_id, segment_id));
                             }
                         });
                     }
