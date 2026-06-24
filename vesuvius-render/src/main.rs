@@ -5,6 +5,7 @@ use image::Luma;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -300,6 +301,13 @@ pub struct Args {
     #[clap(long)]
     worker_threads: Option<usize>,
 
+    /// Emit a single plain progress line every N seconds (flushed) instead of
+    /// the interactive progress bars. Useful for non-interactive logs (e.g.
+    /// Kubernetes), where the bars draw to a hidden target and nothing appears.
+    /// Auto-enabled (at 5s) when stderr is not a TTY; pass 0 to disable.
+    #[clap(long)]
+    progress_interval: Option<u64>,
+
     #[clap(flatten)]
     alpha: AlphaArgs,
 }
@@ -402,10 +410,58 @@ async fn main_run(args: Args) -> Result<()> {
     let multi = MultiProgress::new();
     monitor_runtime_stats(&multi).await;
 
+    // Plain-line progress for non-interactive logs. The indicatif bars draw to
+    // a hidden target when stderr isn't a TTY (k8s, CI), so without this a
+    // long render produces no output at all. Auto-enable at 5s off a TTY; an
+    // explicit --progress-interval wins (0 disables it everywhere).
+    let plain_progress = match args.progress_interval {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+        None if !std::io::stderr().is_terminal() => Some(Duration::from_secs(5)),
+        None => None,
+    };
+
     let params = (&args).into();
     let rendering = Rendering::new(params, &args)?;
-    rendering.run(&multi).await?;
+    rendering.run(&multi, plain_progress).await?;
     Ok(())
+}
+
+/// Format a duration as `HH:MM:SS` for the plain progress line.
+fn format_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// Spawn a task that prints one flushed progress line every `interval` until
+/// aborted, summarizing each named bar's position/length. Used in place of the
+/// interactive bars when stderr isn't a TTY. The returned handle is aborted
+/// (and a final line printed) by the caller once the pipeline completes.
+fn spawn_plain_progress_logger(
+    bars: Vec<(&'static str, ProgressBar)>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            print_plain_progress(&bars);
+        }
+    })
+}
+
+fn print_plain_progress(bars: &[(&'static str, ProgressBar)]) {
+    use std::io::Write;
+    let elapsed = bars.first().map(|(_, b)| b.elapsed()).unwrap_or_default();
+    let mut parts = vec![format!("elapsed={}", format_elapsed(elapsed))];
+    for (label, bar) in bars {
+        let len = bar.length().unwrap_or(0);
+        let pos = bar.position();
+        let pct = if len > 0 { pos as f64 / len as f64 * 100.0 } else { 0.0 };
+        parts.push(format!("{}={}/{} ({:.0}%)", label, pos, len, pct));
+    }
+    let mut stderr = std::io::stderr();
+    let _ = writeln!(stderr, "[progress] {}", parts.join("  "));
+    let _ = stderr.flush();
 }
 
 #[derive(Clone)]
@@ -651,7 +707,7 @@ impl Rendering {
         }
     }
 
-    async fn run(&self, multi: &MultiProgress) -> Result<()> {
+    async fn run(&self, multi: &MultiProgress, plain_progress: Option<Duration>) -> Result<()> {
         std::fs::create_dir_all(&self.params.target_dir)?;
 
         let count_style = ProgressStyle::with_template(
@@ -680,6 +736,20 @@ impl Rendering {
             .with_message("Saving layers");
         multi.add(layers_bar.clone());
         layers_bar.tick();
+
+        // In non-interactive mode replace the (hidden) bars with a periodic
+        // flushed log line. Hide the interactive draw target so a forced
+        // --progress-interval on a TTY doesn't render both.
+        let progress_logger = plain_progress.map(|interval| {
+            multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+            let bars = vec![
+                ("ensure", ensure_bar.clone()),
+                ("render", render_bar.clone()),
+                ("layers", layers_bar.clone()),
+            ];
+            print_plain_progress(&bars);
+            spawn_plain_progress_logger(bars, interval)
+        });
 
         // Two bounded stages. The ensure stage runs ahead of rendering by
         // `prefetch_depth` tiles so the next tiles' chunks download (in the
@@ -733,6 +803,17 @@ impl Rendering {
             .buffer_unordered(render_conc)
             .collect::<Vec<_>>()
             .await;
+
+        // Stop the periodic logger and emit a final 100% line so the log ends
+        // on a complete state rather than whatever the last tick caught.
+        if let Some(handle) = progress_logger {
+            handle.abort();
+            print_plain_progress(&[
+                ("ensure", ensure_bar.clone()),
+                ("render", render_bar.clone()),
+                ("layers", layers_bar.clone()),
+            ]);
+        }
 
         // Make sure the chunks we fetched are durably recorded for the next run.
         self.cache.flush();
