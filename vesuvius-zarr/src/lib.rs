@@ -17,7 +17,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     ops::Deref,
@@ -715,21 +715,34 @@ impl<const N: usize> ZarrContextBase<N> {
 }
 
 pub struct RawContext {
-    data: memmap::Mmap,
+    data: Box<[u8]>,
 }
 impl RawContext {
+    // The bytes are read fully into the heap rather than mmapped. These chunks
+    // are transient decode containers that get copied onward into the unified
+    // cache, so there is no benefit to keeping the file mapped; and over a
+    // FUSE-backed store (e.g. mountpoint-s3) a single sequential read beats
+    // page-fault-driven small reads.
     fn load_from_file(chunk_file: &File) -> RawContext {
-        let data = unsafe { memmap::Mmap::map(chunk_file).unwrap() };
-        RawContext { data }
+        let mut reader: &File = chunk_file;
+        let mut data = Vec::with_capacity(chunk_file.metadata().map(|m| m.len() as usize).unwrap_or(0));
+        reader.read_to_end(&mut data).unwrap();
+        RawContext {
+            data: data.into_boxed_slice(),
+        }
     }
-    /// Open and mmap an existing file. Returns `None` if the file cannot be
-    /// opened or mmap'd — callers that use this as a cache lookup should
-    /// treat that as a cache miss and fall back to whatever produces the
-    /// bytes (e.g. re-decoding from a compressed source).
+    /// Read an existing file fully into memory. Returns `None` if the file
+    /// cannot be opened or read — callers that use this as a cache lookup
+    /// should treat that as a cache miss and fall back to whatever produces
+    /// the bytes (e.g. re-decoding from a compressed source).
     pub fn open(path: &std::path::Path) -> Option<RawContext> {
         let file = std::fs::File::open(path).ok()?;
-        let data = unsafe { memmap::Mmap::map(&file).ok()? };
-        Some(RawContext { data })
+        let mut reader = &file;
+        let mut data = Vec::with_capacity(file.metadata().map(|m| m.len() as usize).unwrap_or(0));
+        reader.read_to_end(&mut data).ok()?;
+        Some(RawContext {
+            data: data.into_boxed_slice(),
+        })
     }
     pub fn len(&self) -> usize {
         self.data.len()
