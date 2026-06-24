@@ -76,7 +76,7 @@ pub const WORKERS_ENV_VAR: &str = "VESUVIUS_CACHE_WORKERS";
 
 /// Resolve the worker count from `VESUVIUS_CACHE_WORKERS`, falling back to
 /// `DEFAULT_WORKERS` when unset, unparseable, or zero.
-fn configured_workers() -> usize {
+pub fn configured_workers() -> usize {
     match std::env::var(WORKERS_ENV_VAR) {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(0) | Err(_) => {

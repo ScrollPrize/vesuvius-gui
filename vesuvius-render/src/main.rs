@@ -459,8 +459,77 @@ fn print_plain_progress(bars: &[(&'static str, ProgressBar)]) {
         let pct = if len > 0 { pos as f64 / len as f64 * 100.0 } else { 0.0 };
         parts.push(format!("{}={}/{} ({:.0}%)", label, pos, len, pct));
     }
+    if let Some(io) = format_io_stats(elapsed) {
+        parts.push(io);
+    }
     let mut stderr = std::io::stderr();
     let _ = writeln!(stderr, "[progress] {}", parts.join("  "));
+    let _ = stderr.flush();
+}
+
+/// Compact local-fetch I/O segment for the periodic progress line. Returns
+/// `None` until at least one chunk has been read. `read`/`decode` are per-chunk
+/// means; `rd` is the share of busy time spent waiting on the store (vs CPU
+/// decode); `MiB/s` is cumulative store read throughput over `elapsed`.
+fn format_io_stats(elapsed: Duration) -> Option<String> {
+    let s = vesuvius_zarr::metrics::snapshot();
+    if s.chunk_count == 0 {
+        return None;
+    }
+    let mib = s.store_bytes as f64 / (1024.0 * 1024.0);
+    let mean_read_ms = s.read_ns as f64 / s.chunk_count as f64 / 1e6;
+    let mean_decode_ms = s.decode_ns as f64 / s.chunk_count as f64 / 1e6;
+    let secs = elapsed.as_secs_f64().max(1e-9);
+    Some(format!(
+        "io chunks={} MiB={:.1} read={:.2}ms decode={:.2}ms rd={:.0}% MiB/s={:.1}",
+        s.chunk_count,
+        mib,
+        mean_read_ms,
+        mean_decode_ms,
+        s.read_fraction() * 100.0,
+        mib / secs,
+    ))
+}
+
+/// One-shot end-of-run summary of local chunk-fetch behaviour, written to
+/// stderr. This is the line to record for each point of a worker-count sweep.
+/// `occupancy` estimates mean cache-worker utilisation (total read+decode time
+/// over wall-clock × worker count): ~100% means the pool was saturated and more
+/// workers likely help; well under 100% means the limiter is upstream of the
+/// fetch pool. A high `read_frac` means store latency dominates (favor more
+/// workers / fewer round-trips); a high decode share means CPU dominates.
+fn print_render_summary(elapsed: Duration, cache_workers: usize) {
+    use std::io::Write;
+    let s = vesuvius_zarr::metrics::snapshot();
+    let mut stderr = std::io::stderr();
+    if s.chunk_count == 0 {
+        let _ = writeln!(stderr, "[summary] no local chunk reads recorded");
+        let _ = stderr.flush();
+        return;
+    }
+    let mib = s.store_bytes as f64 / (1024.0 * 1024.0);
+    let secs = elapsed.as_secs_f64().max(1e-9);
+    let mean_read_ms = s.read_ns as f64 / s.chunk_count as f64 / 1e6;
+    let mean_decode_ms = s.decode_ns as f64 / s.chunk_count as f64 / 1e6;
+    let occupancy = s.busy_ns() as f64 / (cache_workers.max(1) as f64 * elapsed.as_nanos().max(1) as f64);
+    let _ = writeln!(
+        stderr,
+        "[summary] local-fetch chunks={} read={:.1}MiB wall={} \
+         read_total={:.1}s (mean {:.2}ms) decode_total={:.1}s (mean {:.2}ms) read_frac={:.0}% \
+         cache_workers={} occupancy≈{:.0}% throughput={:.1}chunks/s {:.1}MiB/s",
+        s.chunk_count,
+        mib,
+        format_elapsed(elapsed),
+        s.read_ns as f64 / 1e9,
+        mean_read_ms,
+        s.decode_ns as f64 / 1e9,
+        mean_decode_ms,
+        s.read_fraction() * 100.0,
+        cache_workers,
+        occupancy * 100.0,
+        s.chunk_count as f64 / secs,
+        mib / secs,
+    );
     let _ = stderr.flush();
 }
 
@@ -815,6 +884,11 @@ impl Rendering {
                 ("layers", layers_bar.clone()),
             ]);
         }
+
+        // Per-pool worker count × number of pools (base + optional overlay).
+        let cache_workers =
+            vesuvius_rs::cache::configured_workers() * (1 + self.overlay_cache.is_some() as usize);
+        print_render_summary(ensure_bar.elapsed(), cache_workers);
 
         // Make sure the chunks we fetched are durably recorded for the next run.
         self.cache.flush();

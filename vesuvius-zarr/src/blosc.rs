@@ -92,10 +92,17 @@ impl BloscChunk<u8> {
         // a FUSE-backed filesystem (e.g. mountpoint-s3) mmap page faults turn
         // into many small, latency-bound reads that defeat the sequential
         // prefetcher; a single read() lets the backing store serve one large GET.
+        let t_read = std::time::Instant::now();
         let mut bytes = Vec::with_capacity(file.metadata().map(|m| m.len() as usize).unwrap_or(0));
         let mut reader: &File = file;
         reader.read_to_end(&mut bytes).unwrap();
-        Self::decompress_to_vec(&bytes)
+        let read_ns = t_read.elapsed().as_nanos() as u64;
+        let store_bytes = bytes.len() as u64;
+
+        let t_decode = std::time::Instant::now();
+        let out = Self::decompress_to_vec(&bytes);
+        crate::metrics::record_chunk_io(read_ns, t_decode.elapsed().as_nanos() as u64, store_bytes);
+        out
     }
 
     /// In-memory variant of `load_data_from_file`: decompress a blosc-framed
