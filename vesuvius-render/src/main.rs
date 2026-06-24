@@ -759,7 +759,7 @@ impl Rendering {
         let render_conc = self.params.render_concurrency.max(1);
         let ensure_conc = (render_conc + self.params.prefetch_depth).max(1);
 
-        stream::iter(tiles)
+        let layer_results: Vec<Result<()>> = stream::iter(tiles)
             .map(|tile| {
                 let self_clone = self.clone();
                 let ensure_bar = ensure_bar.clone();
@@ -804,6 +804,7 @@ impl Rendering {
             .collect::<Vec<_>>()
             .await;
 
+
         // Stop the periodic logger and emit a final 100% line so the log ends
         // on a complete state rather than whatever the last tick caught.
         if let Some(handle) = progress_logger {
@@ -817,6 +818,12 @@ impl Rendering {
 
         // Make sure the chunks we fetched are durably recorded for the next run.
         self.cache.flush();
+
+        // Propagate the first per-layer failure. Without this, a layer whose
+        // save/encode errored (e.g. a TIFF that overflowed classic 32-bit
+        // offsets) was collected into `layer_results` and silently dropped, so
+        // the render exited 0 and downstream copied a half-written file.
+        layer_results.into_iter().collect::<Result<Vec<()>>>()?;
 
         Ok(())
     }
