@@ -12,6 +12,10 @@ resolver = "2"
 [workspace.dependencies]
 anyhow          = { version = "1" }
 async-recursion = { version = "1" }
+aws-config             = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types   = { version = "1", features = ["hardcoded-credentials"] }
+aws-sigv4              = { version = "1" }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
 base64          = { version = "0.22" }
 bytes           = { version = "1" }
 cc              = { version = "1" }

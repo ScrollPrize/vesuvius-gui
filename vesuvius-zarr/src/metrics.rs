@@ -18,6 +18,27 @@ static READ_NS: AtomicU64 = AtomicU64::new(0);
 static DECODE_NS: AtomicU64 = AtomicU64::new(0);
 static STORE_BYTES: AtomicU64 = AtomicU64::new(0);
 static CHUNK_COUNT: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_READS: AtomicU64 = AtomicU64::new(0);
+static PEAK_READS: AtomicU64 = AtomicU64::new(0);
+
+/// RAII guard that counts a store read as in-flight for its lifetime, so we can
+/// observe how many reads actually run concurrently (the real fetch width,
+/// independent of any assumption about the worker pool size). Hold it only
+/// around the read itself, not the decode.
+pub struct ReadGuard;
+
+/// Mark a store read as starting. Drop the returned guard when the read completes.
+pub fn read_begin() -> ReadGuard {
+    let n = ACTIVE_READS.fetch_add(1, Ordering::Relaxed) + 1;
+    PEAK_READS.fetch_max(n, Ordering::Relaxed);
+    ReadGuard
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        ACTIVE_READS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Record one chunk file read + decode. `read_ns` is the time spent pulling the
 /// (compressed) bytes off the store, `decode_ns` the blosc decode (0 for the
@@ -40,6 +61,10 @@ pub struct ZarrIoStats {
     pub store_bytes: u64,
     /// Number of chunk files read.
     pub chunk_count: u64,
+    /// Store reads in flight at the moment of the snapshot.
+    pub active_reads: u64,
+    /// Peak number of concurrent store reads seen so far.
+    pub peak_reads: u64,
 }
 
 impl ZarrIoStats {
@@ -58,6 +83,18 @@ impl ZarrIoStats {
     pub fn busy_ns(&self) -> u64 {
         self.read_ns + self.decode_ns
     }
+
+    /// Mean number of reads+decodes in flight over `elapsed` — total busy time
+    /// divided by wall time. This is worker-pool-independent: it reflects the
+    /// concurrency we actually achieved, not the pool we think we have.
+    pub fn mean_concurrency(&self, elapsed: std::time::Duration) -> f64 {
+        let wall = elapsed.as_nanos();
+        if wall == 0 {
+            0.0
+        } else {
+            self.busy_ns() as f64 / wall as f64
+        }
+    }
 }
 
 /// Read the current cumulative counters.
@@ -67,5 +104,7 @@ pub fn snapshot() -> ZarrIoStats {
         decode_ns: DECODE_NS.load(Ordering::Relaxed),
         store_bytes: STORE_BYTES.load(Ordering::Relaxed),
         chunk_count: CHUNK_COUNT.load(Ordering::Relaxed),
+        active_reads: ACTIVE_READS.load(Ordering::Relaxed),
+        peak_reads: PEAK_READS.load(Ordering::Relaxed),
     }
 }

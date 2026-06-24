@@ -481,23 +481,28 @@ fn format_io_stats(elapsed: Duration) -> Option<String> {
     let mean_decode_ms = s.decode_ns as f64 / s.chunk_count as f64 / 1e6;
     let secs = elapsed.as_secs_f64().max(1e-9);
     Some(format!(
-        "io chunks={} MiB={:.1} read={:.2}ms decode={:.2}ms rd={:.0}% MiB/s={:.1}",
+        "io chunks={} MiB={:.1} read={:.2}ms decode={:.2}ms rd={:.0}% conc={:.1} peak={} MiB/s={:.1}",
         s.chunk_count,
         mib,
         mean_read_ms,
         mean_decode_ms,
         s.read_fraction() * 100.0,
+        s.mean_concurrency(elapsed),
+        s.peak_reads,
         mib / secs,
     ))
 }
 
 /// One-shot end-of-run summary of local chunk-fetch behaviour, written to
 /// stderr. This is the line to record for each point of a worker-count sweep.
-/// `occupancy` estimates mean cache-worker utilisation (total read+decode time
-/// over wall-clock × worker count): ~100% means the pool was saturated and more
-/// workers likely help; well under 100% means the limiter is upstream of the
-/// fetch pool. A high `read_frac` means store latency dominates (favor more
-/// workers / fewer round-trips); a high decode share means CPU dominates.
+///
+/// `conc` is the mean number of reads+decodes actually in flight (busy time /
+/// wall) and `peak` the high-water mark — the real fetch width, independent of
+/// the configured pool size, which `cache_workers` is shown alongside only for
+/// reference. A high `read_frac` means store latency dominates (favor more
+/// concurrency / fewer round-trips); a high decode share means CPU dominates.
+/// If `conc` sits well below `cache_workers`, the limiter is upstream of the
+/// fetch path (scheduling / in-order render head), not the pool width.
 fn print_render_summary(elapsed: Duration, cache_workers: usize) {
     use std::io::Write;
     let s = vesuvius_zarr::metrics::snapshot();
@@ -511,12 +516,11 @@ fn print_render_summary(elapsed: Duration, cache_workers: usize) {
     let secs = elapsed.as_secs_f64().max(1e-9);
     let mean_read_ms = s.read_ns as f64 / s.chunk_count as f64 / 1e6;
     let mean_decode_ms = s.decode_ns as f64 / s.chunk_count as f64 / 1e6;
-    let occupancy = s.busy_ns() as f64 / (cache_workers.max(1) as f64 * elapsed.as_nanos().max(1) as f64);
     let _ = writeln!(
         stderr,
         "[summary] local-fetch chunks={} read={:.1}MiB wall={} \
          read_total={:.1}s (mean {:.2}ms) decode_total={:.1}s (mean {:.2}ms) read_frac={:.0}% \
-         cache_workers={} occupancy≈{:.0}% throughput={:.1}chunks/s {:.1}MiB/s",
+         conc={:.1} peak={} cache_workers={} throughput={:.1}chunks/s {:.1}MiB/s",
         s.chunk_count,
         mib,
         format_elapsed(elapsed),
@@ -525,8 +529,9 @@ fn print_render_summary(elapsed: Duration, cache_workers: usize) {
         s.decode_ns as f64 / 1e9,
         mean_decode_ms,
         s.read_fraction() * 100.0,
+        s.mean_concurrency(elapsed),
+        s.peak_reads,
         cache_workers,
-        occupancy * 100.0,
         s.chunk_count as f64 / secs,
         mib / secs,
     );

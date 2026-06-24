@@ -725,10 +725,13 @@ impl RawContext {
     // FUSE-backed store (e.g. mountpoint-s3) a single sequential read beats
     // page-fault-driven small reads.
     fn load_from_file(chunk_file: &File) -> RawContext {
-        let t_read = std::time::Instant::now();
         let mut reader: &File = chunk_file;
         let mut data = Vec::with_capacity(chunk_file.metadata().map(|m| m.len() as usize).unwrap_or(0));
-        reader.read_to_end(&mut data).unwrap();
+        let t_read = std::time::Instant::now();
+        {
+            let _g = crate::metrics::read_begin();
+            reader.read_to_end(&mut data).unwrap();
+        }
         // No decode for the uncompressed path, so decode_ns is 0.
         crate::metrics::record_chunk_io(t_read.elapsed().as_nanos() as u64, 0, data.len() as u64);
         RawContext {

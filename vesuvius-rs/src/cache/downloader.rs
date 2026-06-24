@@ -17,6 +17,7 @@
 
 use super::lifo::LifoQueue;
 use super::netlog;
+use super::s3_auth::{self, S3Signer};
 use super::state::ChunkKey;
 use super::MAX_AGE;
 use dashmap::DashMap;
@@ -27,6 +28,33 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_HTTP_WORKERS: usize = 16;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 60;
+
+/// Worker (= max concurrent HTTP GET) count, overridable via
+/// `VESUVIUS_HTTP_WORKERS`. Direct-to-S3 small-object fetching is latency-bound
+/// and benefits from far more than the default 16 (mountpoint tops out where a
+/// few hundred parallel GETs would keep climbing).
+fn configured_http_workers() -> usize {
+    std::env::var("VESUVIUS_HTTP_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HTTP_WORKERS)
+}
+
+/// Whether to attempt AWS SigV4 signing of S3 downloads. Auto-enabled when the
+/// environment looks like it carries AWS credentials (IRSA web-identity, an
+/// assumed role, or static keys); force on/off with `VESUVIUS_S3_AUTH=1`/`0`.
+/// Kept off by default elsewhere so a laptop/GUI run never probes IMDS.
+fn s3_signing_enabled() -> bool {
+    match std::env::var("VESUVIUS_S3_AUTH") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => {
+            std::env::var_os("AWS_WEB_IDENTITY_TOKEN_FILE").is_some()
+                || std::env::var_os("AWS_ROLE_ARN").is_some()
+                || std::env::var_os("AWS_ACCESS_KEY_ID").is_some()
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum DownloadError {
@@ -57,6 +85,9 @@ struct DownloaderInner {
     /// Total HTTP GETs currently on the wire across all workers. Telemetry
     /// only (the netlog records the concurrency each request contended with).
     in_flight: AtomicUsize,
+    /// Optional SigV4 signer for S3-hosted URLs. `None` when signing is disabled
+    /// or no credentials resolved; non-S3 URLs are never signed regardless.
+    signer: Option<Arc<S3Signer>>,
 }
 
 struct Job {
@@ -69,7 +100,7 @@ struct Job {
 
 impl Downloader {
     pub fn new() -> Self {
-        Self::with_workers(DEFAULT_HTTP_WORKERS)
+        Self::with_workers(configured_http_workers())
     }
 
     pub fn with_workers(workers: usize) -> Self {
@@ -80,14 +111,19 @@ impl Downloader {
     /// `Arc<AtomicBool>` across the downloader queue and its task queue and
     /// toggle both with a single `ChunkCache::set_culling`.
     pub fn with_shared_cull(cull_enabled: Arc<AtomicBool>) -> Self {
-        Self::with_settings(DEFAULT_HTTP_WORKERS, MAX_AGE, cull_enabled)
+        Self::with_settings(configured_http_workers(), MAX_AGE, cull_enabled)
     }
 
     pub fn with_settings(workers: usize, max_age: Duration, cull_enabled: Arc<AtomicBool>) -> Self {
+        // Resolve S3 credentials once up front (blocks briefly on the first
+        // STS/IRSA exchange) so workers can sign without async credential I/O.
+        let signer = if s3_signing_enabled() { S3Signer::try_new() } else { None };
+
         let inner = Arc::new(DownloaderInner {
             queue: LifoQueue::new(max_age, cull_enabled),
             active: DashMap::new(),
             in_flight: AtomicUsize::new(0),
+            signer,
         });
 
         // HTTP/1.1 only, deliberately: with ALPN h2, reqwest multiplexes
@@ -249,6 +285,19 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
             req = req.header(reqwest::header::RANGE, header);
         } else {
             log::trace!("[{}] GET", job.url);
+        }
+        // SigV4-sign S3-hosted requests; everything else goes out unsigned.
+        if let Some(signer) = inner.signer.as_ref() {
+            if s3_auth::is_s3_host(&job.url) {
+                match signer.sign_get(&job.url) {
+                    Ok(headers) => {
+                        for (name, value) in headers {
+                            req = req.header(name, value);
+                        }
+                    }
+                    Err(e) => log::warn!("[{}] SigV4 signing failed: {}", job.url, e),
+                }
+            }
         }
         inner.mark_active(chunk);
         let in_flight = inner.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
