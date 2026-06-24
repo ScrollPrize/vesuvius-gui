@@ -286,11 +286,14 @@ impl Segment {
 
     /// URL of the tifxyz segmentation directory (containing `meta.json` +
     /// `x.tif` + `y.tif` + `z.tif`). The returned URL points at the directory;
-    /// callers append the individual file names. Prefers the plain `tifxyz`,
-    /// falling back to `tifxyz-normalized` (the variant published for segments
-    /// that don't expose a plain tifxyz, e.g. the 1667 series).
+    /// callers append the individual file names. Prefers `tifxyz-normalized`,
+    /// the pipeline's canonically-oriented export, falling back to the plain
+    /// `tifxyz` (the raw GP output, `tifxyz_original`) only when no normalized
+    /// variant is published. The raw export can be flipped/rotated relative to
+    /// the normalized one (e.g. PHercParis4/20231005123336 is row-reversed), so
+    /// preferring it produced wrongly-oriented segments.
     pub fn get_tifxyz_url(&self) -> Option<String> {
-        get_standard_url(&self.data, "tifxyz").or_else(|| get_standard_url(&self.data, "tifxyz-normalized"))
+        get_standard_url(&self.data, "tifxyz-normalized").or_else(|| get_standard_url(&self.data, "tifxyz"))
     }
 
     /// Whether this segment has any accessible geometry to download (tifxyz or
