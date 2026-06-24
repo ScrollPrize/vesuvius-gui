@@ -156,11 +156,31 @@ fn save_png(image: &GrayImage, path: &str, metadata: &str) -> Result<()> {
 }
 
 fn save_tiff(image: &GrayImage, path: &str, metadata: &str) -> Result<()> {
+    use tiff::encoder::{TiffKindBig, TiffKindStandard};
+
+    // Classic TIFF stores every offset as a 32-bit value. Once the file
+    // approaches 4 GiB those offsets overflow and the `tiff` encoder errors
+    // partway through `write_data` — but by then gigabytes have already been
+    // flushed to disk, leaving a truncated, unreadable file rather than a clean
+    // failure. On top of that, many readers interpret offsets as *signed*, so
+    // even a spec-valid 2–4 GiB TIFF is broken for them. Switch to BigTIFF
+    // (64-bit offsets) once the pixel data crosses 2 GiB, staying well clear of
+    // both limits. BigTIFF is understood by all current TIFF tooling.
+    const BIGTIFF_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+    if image.as_raw().len() as u64 >= BIGTIFF_THRESHOLD {
+        encode_tiff::<TiffKindBig>(image, path, metadata)
+    } else {
+        encode_tiff::<TiffKindStandard>(image, path, metadata)
+    }
+}
+
+fn encode_tiff<K: tiff::encoder::TiffKind>(image: &GrayImage, path: &str, metadata: &str) -> Result<()> {
     use tiff::encoder::{colortype::Gray8, TiffEncoder};
     use tiff::tags::Tag;
 
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut tiff = TiffEncoder::new(file)?;
+    let mut tiff = TiffEncoder::<_, K>::new_generic(file)?;
     let mut layer = tiff.new_image::<Gray8>(image.width(), image.height())?;
     layer.encoder().write_tag(Tag::ImageDescription, metadata)?;
     layer.write_data(image.as_raw())?;
