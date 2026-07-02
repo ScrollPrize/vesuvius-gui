@@ -4766,6 +4766,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tiff 0.10.3",
  "tokio",
  "vesuvius-rs",

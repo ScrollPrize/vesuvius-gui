@@ -21,6 +21,7 @@ use vesuvius_rs::volume::{
 use vesuvius_zarr::base_cache_dir;
 
 mod metadata;
+mod tiled_tiff;
 
 /// Wall-clock budget for making one tile's chunks resident before we give up
 /// and render with whatever is available. Chunk fetches are normally far
@@ -833,7 +834,10 @@ impl Rendering {
         let render_conc = self.params.render_concurrency.max(1);
         let ensure_conc = (render_conc + self.params.prefetch_depth).max(1);
 
-        let layer_results: Vec<Result<()>> = stream::iter(tiles)
+        // Two bounded, ordered stages produce `(tile, Image)` in `uv_tiles`
+        // order (w-major, then row, then column). Boxed so either output path
+        // below can consume the same stream.
+        let rendered = stream::iter(tiles)
             .map(|tile| {
                 let self_clone = self.clone();
                 let ensure_bar = ensure_bar.clone();
@@ -861,22 +865,36 @@ impl Rendering {
                     (tile, tile_image)
                 }
             })
-            .buffered(render_conc) // ordered so each `chunks()` group is exactly one layer
-            .chunks(tiles_per_layer as usize)
-            .map(|tiles| {
-                let self_clone = self.clone();
-                let layers_bar = layers_bar.clone();
-                async move {
-                    let res = tokio::task::spawn_blocking(move || self_clone.render_layer_from_tiles(tiles))
-                        .await
-                        .unwrap();
-                    layers_bar.inc(1);
-                    res
-                }
-            })
-            .buffer_unordered(render_conc)
-            .collect::<Vec<_>>()
-            .await;
+            .buffered(render_conc) // ordered so each layer's tiles arrive contiguously
+            .boxed();
+
+        // `.tif`/`.tiff` streams each tile straight to a tiled BigTIFF as it's
+        // rendered (O(a few tiles) of memory); every other format still
+        // assembles a full `GrayImage` per layer and encodes it in one shot.
+        let is_tiled_tiff = matches!(
+            self.params.target_format.to_ascii_lowercase().as_str(),
+            "tif" | "tiff"
+        );
+        let layer_results: Vec<Result<()>> = if is_tiled_tiff {
+            self.stream_layers_to_tiled_tiff(rendered, layers_bar.clone()).await
+        } else {
+            rendered
+                .chunks(tiles_per_layer as usize)
+                .map(|tiles| {
+                    let self_clone = self.clone();
+                    let layers_bar = layers_bar.clone();
+                    async move {
+                        let res = tokio::task::spawn_blocking(move || self_clone.render_layer_from_tiles(tiles))
+                            .await
+                            .unwrap();
+                        layers_bar.inc(1);
+                        res
+                    }
+                })
+                .buffer_unordered(render_conc)
+                .collect::<Vec<_>>()
+                .await
+        };
 
 
         // Stop the periodic logger and emit a final 100% line so the log ends
@@ -1048,6 +1066,82 @@ impl Rendering {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// Consume the ordered `(tile, Image)` stream and write one tiled BigTIFF
+    /// per w-layer, flushing each tile to disk as it arrives instead of
+    /// buffering a whole layer + a full `GrayImage`. Layers arrive contiguously
+    /// (the stream is ordered), so a single active writer thread suffices: when
+    /// `w` changes we close the current file (letting it finalize) and open the
+    /// next. Returns one `Result` per layer, in completion order.
+    async fn stream_layers_to_tiled_tiff(
+        &self,
+        mut rendered: impl futures::Stream<Item = (UVTile, Image)> + Unpin,
+        layers_bar: ProgressBar,
+    ) -> Vec<Result<()>> {
+        use crate::tiled_tiff::{write_tiled_gray_tiff, TileGray};
+
+        let width = self.params.render_width();
+        let height = self.params.render_height();
+        let left = self.params.render_left();
+        let top = self.params.render_top();
+        let tile_size = self.params.tile_size;
+        let target_dir = self.params.target_dir.clone();
+        let target_format = self.params.target_format.clone();
+        let metadata = self.params.metadata_json.clone();
+        // Bound the hand-off so a slow disk backpressures rendering rather than
+        // letting tiles pile up in the channel.
+        let cap = (self.params.render_concurrency * 2).max(1);
+
+        // Surface the writer's outcome, mapping a task panic/cancel to an error.
+        fn writer_result(joined: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+            joined.unwrap_or_else(|e| Err(anyhow!("tiled TIFF writer task failed: {e}")))
+        }
+
+        let mut results: Vec<Result<()>> = Vec::new();
+        // The active layer's writer task + the channel feeding it. The tiff
+        // encoder is synchronous and self-referential, so it runs as one
+        // long-lived `spawn_blocking` task that pulls tiles from the channel;
+        // its `JoinHandle` is awaitable, so rotating layers never blocks the
+        // reactor.
+        type Active = (usize, tokio::sync::mpsc::Sender<TileGray>, tokio::task::JoinHandle<Result<()>>);
+        let mut active: Option<Active> = None;
+
+        while let Some((UVTile { u, v, w }, image)) = rendered.next().await {
+            // Rotate to a fresh writer when the layer changes.
+            if active.as_ref().map(|(aw, _, _)| *aw) != Some(w) {
+                if let Some((_, tx, handle)) = active.take() {
+                    drop(tx); // close channel → writer drains + finalizes
+                    results.push(writer_result(handle.await));
+                    layers_bar.inc(1);
+                }
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<TileGray>(cap);
+                let path = format!("{}/{:02}.{}", target_dir, w, target_format);
+                let (pw, ph, pts, pmeta) = (width, height, tile_size, metadata.clone());
+                let handle = tokio::task::spawn_blocking(move || {
+                    let tiles = std::iter::from_fn(move || rx.blocking_recv());
+                    write_tiled_gray_tiff(&path, pw, ph, pts, &pmeta, tiles)
+                });
+                active = Some((w, tx, handle));
+            }
+
+            // Color32 → Gray8: drops the 4 MiB tile for a 1 MiB buffer before
+            // the hand-off. Tiles are painted full-size (edge overhang
+            // included), which is exactly what the tiled layout stores.
+            let data: Vec<u8> = image.data.iter().map(|c| c.r()).collect();
+            let col = (u - left) / tile_size;
+            let row = (v - top) / tile_size;
+            // A send error only happens if the writer already died; its actual
+            // error is surfaced by `writer_result` when we drain below.
+            let _ = active.as_ref().unwrap().1.send(TileGray { col, row, data }).await;
+        }
+
+        if let Some((_, tx, handle)) = active.take() {
+            drop(tx);
+            results.push(writer_result(handle.await));
+            layers_bar.inc(1);
+        }
+        results
     }
 
     fn render_layer_from_tiles(&self, tiles: Vec<(UVTile, Image)>) -> Result<()> {
