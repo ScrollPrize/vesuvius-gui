@@ -112,6 +112,11 @@ pub struct SegmentProperties {
     pub width: usize,
     pub height: usize,
     pub volume_coverage: Option<HashMap<String, serde_json::Value>>,
+    /// Integer factor by which the `original_volume_id` was downscaled to
+    /// produce the space the segment mesh was traced in. When present, stored
+    /// mesh coordinates must be multiplied by this factor to land in the
+    /// original volume's voxel space (see [`Segment::original_volume_transform`]).
+    pub original_volume_downscale: Option<f64>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -301,6 +306,18 @@ impl Segment {
     /// have private-S3 origins; this distinguishes "listed" from "downloadable".
     pub fn is_downloadable(&self) -> bool {
         self.get_tifxyz_url().is_some() || self.get_obj_url().is_some()
+    }
+
+    /// Affine mapping the segment's stored mesh coordinates into its
+    /// `original_volume_id` voxel space. Returns `None` when no downscale is
+    /// recorded (or it's the identity factor 1), i.e. the mesh is already in
+    /// original-volume coordinates.
+    pub fn original_volume_transform(&self) -> Option<AffineTransform> {
+        let f = self.properties.original_volume_downscale?;
+        if (f - 1.0).abs() < 1e-9 {
+            return None;
+        }
+        Some(AffineTransform::from_uniform_scale(f))
     }
 }
 

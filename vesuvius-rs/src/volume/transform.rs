@@ -42,6 +42,28 @@ impl AffineTransform {
         }
     }
 
+    /// Uniform scaling affine `[[f,0,0,0],[0,f,0,0],[0,0,f,0]]`.
+    pub fn from_uniform_scale(f: f64) -> Self {
+        AffineTransform {
+            matrix: [[f, 0.0, 0.0, 0.0], [0.0, f, 0.0, 0.0], [0.0, 0.0, f, 0.0]],
+        }
+    }
+
+    /// Compose two affines so the result maps a point first through `self`, then
+    /// through `after`: `result(p) = after(self(p))`.
+    pub fn then(&self, after: &AffineTransform) -> Self {
+        let a = &after.matrix;
+        let b = &self.matrix;
+        let mut m = [[0.0f64; 4]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+            }
+            m[i][3] = a[i][0] * b[0][3] + a[i][1] * b[1][3] + a[i][2] * b[2][3] + a[i][3];
+        }
+        AffineTransform { matrix: m }
+    }
+
     pub fn scale_factor(&self) -> f64 {
         let m = &self.matrix;
         let scale_x = (m[0][0] * m[0][0] + m[0][1] * m[0][1] + m[0][2] * m[0][2]).sqrt();

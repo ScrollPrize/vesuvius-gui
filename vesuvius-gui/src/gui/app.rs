@@ -308,9 +308,21 @@ impl TemplateApp {
                     let volume_id = target_volume_id.unwrap_or(&segment.original_volume_id);
                     current_volume_id = Some(volume_id.to_string());
 
-                    if volume_id != &segment.original_volume_id {
-                        transform = atlas_sample.get_transform(&segment.original_volume_id, volume_id);
-                    }
+                    // The mesh may have been traced on a downscaled copy of its
+                    // original volume; this maps stored coords → original voxels.
+                    let downscale = segment.original_volume_transform();
+                    // Registration into a different target volume, applied after
+                    // the downscale lands the mesh in original-volume space.
+                    let registration = if volume_id != &segment.original_volume_id {
+                        atlas_sample.get_transform(&segment.original_volume_id, volume_id)
+                    } else {
+                        None
+                    };
+                    transform = match (downscale, registration) {
+                        (Some(d), Some(r)) => Some(d.then(&r)),
+                        (Some(d), None) => Some(d),
+                        (None, r) => r,
+                    };
 
                     if let Some(volume) = atlas_sample.get_volume(volume_id) {
                         volume_url_opt = volume.get_ome_zarr_url();
