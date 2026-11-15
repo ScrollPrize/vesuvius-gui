@@ -62,6 +62,7 @@ fn main() {
         ome.zarr_contexts.len()
     );
     for (i, ctx) in ome.zarr_contexts.iter().enumerate() {
+        let Some(ctx) = ctx else { continue };
         println!(
             "  L{}: shape={:?} chunks={:?} v3_remote={}",
             i,

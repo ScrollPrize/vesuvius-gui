@@ -1,0 +1,62 @@
+{
+  "volume": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "surface": "20251029010146-auto_grown_20251029010146642",
+  "crop_yx": [
+    400,
+    432,
+    400,
+    432
+  ],
+  "render_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "level_generation": "nearest decimation by 2**lod along all axes; CT bytes unchanged",
+  "levels": [
+    {
+      "lod": 0,
+      "shape": [
+        20,
+        32,
+        32
+      ],
+      "sha256": "99749d7d5d86a756ba440c445e58c0fa1c0613b503da47191e9ace8e408a6921"
+    },
+    {
+      "lod": 1,
+      "shape": [
+        10,
+        16,
+        16
+      ],
+      "sha256": "077a6694bc296a97804e0d4b0c2e4f8a6d6dac046277c1842532ba2f5cb56df2"
+    },
+    {
+      "lod": 2,
+      "shape": [
+        5,
+        8,
+        8
+      ],
+      "sha256": "d9b9ebb338a98c9b351cb347cbffc27ac513c19cc1ed5fef14833cecd54364cd"
+    }
+  ]
+}
