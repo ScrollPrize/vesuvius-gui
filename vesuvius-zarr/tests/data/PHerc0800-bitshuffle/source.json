@@ -1,0 +1,31 @@
+{
+  "sample": "PHerc0800",
+  "source_volume": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "source_chunk": "0/91/47/25",
+  "source_chunk_sha256": "6784a75ce2a9df9b28831a755e1c0524a252b1b93dabae5af4d0bb9d578f563f",
+  "selection": "prefix of the unchanged original uint8 CT bytes",
+  "encoder": "numcodecs.Blosc clevel=5 shuffle=2",
+  "cases": [
+    {
+      "name": "lz4-8192",
+      "bytes": 8192,
+      "blocksize": 4096,
+      "encoded_sha256": "0f6f58390498d067b2becb878a98ec8f3e1c736a3a51533d63db92a27a75f997",
+      "reference_sha256": "91efd6326c3435f6e32e7640f55d41e7469870514fd7aa5747f33f1a5dc1af33"
+    },
+    {
+      "name": "zstd-8192",
+      "bytes": 8192,
+      "blocksize": 4096,
+      "encoded_sha256": "a6e1251012680812d19914e559011eb1b47fb6dea078249b2e2adf7a75a89e78",
+      "reference_sha256": "91efd6326c3435f6e32e7640f55d41e7469870514fd7aa5747f33f1a5dc1af33"
+    },
+    {
+      "name": "zstd-8197",
+      "bytes": 8197,
+      "blocksize": 65536,
+      "encoded_sha256": "30a970befa4ec51fd773d43257c39bde4692b41152d34e1f3d059a51b7fd0021",
+      "reference_sha256": "1b7123a0555d97447bd34e7fd461bacd9ce6855cda5c9aa7723d2059c2d57471"
+    }
+  ]
+}
