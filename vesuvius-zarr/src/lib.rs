@@ -22,7 +22,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     ops::Deref,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 type HashMap<K, V> = FxHashMap<K, V>;
@@ -356,7 +356,7 @@ impl ZarrFileAccess for RemoteZarrDirectory {
 pub(crate) struct BlockingRemoteZarrDirectory {
     url: String,
     local_cache_dir: String,
-    downloading: Arc<Mutex<HashMap<String, Arc<Mutex<Option<Arc<File>>>>>>>,
+    downloading: Arc<Mutex<HashMap<String, Arc<OnceLock<bool>>>>>,
     client: Client,
 }
 impl BlockingRemoteZarrDirectory {
@@ -393,55 +393,50 @@ impl BlockingRemoteZarrDirectory {
 
             let entry = {
                 let mut downloading = self.downloading.lock().unwrap();
-                if downloading.contains_key(&chunk_str) {
-                    let entry = downloading.get(&chunk_str).unwrap().clone();
-                    return entry.lock().unwrap().clone();
-                } else {
-                    let entry = Arc::new(Mutex::new(None));
-                    downloading.insert(chunk_str.clone(), entry.clone());
-                    entry
-                }
+                downloading
+                    .entry(chunk_str.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new()))
+                    .clone()
             };
-            let mut entry = entry.lock().unwrap();
-
-            let target_url = format!("{}/{}", self.url, chunk_str);
-            //println!("Downloading chunk from {}", target_url);
-            // run request with reqwest blocking
-            let response = self.client.get(&target_url).send().unwrap();
-            if response.status() != 200 {
-                /* println!(
-                    "Failed to download chunk from {}, status {}",
-                    target_url, response.status
-                ); */
-                let missing_tmp = format!("{}.missing.tmp", target_file);
-                std::fs::create_dir_all(std::path::Path::new(&target_file).parent().unwrap()).unwrap();
-                std::fs::write(&missing_tmp, "").unwrap(); // create missing marker file
-                std::fs::rename(&missing_tmp, &missing_marker_file).unwrap();
-                return None;
-            }
-            let data = response.bytes().unwrap().to_vec();
-            let parent_dir = std::path::Path::new(&target_file).parent().unwrap();
-            std::fs::create_dir_all(parent_dir).unwrap();
-
-            // Write atomically then reopen for reading. `File::create` returns
-            // a write-only handle; mmap'ing it would later fail with EACCES
-            // for uncompressed (`RawContext`) chunks that go through
-            // `memmap::Mmap::map`.
-            let tmp_file = format!("{}.tmp", target_file);
-            {
-                let mut tmp = File::create(&tmp_file).unwrap();
-                tmp.write_all(&data).unwrap();
-            }
-            std::fs::rename(&tmp_file, &target_file).unwrap();
-            let file = Arc::new(File::open(&target_file).unwrap());
-
-            *entry = Some(file.clone());
-
-            {
+            let available = entry.get_or_init(|| {
+                if std::path::Path::new(&target_file).exists() {
+                    return true;
+                }
+                if std::path::Path::new(&missing_marker_file).exists() {
+                    return false;
+                }
+                let target_url = format!("{}/{}", self.url, chunk_str);
+                let response = self.client.get(&target_url).send().unwrap();
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    let missing_tmp = format!("{}.missing.tmp", target_file);
+                    std::fs::create_dir_all(std::path::Path::new(&target_file).parent().unwrap()).unwrap();
+                    std::fs::write(&missing_tmp, "").unwrap();
+                    std::fs::rename(&missing_tmp, &missing_marker_file).unwrap();
+                    return false;
+                }
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::OK,
+                    "Failed to download chunk from {}",
+                    target_url
+                );
+                let data = response.bytes().unwrap().to_vec();
+                let parent_dir = std::path::Path::new(&target_file).parent().unwrap();
+                std::fs::create_dir_all(parent_dir).unwrap();
+                let tmp_file = format!("{}.tmp", target_file);
+                {
+                    let mut tmp = File::create(&tmp_file).unwrap();
+                    tmp.write_all(&data).unwrap();
+                }
+                std::fs::rename(&tmp_file, &target_file).unwrap();
                 self.downloading.lock().unwrap().remove(&chunk_str);
+                true
+            });
+            if *available {
+                Some(Arc::new(File::open(&target_file).unwrap()))
+            } else {
+                None
             }
-
-            Some(file)
         }
     }
 }
