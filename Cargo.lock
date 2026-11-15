@@ -4812,6 +4812,7 @@ dependencies = [
  "vesuvius-c3d",
  "vesuvius-zarr",
  "wavefront_obj",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

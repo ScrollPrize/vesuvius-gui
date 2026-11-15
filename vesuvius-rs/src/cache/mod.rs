@@ -15,6 +15,8 @@
 mod backfiller;
 mod cache;
 mod disk;
+#[cfg(windows)]
+mod windows_sparse;
 mod downloader;
 mod lifo;
 mod netlog;
