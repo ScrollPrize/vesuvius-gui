@@ -423,7 +423,7 @@ async fn main_run(args: Args) -> Result<()> {
     };
 
     let params = (&args).into();
-    let rendering = Rendering::new(params, &args)?;
+    let rendering = tokio::task::spawn_blocking(move || Rendering::new(params, &args)).await??;
     rendering.run(&multi, plain_progress).await?;
     Ok(())
 }
