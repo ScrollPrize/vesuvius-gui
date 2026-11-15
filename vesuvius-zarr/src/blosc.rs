@@ -43,9 +43,9 @@ pub struct BloscHeader {
 impl BloscHeader {
     fn from_bytes(bytes: &[u8]) -> Self {
         let flags = bytes[2];
-        let shuffle = match flags & 0x7 {
-            0 | 1 => BloscShuffle::None,
-            2 => BloscShuffle::Byte,
+        let shuffle = match flags & 0x5 {
+            0 => BloscShuffle::None,
+            1 => BloscShuffle::Byte,
             4 => BloscShuffle::Bit,
             x => panic!("Invalid shuffle value {x}"),
         };
@@ -114,6 +114,9 @@ impl BloscChunk<u8> {
     /// cache.
     pub fn decompress_to_vec(bytes: &[u8]) -> Vec<u8> {
         let header = BloscHeader::from_bytes(&bytes[0..16]);
+        if header.flags & 0x2 != 0 {
+            return bytes[16..16 + header.nbytes].to_vec();
+        }
         let num_blocks = header.num_blocks();
         let mut offsets = Vec::with_capacity(num_blocks);
         for i in 0..num_blocks {
