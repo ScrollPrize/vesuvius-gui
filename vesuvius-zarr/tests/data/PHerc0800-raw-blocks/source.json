@@ -1,0 +1,22 @@
+{
+  "sample": "PHerc0800",
+  "source_volume": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "source_chunk": "0/96/50/24",
+  "source_chunk_sha256": "63a17766f36e9bc9a9e4d22d6f404dd00e7b792352b1d71ddde407b59652cccf",
+  "source_byte_range": [
+    1441792,
+    1572864
+  ],
+  "shape_zyx": [
+    8,
+    128,
+    128
+  ],
+  "chunk_local_z": [
+    88,
+    96
+  ],
+  "encoder": "numcodecs.Blosc lz4 clevel=5 blocksize=65536",
+  "reference_sha256": "df42a0ae1a03ae8c26e04d68ccd0e7242ce833fa150b66f0e49188f9b4bbc4c0",
+  "format_reference": "https://github.com/Blosc/c-blosc/blob/main/blosc/blosc.c"
+}
