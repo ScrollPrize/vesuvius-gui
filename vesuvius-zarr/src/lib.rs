@@ -889,6 +889,14 @@ impl<const N: usize> ZarrContext<N> {
 }
 
 impl ZarrContext<3> {
+    fn chunk_strides(&self) -> [usize; 3] {
+        let chunks = &self.array.def.chunks;
+        match &self.array.def.order {
+            ZarrOrder::ColumnMajor => [chunks[1] * chunks[2], chunks[2], 1],
+            ZarrOrder::RowMajor => [1, chunks[0], chunks[0] * chunks[1]],
+        }
+    }
+
     pub fn cache_missing(&self) -> bool {
         self.cache_missing
     }
@@ -913,8 +921,8 @@ impl ZarrContext<3> {
             index[2] % self.array.def.chunks[2],
         ];
 
-        let idx = ((chunk_offset[0] * self.array.def.chunks[1]) + chunk_offset[1]) * self.array.def.chunks[2]
-            + chunk_offset[2];
+        let [sx, sy, sz] = self.chunk_strides();
+        let idx = chunk_offset[0] * sx + chunk_offset[1] * sy + chunk_offset[2] * sz;
 
         // fast path
         let state = self.state.borrow();
@@ -953,11 +961,8 @@ impl ZarrContext<3> {
         let (p000, p100, p010, p110, p001, p101, p011, p111) = if fast_path {
             let chunk_no = [x0 / cx, y0 / cy, z0 / cz];
 
-            let idx = ((chunk_offset[0] * cy) + chunk_offset[1]) * cz + chunk_offset[2];
-
-            let idx_dx = cy * cz;
-            let idx_dy = cz;
-            let idx_dz = 1;
+            let [idx_dx, idx_dy, idx_dz] = self.chunk_strides();
+            let idx = chunk_offset[0] * idx_dx + chunk_offset[1] * idx_dy + chunk_offset[2] * idx_dz;
 
             // fast path
             let last_chunk_no = self.state.borrow().last_chunk_no;
