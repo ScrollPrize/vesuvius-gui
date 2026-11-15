@@ -15,6 +15,8 @@ fn main() {
         build.flag_if_supported("-std=c23");
         build.flag_if_supported("-std=c2x");
         build.flag_if_supported("-fno-strict-aliasing");
+    } else {
+        build.flag_if_supported("/std:c17");
     }
 
     // Enable host-targeted SIMD on native builds. c3d auto-detects AVX-512 /
