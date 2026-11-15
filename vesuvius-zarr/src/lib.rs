@@ -82,7 +82,7 @@ pub enum ZarrCompressorId {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ZarrCompressor {
-    blocksize: u8,
+    blocksize: u32,
     clevel: u8,
     #[serde(rename = "cname")]
     compression_name: ZarrCompressionName,
