@@ -1,0 +1,14 @@
+{
+  "volume_url": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr",
+  "surface": "20251029010146-auto_grown_20251029010146642",
+  "crop": "242+802-16x16",
+  "layer": 32,
+  "dimensions": [
+    16,
+    16
+  ],
+  "sha256": "1dbda56b0713f3c411c375f694e45e988c67b52da076256e764d4949e509dc68",
+  "processing": "Grayscale bytes from the actual global-coordinate CT surface render, without intensity changes",
+  "surface_url": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/segments/20251029010146-auto_grown_20251029010146642/mesh/20251029010146-on-20250521135224-8.64um.tifxyz/",
+  "middle_layer": 32
+}

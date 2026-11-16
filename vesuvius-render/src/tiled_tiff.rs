@@ -20,7 +20,7 @@
 
 use anyhow::{bail, Result};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Seek, Write};
 use tiff::encoder::{TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard};
 use tiff::tags::Tag;
 
@@ -70,7 +70,7 @@ pub fn write_tiled_gray_tiff(
 }
 
 fn encode<K: TiffKind>(
-    file: BufWriter<File>,
+    mut file: impl Write + Seek,
     width: usize,
     height: usize,
     tile_size: usize,
@@ -82,7 +82,7 @@ fn encode<K: TiffKind>(
     let n = tiles_across * tiles_down;
     let expected_len = tile_size * tile_size;
 
-    let mut encoder = TiffEncoder::<_, K>::new_generic(file)?;
+    let mut encoder = TiffEncoder::<_, K>::new_generic(&mut file)?;
     let mut dir = encoder.image_directory()?;
 
     // Data is appended to the file as it arrives; the offset/count of each tile
@@ -138,6 +138,7 @@ fn encode<K: TiffKind>(
     dir.write_tag(Tag::ImageDescription, metadata)?;
 
     dir.finish()?;
+    file.flush()?;
     Ok(())
 }
 
@@ -228,5 +229,91 @@ mod tests {
         let one = tiles(40, 24, 16).into_iter().take(1);
         let err = write_tiled_gray_tiff(path.to_str().unwrap(), 40, 24, 16, "m", one);
         assert!(err.is_err(), "incomplete tile set must be rejected");
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::{Cursor, SeekFrom};
+    use std::rc::Rc;
+    use tiff::decoder::{Decoder, DecodingResult};
+
+    const CT: &[u8] = include_bytes!("../tests/data/PHerc0800-tile.gray");
+
+    struct FailingTrailer {
+        bytes: Cursor<Vec<u8>>,
+        failed: Rc<Cell<bool>>,
+    }
+
+    impl Write for FailingTrailer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if matches!(bytes.len(), 4 | 8) && bytes.iter().all(|&byte| byte == 0) {
+                self.failed.set(true);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "final TIFF link write failed",
+                ));
+            }
+            self.bytes.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for FailingTrailer {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.bytes.seek(position)
+        }
+    }
+
+    fn tile() -> impl Iterator<Item = TileGray> {
+        std::iter::once(TileGray {
+            col: 0,
+            row: 0,
+            data: CT.to_vec(),
+        })
+    }
+
+    fn check_failure<K: TiffKind>() {
+        let failed = Rc::new(Cell::new(false));
+        let writer = FailingTrailer {
+            bytes: Cursor::new(Vec::new()),
+            failed: failed.clone(),
+        };
+        let result = encode::<K>(BufWriter::new(writer), 16, 16, 16, "PHerc0800", tile());
+        assert!(failed.get(), "the final link write must reach the injected failure");
+        assert!(result.is_err(), "the writer must report the buffered write failure");
+    }
+
+    fn check_ct_roundtrip<K: TiffKind>() {
+        let mut output = Cursor::new(Vec::new());
+        encode::<K>(BufWriter::new(&mut output), 16, 16, 16, "PHerc0800", tile()).unwrap();
+        output.set_position(0);
+        let mut decoder = Decoder::new(output).unwrap();
+        assert_eq!(decoder.dimensions().unwrap(), (16, 16));
+        let DecodingResult::U8(pixels) = decoder.read_image().unwrap() else {
+            panic!("expected grayscale CT")
+        };
+        assert_eq!(pixels, CT);
+    }
+
+    #[test]
+    fn reports_standard_tiff_final_write_failure() {
+        check_failure::<TiffKindStandard>();
+    }
+
+    #[test]
+    fn reports_bigtiff_final_write_failure() {
+        check_failure::<TiffKindBig>();
+    }
+
+    #[test]
+    fn preserves_ct_pixels_in_both_tiff_kinds() {
+        check_ct_roundtrip::<TiffKindStandard>();
+        check_ct_roundtrip::<TiffKindBig>();
     }
 }
