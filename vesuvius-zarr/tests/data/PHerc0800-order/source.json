@@ -1,0 +1,53 @@
+{
+  "volume": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "surface": "20251029010146-auto_grown_20251029010146642",
+  "mesh": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/segments/20251029010146-auto_grown_20251029010146642/mesh/20251029010146-on-20250521135224-8.64um.tifxyz/",
+  "render": "vc_render_tifxyz --scale 1 --group-idx 0 --num-slices 21 --flip-normals --voxel-size 8.64 --voxel-unit micrometer",
+  "crop_yx": [
+    400,
+    432,
+    400,
+    432
+  ],
+  "render_layers": [
+    0,
+    1,
+    2
+  ],
+  "sha256": {
+    "00.tif": "d7681239428acdddf9c96cbca518a246ed55abbada19c9583f29e61c2fe0d95f",
+    "01.tif": "2bcae641593434786ffc59c0ca17cf9c6c79c23c3638cd84255bccb228f1b388",
+    "02.tif": "bda1267ceccdcfe97f2cbf3e9c5020bf9ff3633691502711072cf0d0c9ec96ea"
+  },
+  "order_fixture": {
+    "shape": [
+      3,
+      16,
+      12
+    ],
+    "chunks": [
+      4,
+      8,
+      6
+    ],
+    "crop_from_existing_fixture_yx": [
+      0,
+      16,
+      0,
+      12
+    ],
+    "reference_order": "C",
+    "note": "Same actual CT values stored in two layouts, no intensity transform."
+  },
+  "order_fixture_sha256": {
+    "reference.raw": "88b46cfda50a31f479dba9e823b48f8a4d25c892b717f4422f700c58ca44fdf0",
+    "C/0.0.0": "3ebcae54c46dc576545896775a2d491eeb8d69c8dbb0098f4f0d42dca2a2f0f1",
+    "C/0.0.1": "6c10d6436e71e13f9518206e9bdb9cfcc527fca2823633256bb8c0a0cee60519",
+    "C/0.1.0": "ee1086f875ae51182bf0b4b0e9eba1ec8f0ddda44b563dbe90443385c7942272",
+    "C/0.1.1": "1224ffb79d7844fbb7238127e16ee0ba81464c18ab0bcaa979f3a2294330419d",
+    "F/0.0.0": "6000241bb124a57cecfa83c603fc3f232bb2a90dd446be0e74c3e5fafab75b90",
+    "F/0.0.1": "76e92358ecdf97237afaa628247b931a4cc162f6620d9ce0ae4655e7f9fb6742",
+    "F/0.1.0": "db8ed81d11cd93257835e825ece8bd4c4871a6c863215c0450bb2d899068c0c8",
+    "F/0.1.1": "47fae503e4e1d5aa79ab4ec3ce7ee7166923239f5bb3a65a03c456d32d30df26"
+  }
+}
