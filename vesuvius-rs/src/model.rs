@@ -310,7 +310,14 @@ impl NewVolumeReference {
                 OmeZarrContext::from_url_blocking_to_default_cache_dir(url),
                 url.clone(),
             ),
-            VolumeLocation::LocalPath(path) => (OmeZarrContext::from_path(path), format!("file://{}", path)),
+            VolumeLocation::LocalPath(path) => {
+                let source_path = if Path::new(path).is_relative() {
+                    std::env::current_dir().expect("resolve local volume path").join(path)
+                } else {
+                    path.into()
+                };
+                (OmeZarrContext::from_path(path), format!("file://{}", source_path.display()))
+            }
         };
         // Embed the source's sha256 into the on-disk volume key so two sources
         // advertising the same volume_id can coexist under one unified root.
@@ -474,5 +481,56 @@ impl NewVolumeReference {
             location_type, location_str
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod relative_cache_tests {
+    use super::*;
+    use crate::cache::{ChunkKey, UnifiedVolume};
+    use crate::volume::VoxelVolume;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn relative_volumes_in_different_directories_do_not_share_ct() {
+        if let Ok(root) = std::env::var("VESUVIUS_TEST_RELATIVE_CACHE") {
+            let reference = NewVolumeReference::from_path("scan.zarr").unwrap();
+            let NewVolumeReference::OmeZarr { id, location } = reference else {
+                panic!("expected CT pyramid")
+            };
+            let cache = NewVolumeReference::open_ome_zarr_cache(&id, &location, root.into(), false);
+            assert!(cache
+                .wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(3))
+                .as_resident()
+                .is_some());
+            let expected = std::fs::read("scan.zarr/0/0.0.0").unwrap()[21];
+            assert_eq!(UnifiedVolume::new(cache).get([1.0; 3], 1), expected);
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/PHerc0800-relative-cache"
+        ));
+        for name in ["A", "B"] {
+            let cwd = root.path().join(name);
+            let volume = cwd.join("scan.zarr");
+            std::fs::create_dir_all(volume.join("0")).unwrap();
+            for file in [".zattrs", "0/.zarray", "0/0.0.0"] {
+                std::fs::copy(fixture.join(name).join(file), volume.join(file)).unwrap();
+            }
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["model::relative_cache_tests::relative_volumes_in_different_directories_do_not_share_ct", "--exact", "--nocapture"])
+                .current_dir(cwd)
+                .env("VESUVIUS_TEST_RELATIVE_CACHE", root.path().join("cache"))
+                .output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
     }
 }
