@@ -1,0 +1,37 @@
+{
+  "multiscales": [
+    {
+      "axes": [
+        {
+          "name": "z",
+          "type": "space"
+        },
+        {
+          "name": "y",
+          "type": "space"
+        },
+        {
+          "name": "x",
+          "type": "space"
+        }
+      ],
+      "datasets": [
+        {
+          "path": "0",
+          "coordinateTransformations": [
+            {
+              "type": "scale",
+              "scale": [
+                1,
+                1,
+                1
+              ]
+            }
+          ]
+        }
+      ],
+      "name": "PHerc0800 CT ROI",
+      "version": "0.4"
+    }
+  ]
+}

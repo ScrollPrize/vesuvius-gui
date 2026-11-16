@@ -326,6 +326,16 @@ fn lod_for(sfactor: u8) -> u8 {
     (sfactor as u32).max(1).trailing_zeros() as u8
 }
 
+fn clamp_sample_lod(xyz: [f64; 3], downsampling: i32, max_lod: u8) -> ([f64; 3], u8) {
+    let requested = lod_for(downsampling.max(1) as u8);
+    if requested <= max_lod {
+        (xyz, requested)
+    } else {
+        let scale = (1u32 << (requested - max_lod)) as f64;
+        (xyz.map(|value| value * scale), max_lod)
+    }
+}
+
 impl VoxelVolume for UnifiedVolume {
     fn reset_for_painting(&self) {
         self.drop_hot_slot();
@@ -336,7 +346,9 @@ impl VoxelVolume for UnifiedVolume {
     }
 
     fn touch_aabb(&self, min: [f64; 3], max: [f64; 3], downsampling: i32) {
-        let target_lod = lod_for(downsampling.max(1) as u8);
+        let max_lod = self.cache.max_lod();
+        let (min, target_lod) = clamp_sample_lod(min, downsampling, max_lod);
+        let (max, _) = clamp_sample_lod(max, downsampling, max_lod);
         self.cache.touch_aabb(min, max, target_lod);
     }
 
@@ -346,8 +358,8 @@ impl VoxelVolume for UnifiedVolume {
         // passes `[x / sfactor, y / sfactor, z / sfactor]`): `xyz` is in
         // voxel-coords at the requested downsampling. We do NOT re-divide by
         // scale here.
-        let target_lod = lod_for(downsampling.max(1) as u8);
         let max_lod = self.cache.max_lod();
+        let (xyz, target_lod) = clamp_sample_lod(xyz, downsampling, max_lod);
 
         let target_sx = (xyz[0] as i64).max(0) as u64;
         let target_sy = (xyz[1] as i64).max(0) as u64;
@@ -463,7 +475,10 @@ impl UnifiedVolume {
         downsampling: i32,
         mut sink: F,
     ) {
-        let target_lod = lod_for(downsampling.max(1) as u8);
+        let max_lod = self.cache.max_lod();
+        let (base, target_lod) = clamp_sample_lod(base, downsampling, max_lod);
+        let (dir, _) = clamp_sample_lod(dir, downsampling, max_lod);
+        let downsampling = 1i32 << target_lod;
         let n_total = (w_hi - w_lo) as i32;
         if n_total <= 0 {
             return;
@@ -694,8 +709,8 @@ impl UnifiedVolume {
     /// 2^shift)` for most `target_sx`), the 8 corners collapse to one
     /// value, and the output bands instead of smoothly interpolating.
     fn interpolate_u8(&self, xyz: [f64; 3], downsampling: i32) -> u8 {
-        let target_lod = lod_for(downsampling.max(1) as u8);
         let max_lod = self.cache.max_lod();
+        let (xyz, target_lod) = clamp_sample_lod(xyz, downsampling, max_lod);
 
         let target_sx = (xyz[0] as i64).max(0) as u64;
         let target_sy = (xyz[1] as i64).max(0) as u64;
@@ -1379,8 +1394,8 @@ impl PaintVolume for UnifiedVolume {
         // pan.
         self.drop_hot_slot();
 
-        let target_lod = lod_for(sfactor);
         let max_lod = self.cache.max_lod();
+        let target_lod = lod_for(sfactor).min(max_lod);
 
         // Per-paint filter LUT: `DrawingConfig::filter` re-evaluates
         // `filters_active()`, the quant bit-mask match, and an f32 divide
@@ -1591,5 +1606,86 @@ impl PaintVolume for UnifiedVolume {
     fn shared(&self) -> VolumeCons {
         let cache = self.cache.clone();
         Box::new(move || VoxelPaintVolume::into_volume(UnifiedVolume::new(cache)))
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+    use crate::cache::backfillers::ome_zarr::OmeZarrBackfiller;
+    use crate::cache::UnifiedCache;
+    use std::time::Duration;
+    use vesuvius_zarr::OmeZarrContext;
+
+    fn setup(warm: bool) -> (tempfile::TempDir, ChunkCache, UnifiedVolume) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/PHerc0800-zoom");
+        let source = Arc::new(OmeZarrBackfiller::from_ome(
+            "PHerc0800-zoom",
+            OmeZarrContext::from_path(path),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let cache = UnifiedCache::for_cache_dir(temp.path()).open_volume_with_shard_chunks_per_axis(source, 2);
+        if warm {
+            assert!(cache
+                .wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(2))
+                .as_resident()
+                .is_some());
+        }
+        let volume = UnifiedVolume::new(cache.clone());
+        (temp, cache, volume)
+    }
+
+    #[test]
+    fn nearest_sample_above_max_lod_keeps_world_coordinates() {
+        let (_root, _cache, volume) = setup(true);
+        for factor in [2, 4] {
+            assert_eq!(
+                volume.get([4.0 / factor as f64, 2.0 / factor as f64, 1.0 / factor as f64], factor),
+                volume.get([4.0, 2.0, 1.0], 1)
+            );
+        }
+        assert_ne!(volume.get([4.0, 2.0, 1.0], 1), 0);
+    }
+
+    #[test]
+    fn interpolated_sample_above_max_lod_keeps_its_fraction() {
+        let (_root, _cache, volume) = setup(true);
+        let expected = volume.get_interpolated([2.5, 3.0, 1.0], 1);
+        assert_ne!(expected, 0);
+        assert_eq!(volume.get_interpolated([1.25, 1.5, 0.5], 2), expected);
+    }
+
+    #[test]
+    fn gathered_samples_above_max_lod_use_the_available_ct() {
+        let (_root, _cache, volume) = setup(true);
+        let mut expected = [0; 3];
+        let mut actual = [0; 3];
+        volume.gather_along_normal([2.0, 2.0, 1.0], [1.0, 0.0, 0.0], 1, &mut expected);
+        volume.gather_along_normal([1.0, 1.0, 0.5], [0.5, 0.0, 0.0], 2, &mut actual);
+        assert!(expected.iter().all(|&value| value != 0));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn paint_above_max_lod_keeps_world_pixel_positions() {
+        let (_root, _cache, volume) = setup(true);
+        let mut expected = Image::new(3, 3);
+        let mut actual = Image::new(3, 3);
+        let config = DrawingConfig::default();
+        volume.paint([4, 4, 1], 0, 1, 2, 3, 3, 1, 1, &config, &mut expected);
+        volume.paint([4, 4, 1], 0, 1, 2, 3, 3, 2, 1, &config, &mut actual);
+        assert!(expected.data.iter().all(|color| color.r() != 0));
+        assert_eq!(actual.data, expected.data);
+    }
+
+    #[test]
+    fn prefetch_above_max_lod_touches_the_available_ct() {
+        let (_root, cache, volume) = setup(false);
+        volume.touch_aabb([1.0, 1.0, 0.5], [2.0, 2.0, 1.0], 2);
+        let state = cache.peek(ChunkKey::new(0, 0, 0, 0));
+        assert!(
+            state.is_some(),
+            "prefetch must dispatch the corresponding native CT chunk"
+        );
     }
 }
