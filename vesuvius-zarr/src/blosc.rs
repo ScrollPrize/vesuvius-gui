@@ -133,11 +133,16 @@ impl BloscChunk<u8> {
             let block_compressed_length =
                 u32::from_le_bytes(bytes[block_offset..block_offset + 4].try_into().unwrap()) as usize;
             let block_compressed_data = &bytes[block_offset + 4..block_offset + block_compressed_length + 4];
-            let block = match header.compressor {
-                BloscCompressor::Lz4 => lz4_compression::decompress::decompress(block_compressed_data)
-                    .unwrap_or_else(|_| vec![0; header.blocksize]),
-                BloscCompressor::Zstd => zstd_decompress(block_compressed_data),
-                _ => panic!("Unsupported blosc compressor: {:?}", header.compressor),
+            let block_size = header.blocksize.min(header.nbytes - i * header.blocksize);
+            let block = if block_compressed_length == block_size {
+                block_compressed_data.to_vec()
+            } else {
+                match header.compressor {
+                    BloscCompressor::Lz4 => lz4_compression::decompress::decompress(block_compressed_data)
+                        .unwrap_or_else(|_| vec![0; header.blocksize]),
+                    BloscCompressor::Zstd => zstd_decompress(block_compressed_data),
+                    _ => panic!("Unsupported blosc compressor: {:?}", header.compressor),
+                }
             };
             data.extend(block);
         }
