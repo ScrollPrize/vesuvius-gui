@@ -27,7 +27,7 @@ use crate::cache::state::ChunkKey;
 use crate::cache::{CHUNK_SIDE, CHUNK_VOXELS};
 use std::collections::HashMap;
 use std::sync::Arc;
-use vesuvius_zarr::{ChunkContext, OmeZarrContext, ZarrArray};
+use vesuvius_zarr::{ChunkContext, OmeZarrContext, ZarrArray, ZarrOrder};
 
 pub struct OmeZarrBackfiller {
     volume_id: String,
@@ -97,6 +97,7 @@ impl ChunkBackfiller for OmeZarrBackfiller {
         let def = array.def();
         let shape = def.shape.clone();
         let nchunk = def.chunks.clone();
+        let order = def.order.clone();
         if shape.len() != 3 || nchunk.len() != 3 {
             return Err(BackfillError::Permanent(format!(
                 "expected 3D zarr at lod {}, got shape={:?} chunks={:?}",
@@ -228,6 +229,7 @@ impl ChunkBackfiller for OmeZarrBackfiller {
                     &covered_for_extract,
                     &shape,
                     &nchunk,
+                    &order,
                     &decoded,
                     "v2",
                 ))
@@ -365,12 +367,15 @@ pub(super) fn fill_covered_chunks<D: NativeSample>(
     covered: &[ChunkKey],
     shape: &[usize],
     nchunk: &[usize],
+    order: &ZarrOrder,
     decoded: &HashMap<[usize; 3], Arc<D>>,
     label: &str,
 ) -> Vec<(ChunkKey, ExtractedChunk)> {
     let started = std::time::Instant::now();
-    let stride_y = nchunk[2];
-    let stride_z = nchunk[1] * nchunk[2];
+    let [stride_z, stride_y, stride_x] = match order {
+        ZarrOrder::ColumnMajor => [nchunk[1] * nchunk[2], nchunk[2], 1],
+        ZarrOrder::RowMajor => [1, nchunk[0], nchunk[0] * nchunk[1]],
+    };
     let mut output: Vec<(ChunkKey, ExtractedChunk)> = Vec::with_capacity(covered.len());
     let mut primary_found = false;
     let mut empty_count = 0usize;
@@ -445,7 +450,7 @@ pub(super) fn fill_covered_chunks<D: NativeSample>(
                             let out_y = out_z + ly * CHUNK_SIDE;
                             for sx in nx_lo..nx_hi {
                                 let lx = sx - cv_base[2];
-                                out[out_y + lx] = d.at(in_y + (sx - chunk_base_x));
+                                out[out_y + lx] = d.at(in_y + (sx - chunk_base_x) * stride_x);
                             }
                         }
                     }
@@ -472,4 +477,78 @@ pub(super) fn fill_covered_chunks<D: NativeSample>(
         started.elapsed()
     );
     output
+}
+
+#[cfg(test)]
+mod storage_order_tests {
+    use super::*;
+
+    fn check_ct_order(order: &str, downloaded: bool) {
+        let path = format!(
+            "{}/../vesuvius-zarr/tests/data/PHerc0800-order/{order}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let backfiller = OmeZarrBackfiller::from_ome(order, OmeZarrContext::from_path(&path));
+        let key = ChunkKey::new(0, 0, 0, 0);
+        let plan = backfiller.plan(key).unwrap();
+        let inputs = plan
+            .sources
+            .into_iter()
+            .map(|source| {
+                let SourceSpec::Compute { fetch, .. } = source else {
+                    panic!("expected local CT source")
+                };
+                let result = fetch();
+                if !downloaded {
+                    return result;
+                }
+                result.map(|payload| {
+                    payload.map(|payload| {
+                        let context = payload.downcast::<ChunkContext>().ok().unwrap();
+                        let raw: Vec<u8> = (0..4 * 8 * 6).map(|index| context.get(index)).collect();
+                        Arc::new(LazySource::new(Arc::new(raw))) as SourcePayload
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let outputs = (plan.extract)(&inputs).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let (output_key, chunk) = &outputs[0];
+        assert_eq!(*output_key, key);
+        let ExtractedChunk::Bytes(bytes) = chunk else {
+            panic!("expected CT bytes")
+        };
+        let reference = include_bytes!("../../../../vesuvius-zarr/tests/data/PHerc0800-order/reference.raw");
+        for z in 0..CHUNK_SIDE {
+            for y in 0..CHUNK_SIDE {
+                for x in 0..CHUNK_SIDE {
+                    let expected = if z < 3 && y < 16 && x < 12 {
+                        reference[(z * 16 + y) * 12 + x]
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        bytes[(z * CHUNK_SIDE + y) * CHUNK_SIDE + x],
+                        expected,
+                        "{order}, downloaded={downloaded}, {z},{y},{x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extracts_c_order_ct() {
+        check_ct_order("C", false);
+    }
+
+    #[test]
+    fn extracts_fortran_order_ct() {
+        check_ct_order("F", false);
+    }
+
+    #[test]
+    fn extracts_downloaded_fortran_order_ct() {
+        check_ct_order("F", true);
+    }
 }

@@ -238,6 +238,7 @@ pub(super) fn plan_v3_chunk(
                 &targets,
                 &shape,
                 &sub,
+                &vesuvius_zarr::ZarrOrder::ColumnMajor,
                 &decoded,
                 "v3",
             ))
