@@ -47,17 +47,23 @@ impl clap::builder::TypedValueParser for CropParser {
         _arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> std::result::Result<Self::Value, clap::Error> {
-        // parse a value like 0+0-0x0 with a regexp
-
-        let re = regex::Regex::new(r"(\d+)\+(\d+)-(\d+)x(\d+)").unwrap();
-        let captures = re.captures(value.to_str().unwrap()).ok_or(clap::Error::raw(
+        let invalid = || {
+            clap::Error::raw(
             clap::error::ErrorKind::ValueValidation,
-            "--crop argument could not be parsed. Use '--crop <left>+<top>-<width>x<height>', e.g. '--crop 1000+1000-500x500'.",
-        ))?;
-        let left = captures.get(1).unwrap().as_str().parse().unwrap();
-        let top = captures.get(2).unwrap().as_str().parse().unwrap();
-        let width = captures.get(3).unwrap().as_str().parse().unwrap();
-        let height = captures.get(4).unwrap().as_str().parse().unwrap();
+            "Invalid --crop. Use <left>+<top>-<width>x<height> with nonzero dimensions and extents within platform limits.",
+        )
+        };
+        let value = value.to_str().ok_or_else(invalid)?;
+        let re = regex::Regex::new(r"\A([0-9]+)\+([0-9]+)-([0-9]+)x([0-9]+)\z").unwrap();
+        let captures = re.captures(value).ok_or_else(invalid)?;
+        let parse = |index: usize| captures[index].parse::<usize>().map_err(|_| invalid());
+        let left = parse(1)?;
+        let top = parse(2)?;
+        let width = parse(3)?;
+        let height = parse(4)?;
+        if width == 0 || height == 0 || left.checked_add(width).is_none() || top.checked_add(height).is_none() {
+            return Err(invalid());
+        }
         Ok(Crop {
             top,
             left,
@@ -1381,5 +1387,63 @@ impl VoxelVolume for TileCollectingVolume {
             self.add_tile(((xyz[0] as usize) >> 6, (xyz[1] as usize) >> 6, (xyz[2] as usize) >> 6));
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod crop_parser_tests {
+    use super::*;
+    use clap::builder::TypedValueParser;
+
+    fn parse(value: &str) -> std::result::Result<Crop, clap::Error> {
+        CropParser.parse_ref(&clap::Command::new("render"), None, value.as_ref())
+    }
+
+    #[test]
+    fn accepts_the_complete_crop_syntax() {
+        let crop = parse("10+20-30x40").unwrap();
+        assert_eq!((crop.left, crop.top, crop.width, crop.height), (10, 20, 30, 40));
+        assert!(parse("0+0-1x1").is_ok());
+    }
+
+    #[test]
+    fn rejects_partial_or_non_ascii_matches() {
+        for value in [
+            "prefix10+20-30x40",
+            "10+20-30x40suffix",
+            "-10+20-30x40",
+            "10+20-30x40\n",
+            "\u{0661}\u{0660}+20-30x40",
+        ] {
+            assert!(parse(value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_numbers_and_extents_that_overflow() {
+        for value in [
+            format!("{}0+0-1x1", usize::MAX),
+            format!("{}+0-1x1", usize::MAX),
+            format!("0+{}-1x1", usize::MAX),
+        ] {
+            assert!(parse(&value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_crop_dimensions() {
+        for value in ["0+0-0x1", "0+0-1x0", "0+0-0x0"] {
+            assert!(parse(value).is_err(), "{value:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_invalid_unicode_without_panicking() {
+        use std::os::windows::ffi::OsStringExt;
+        let value = std::ffi::OsString::from_wide(&[0xd800]);
+        assert!(CropParser
+            .parse_ref(&clap::Command::new("render"), None, &value)
+            .is_err());
     }
 }
