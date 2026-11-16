@@ -1,0 +1,26 @@
+{
+  "volume_url": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "native_chunk": "91/47/25",
+  "native_chunk_sha256": "6784a75ce2a9df9b28831a755e1c0524a252b1b93dabae5af4d0bb9d578f563f",
+  "crop_zyx": [
+    [
+      0,
+      4
+    ],
+    [
+      0,
+      8
+    ],
+    [
+      0,
+      8
+    ]
+  ],
+  "shape_zyx": [
+    4,
+    8,
+    8
+  ],
+  "sha256": "25fa74db773fb8aea860d7c6010c80e54ad2763f2145fba10e3efc0350253e27",
+  "processing": "Unchanged native uint8 CT values, uncompressed C order"
+}

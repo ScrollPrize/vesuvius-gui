@@ -1144,7 +1144,7 @@ impl Inner {
         let _guard = DispatchGuard { inner: self.clone(), key };
         let state = self.dispatch_chunk(key);
         self.map.insert(key, state.clone());
-        self.publish_terminal(key, &state);
+        self.publish_dependency_state(key, &state);
         state
     }
 
@@ -1164,17 +1164,14 @@ impl Inner {
             .is_ok()
     }
 
-    /// Called right after a chunk is written into `self.map`. If the new
-    /// state is terminal (`Resident` or `Empty`), drain
-    /// `pending_chunk_sources[key]` and complete each waiting source:
-    ///   - `Resident` → payload is the chunk's `Arc<ChunkState>`.
-    ///   - `Empty`    → `Ok(None)` (parent sees the child as absent).
-    /// Source completion is idempotent (`complete_source` no-ops on a Done
-    /// source), so double-fires from racing publishers are safe.
-    fn publish_terminal(self: &Arc<Self>, key: ChunkKey, state: &Arc<ChunkState>) {
+    fn publish_dependency_state(self: &Arc<Self>, key: ChunkKey, state: &Arc<ChunkState>) {
         let outcome: SourceOutcome = match state.as_ref() {
             ChunkState::Resident { .. } => Ok(Some(state.clone() as SourcePayload)),
             ChunkState::Empty => Ok(None),
+            ChunkState::CooldownMiss { .. } if self.is_out_of_bounds(key) => Ok(None),
+            ChunkState::CooldownMiss { .. } => {
+                Err(BackfillError::Transient(format!("chunk dependency {} failed", key)))
+            }
             _ => return,
         };
         let waiters: Vec<String> = match self.pending_chunk_sources.remove(&key) {
@@ -1422,45 +1419,8 @@ impl Inner {
                     .push(source_key.clone());
 
                 let child_state = self.state_or_fetch(child_key);
-                match child_state.as_ref() {
-                    ChunkState::Resident { .. } => {
-                        // publish_terminal either fired during the dispatch
-                        // call above or is about to via the disk path; in
-                        // both cases the source is (or will be) Done.
-                        log::trace!(
-                            "[{}] chunk dep on {} resident (chunk {})",
-                            source_key,
-                            child_key,
-                            chunk_key
-                        );
-                        RegisterResult::Queued
-                    }
-                    ChunkState::Empty | ChunkState::CooldownMiss { .. } => {
-                        // Child is definitively absent or won't load — resolve
-                        // our source as absent. (Empty also gets handled by
-                        // publish_terminal, but we may have raced ahead of
-                        // that; complete_source is idempotent.)
-                        log::trace!(
-                            "[{}] chunk dep on {} unresolvable (chunk {})",
-                            source_key,
-                            child_key,
-                            chunk_key
-                        );
-                        self.complete_source(source_key.clone(), Ok(None));
-                        RegisterResult::Queued
-                    }
-                    _ => {
-                        // Pending / Missing — publish_terminal will satisfy
-                        // us when the child reaches a terminal state.
-                        log::trace!(
-                            "[{}] chunk dep on {} pending (chunk {})",
-                            source_key,
-                            child_key,
-                            chunk_key
-                        );
-                        RegisterResult::Queued
-                    }
-                }
+                self.publish_dependency_state(child_key, &child_state);
+                RegisterResult::Queued
             }
             SourceSpec::Download { key: _, url, range } => {
                 // Retention key: the (url, byte-range) identity of the
@@ -1770,7 +1730,7 @@ impl Inner {
 
         let new_state = primary_state.unwrap_or_else(|| failure_state.clone().unwrap_or_else(cooldown));
         self.map.insert(key, new_state.clone());
-        self.publish_terminal(key, &new_state);
+        self.publish_dependency_state(key, &new_state);
 
         // Promote siblings to their terminal states. The set of keys we
         // touched is `{primary} ∪ {fills}`; any covered key not in that
@@ -1782,7 +1742,7 @@ impl Inner {
         for (k, state) in &sibling_states {
             touched.insert(*k);
             self.map.insert(*k, state.clone());
-            self.publish_terminal(*k, state);
+            self.publish_dependency_state(*k, state);
         }
         for c in &covered {
             if touched.contains(c) {
@@ -2212,4 +2172,137 @@ fn upsample_from_parent(parent: &[u8], target_cx: u32, target_cy: u32, target_cz
         }
     }
     out
+}
+
+#[cfg(test)]
+mod dependency_failure_tests {
+    use super::*;
+    use crate::cache::backfillers::ome_zarr::OmeZarrBackfiller;
+    use crate::cache::backfillers::synthesized_lod::SynthesizedLodBackfiller;
+    use std::sync::atomic::AtomicBool;
+    use vesuvius_zarr::OmeZarrContext;
+
+    struct GatedCt {
+        inner: OmeZarrBackfiller,
+        failing: Arc<AtomicBool>,
+    }
+
+    impl ChunkBackfiller for GatedCt {
+        fn max_lod(&self) -> u8 {
+            self.inner.max_lod()
+        }
+        fn voxel_extent(&self) -> [u32; 3] {
+            self.inner.voxel_extent()
+        }
+        fn volume_id(&self) -> String {
+            self.inner.volume_id()
+        }
+        fn plan(&self, key: ChunkKey) -> Result<BackfillPlan, BackfillError> {
+            let mut plan = self.inner.plan(key)?;
+            plan.sources = plan
+                .sources
+                .into_iter()
+                .map(|source| {
+                    let SourceSpec::Compute { key, fetch } = source else {
+                        panic!("expected a local CT source")
+                    };
+                    let failing = self.failing.clone();
+                    SourceSpec::Compute {
+                        key,
+                        fetch: Box::new(move || {
+                            if failing.load(Ordering::SeqCst) {
+                                Err(BackfillError::Transient("injected CT read failure".into()))
+                            } else {
+                                fetch()
+                            }
+                        }),
+                    }
+                })
+                .collect();
+            Ok(plan)
+        }
+    }
+
+    fn setup(failing: bool) -> (tempfile::TempDir, ChunkCache, Arc<AtomicBool>) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/PHerc0800-dependency");
+        let gate = Arc::new(AtomicBool::new(failing));
+        let inner = GatedCt {
+            inner: OmeZarrBackfiller::from_ome("PHerc0800-dependency", OmeZarrContext::from_path(path)),
+            failing: gate.clone(),
+        };
+        let synth = Arc::new(SynthesizedLodBackfiller::with_extra_levels(Arc::new(inner), 1));
+        let root = tempfile::tempdir().unwrap();
+        let cache = UnifiedCache::for_cache_dir(root.path()).open_volume_with_shard_chunks_per_axis(synth, 2);
+        (root, cache, gate)
+    }
+
+    fn check_ct(cache: &ChunkCache) {
+        let state = cache.wait_for(ChunkKey::new(1, 0, 0, 0), Duration::from_secs(3));
+        let pixels = state.as_resident().expect("coarse CT must become resident");
+        let raw = include_bytes!("../../tests/data/PHerc0800-dependency/0/0.0.0");
+        for z in 0..64 {
+            for y in 0..64 {
+                for x in 0..64 {
+                    let mut sum = 0u16;
+                    if z < 2 && y < 4 && x < 4 {
+                        for dz in 0..2 {
+                            for dy in 0..2 {
+                                for dx in 0..2 {
+                                    sum += raw[((z * 2 + dz) * 8 + y * 2 + dy) * 8 + x * 2 + dx] as u16;
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(pixels[(z * 64 + y) * 64 + x], (sum / 8) as u8, "{z},{y},{x}");
+                }
+            }
+        }
+    }
+
+    fn check_recovery(cache: &ChunkCache, gate: &AtomicBool) {
+        let parent = ChunkKey::new(1, 0, 0, 0);
+        let state = cache.wait_for(parent, Duration::from_secs(2));
+        assert!(
+            matches!(state.as_ref(), ChunkState::CooldownMiss { .. }),
+            "dependency failure must remain retryable: {state:?}"
+        );
+        gate.store(false, Ordering::SeqCst);
+        for key in [ChunkKey::new(0, 0, 0, 0), parent] {
+            cache.inner.map.insert(
+                key,
+                Arc::new(ChunkState::CooldownMiss {
+                    until: SystemTime::UNIX_EPOCH,
+                }),
+            );
+        }
+        check_ct(cache);
+    }
+
+    #[test]
+    fn child_read_failure_settles_the_waiting_parent_and_recovers() {
+        let (_root, cache, gate) = setup(true);
+        check_recovery(&cache, &gate);
+    }
+
+    #[test]
+    fn existing_child_cooldown_does_not_persist_an_empty_parent() {
+        let (_root, cache, gate) = setup(true);
+        let child = cache.wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(2));
+        assert!(matches!(child.as_ref(), ChunkState::CooldownMiss { .. }));
+        check_recovery(&cache, &gate);
+    }
+
+    #[test]
+    fn resident_child_immediately_supplies_the_coarse_ct() {
+        let (_root, cache, _gate) = setup(false);
+        let child = cache.wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(2));
+        assert!(child.as_resident().is_some());
+        check_ct(&cache);
+    }
+
+    #[test]
+    fn out_of_bounds_children_still_zero_pad_the_real_ct_average() {
+        let (_root, cache, _gate) = setup(false);
+        check_ct(&cache);
+    }
 }
