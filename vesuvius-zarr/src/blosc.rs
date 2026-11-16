@@ -139,7 +139,19 @@ impl BloscChunk<u8> {
                 BloscCompressor::Zstd => zstd_decompress(block_compressed_data),
                 _ => panic!("Unsupported blosc compressor: {:?}", header.compressor),
             };
-            data.extend(block);
+            if matches!(header.shuffle, BloscShuffle::Bit) && block.len() % 8 == 0 {
+                assert_eq!(header.typesize, 1, "bitshuffle decoding requires uint8 elements");
+                let rows = block.len() / 8;
+                for index in 0..block.len() {
+                    let mut value = 0;
+                    for bit in 0..8 {
+                        value |= ((block[bit * rows + index / 8] >> (index % 8)) & 1) << bit;
+                    }
+                    data.push(value);
+                }
+            } else {
+                data.extend(block);
+            }
         }
         data
     }
