@@ -165,6 +165,7 @@ pub struct ObjFileConfig {
 
 pub struct VesuviusConfig {
     pub data_dir: Option<String>,
+    pub coord: Option<[i32; 3]>,
     pub obj_file: Option<ObjFileConfig>,
     pub tifxyz_dir: Option<(String, Option<AffineTransform>)>,
     pub overlay_dir: Option<String>,
@@ -501,6 +502,10 @@ impl TemplateApp {
                     app.overlay_inner = Some(inner);
                 }
             }
+        }
+
+        if let Some(coord) = config.coord {
+            app.coord = coord;
         }
 
         app
