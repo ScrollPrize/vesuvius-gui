@@ -570,6 +570,12 @@ impl RenderParams {
     fn render_height(&self) -> usize {
         self.crop.as_ref().map(|c| c.height).unwrap_or(self.height)
     }
+    fn tile_dimensions(&self, u: usize, v: usize) -> (usize, usize) {
+        (
+            self.tile_size.min(self.render_width() - (u - self.render_left())),
+            self.tile_size.min(self.render_height() - (v - self.render_top())),
+        )
+    }
     /// The drawing config shared by the chunk-collection pass and the render
     /// pass — they MUST agree so the chunks we make resident are exactly the
     /// ones the render samples.
@@ -949,8 +955,7 @@ impl Rendering {
     /// exactly like the render pass, so the overlay's sampled chunks are
     /// collected too (in their own cache's coordinate space).
     fn chunks_for(&self, UVTile { u, v, w }: &UVTile) -> TileChunks {
-        let tile_width = self.params.tile_size;
-        let tile_height = self.params.tile_size;
+        let (tile_width, tile_height) = self.params.tile_dimensions(*u, *v);
 
         // Keep handles to the *same* collector instances that `paint` samples.
         // (`TileCollectingVolume`'s state is a `RefCell` that deep-clones, so
@@ -1125,9 +1130,6 @@ impl Rendering {
                 active = Some((w, tx, handle));
             }
 
-            // Color32 → Gray8: drops the 4 MiB tile for a 1 MiB buffer before
-            // the hand-off. Tiles are painted full-size (edge overhang
-            // included), which is exactly what the tiled layout stores.
             let data: Vec<u8> = image.data.iter().map(|c| c.r()).collect();
             let col = (u - left) / tile_size;
             let row = (v - top) / tile_size;
@@ -1177,8 +1179,7 @@ impl Rendering {
     }
 
     fn render_tile(&self, UVTile { u, v, w }: &UVTile) -> Image {
-        let paint_width = self.params.tile_size;
-        let paint_height = self.params.tile_size;
+        let (paint_width, paint_height) = self.params.tile_dimensions(*u, *v);
 
         // Fresh per-tile reader over the shared cache: UnifiedVolume holds a
         // thread-local hot slot (!Sync), so each render thread needs its own.
@@ -1197,7 +1198,7 @@ impl Rendering {
         let world = self.world(vol);
         let config = self.params.drawing_config();
 
-        let mut image = Image::new(paint_width, paint_height);
+        let mut image = Image::new(self.params.tile_size, self.params.tile_size);
         world.paint(
             [
                 *u as i32 + paint_width as i32 / 2,
@@ -1381,5 +1382,132 @@ impl VoxelVolume for TileCollectingVolume {
             self.add_tile(((xyz[0] as usize) >> 6, (xyz[1] as usize) >> 6, (xyz[2] as usize) >> 6));
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod edge_tile_tests {
+    use super::*;
+
+    fn rendering(overlay: bool) -> (Rendering, tempfile::TempDir) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/PHerc0800");
+        let surface = root.join("surface.tifxyz");
+        let volume = root.join("volume.zarr");
+        let cache = tempfile::tempdir().unwrap();
+        let mut args = Args::parse_from([
+            "vesuvius-render",
+            "--tifxyz",
+            surface.to_str().unwrap(),
+            "--volume",
+            volume.to_str().unwrap(),
+            "--target-dir",
+            cache.path().to_str().unwrap(),
+            "--data-directory",
+            cache.path().to_str().unwrap(),
+            "--crop",
+            "400+400-65x67",
+            "--min-layer",
+            "32",
+            "--max-layer",
+            "32",
+        ]);
+        if overlay {
+            args.overlay = Some(volume.to_str().unwrap().to_string());
+            args.alpha.composite_mode = Some(CompositeModeArg::AlphaOverlay);
+        }
+        (Rendering::new((&args).into(), &args).unwrap(), cache)
+    }
+
+    fn exact_crop_chunks(rendering: &Rendering) -> TileChunks {
+        let base = Arc::new(TileCollectingVolume::new());
+        let overlay = rendering
+            .overlay_cache
+            .as_ref()
+            .map(|_| Arc::new(TileCollectingVolume::new()));
+        let inner = match overlay.as_ref() {
+            Some(overlay) => OverlayVolume::new(
+                Volume::from_ref(base.clone()),
+                Volume::from_ref(overlay.clone()),
+                OverlayColoring::default(),
+            )
+            .into_volume(),
+            None => Volume::from_ref(base.clone()),
+        };
+        let width = rendering.params.render_width();
+        let height = rendering.params.render_height();
+        let mut image = Image::new(width, height);
+        rendering.world(inner).paint(
+            [
+                (rendering.params.render_left() + width / 2) as i32,
+                (rendering.params.render_top() + height / 2) as i32,
+                0,
+            ],
+            0,
+            1,
+            2,
+            width,
+            height,
+            1,
+            1,
+            &rendering.params.drawing_config(),
+            &mut image,
+        );
+        let base = base
+            .state
+            .replace(Default::default())
+            .requested_tiles
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        let overlay = overlay
+            .map(|overlay| {
+                overlay
+                    .state
+                    .replace(Default::default())
+                    .requested_tiles
+                    .into_iter()
+                    .map(Into::into)
+                    .collect()
+            })
+            .unwrap_or_default();
+        TileChunks { base, overlay }
+    }
+
+    fn check_crop(overlay: bool) {
+        let (mut rendering, _cache) = rendering(overlay);
+        let expected = exact_crop_chunks(&rendering);
+        assert!(!expected.base.is_empty());
+        assert_eq!(!expected.overlay.is_empty(), overlay);
+        for size in [1024, 128, 16] {
+            rendering.params.tile_size = size;
+            let mut actual = TileChunks::default();
+            for tile in rendering.uv_tiles() {
+                let chunks = rendering.chunks_for(&tile);
+                actual.base.extend(chunks.base);
+                actual.overlay.extend(chunks.overlay);
+            }
+            assert!(
+                actual.base == expected.base,
+                "tile_size={size}: {} base chunks instead of {}",
+                actual.base.len(),
+                expected.base.len()
+            );
+            assert!(
+                actual.overlay == expected.overlay,
+                "tile_size={size}: {} overlay chunks instead of {}",
+                actual.overlay.len(),
+                expected.overlay.len()
+            );
+        }
+    }
+
+    #[test]
+    fn crop_collects_only_its_real_surface_chunks() {
+        check_crop(false);
+    }
+
+    #[test]
+    fn overlay_crop_collects_only_its_real_surface_chunks() {
+        check_crop(true);
     }
 }
