@@ -896,9 +896,9 @@ impl ZarrContext<3> {
         self.cache.purge_missing();
     }
     pub fn get(&self, index: [usize; 3]) -> Option<u8> {
-        if index[0] > self.array.def.shape[0]
-            || index[1] > self.array.def.shape[1]
-            || index[2] > self.array.def.shape[2]
+        if index[0] >= self.array.def.shape[0]
+            || index[1] >= self.array.def.shape[1]
+            || index[2] >= self.array.def.shape[2]
         {
             return None; // FIXME: or just return 0?
         }
@@ -931,6 +931,11 @@ impl ZarrContext<3> {
         }
     }
     pub fn get_interpolated(&self, xyz: [f64; 3]) -> Option<u8> {
+        if xyz.iter().zip(&self.array.def.shape).any(|(&value, &size)| {
+            !value.is_finite() || value < 0.0 || value.floor() + 1.0 >= size as f64
+        }) {
+            return None;
+        }
         let (dx, x0) = modf(xyz[0]);
         let x0 = x0 as usize;
         let x1 = x0 + 1;
