@@ -112,7 +112,7 @@ pub struct OmeZarr {
 pub struct OmeZarrContext {
     pub ome_zarr: OmeZarr,
     pub cache_missing: bool,
-    pub zarr_contexts: Vec<ZarrContext<3>>, // TODO: make generic
+    pub zarr_contexts: Vec<Option<ZarrContext<3>>>,
 }
 
 impl OmeZarrContext {
@@ -133,7 +133,7 @@ impl OmeZarrContext {
             let zarr_contexts = ome_zarr.attrs.multiscales[0]
                 .datasets
                 .iter()
-                .filter_map(|dataset| {
+                .map(|dataset| {
                     let url_path = format!("{}/{}", url, dataset.path);
                     let cache_path = format!("{}/{}", local_cache_dir, dataset.path);
                     if !remote_dataset_present(&url_path, &cache_path, &client) {
@@ -164,7 +164,7 @@ impl OmeZarrContext {
             .map(|dataset| {
                 let url_path = format!("{}/{}", url, dataset.path);
                 let cache_path = format!("{}/{}", local_cache_dir, dataset.path);
-                ZarrArray::from_url(&url_path, &cache_path).into_ctx().into_ctx()
+                Some(ZarrArray::from_url(&url_path, &cache_path).into_ctx().into_ctx())
             })
             .collect();
 
@@ -193,7 +193,7 @@ impl OmeZarrContext {
             let zarr_contexts = ome_zarr.attrs.multiscales[0]
                 .datasets
                 .iter()
-                .filter_map(|dataset| {
+                .map(|dataset| {
                     let url_path = format!("{}/{}", url, dataset.path);
                     let cache_path = format!("{}/{}", local_cache_dir, dataset.path);
                     if !remote_dataset_present(&url_path, &cache_path, &client) {
@@ -223,9 +223,11 @@ impl OmeZarrContext {
             .map(|dataset| {
                 let url_path = format!("{}/{}", url, dataset.path);
                 let cache_path = format!("{}/{}", local_cache_dir, dataset.path);
-                ZarrArray::from_url_blocking(&url_path, &cache_path, client.clone())
-                    .into_ctx()
-                    .into_ctx()
+                Some(
+                    ZarrArray::from_url_blocking(&url_path, &cache_path, client.clone())
+                        .into_ctx()
+                        .into_ctx(),
+                )
             })
             .collect();
         Self { ome_zarr, zarr_contexts, cache_missing: true }
@@ -254,7 +256,7 @@ impl OmeZarrContext {
         let zarr_contexts = ome_zarr.attrs.multiscales[0]
             .datasets
             .iter()
-            .filter_map(|dataset| {
+            .map(|dataset| {
                 let dataset_path = format!("{}/{}", path, dataset.path);
                 let has_v3 = std::path::Path::new(&format!("{}/zarr.json", dataset_path)).exists();
                 let has_v2 = std::path::Path::new(&format!("{}/.zarray", dataset_path)).exists();
@@ -290,10 +292,16 @@ impl OmeZarrContext {
     }
 
     pub fn get(&self, xyz: [usize; 3], scale: u8) -> u8 {
-        let max = self.zarr_contexts.len() as u8 - 1;
+        let Some(max) = self.zarr_contexts.iter().rposition(Option::is_some) else {
+            return 0;
+        };
+        let max = max as u8;
         for s in scale.min(max)..=max {
+            let Some(context) = self.zarr_contexts[s as usize].as_ref() else {
+                continue;
+            };
             let scaled_xyz = xyz.iter().map(|&x| x >> s).collect::<Vec<usize>>();
-            let v = self.zarr_contexts[s as usize].get(scaled_xyz.try_into().unwrap());
+            let v = context.get(scaled_xyz.try_into().unwrap());
             if let Some(v) = v {
                 return v;
             }
@@ -301,10 +309,16 @@ impl OmeZarrContext {
         0
     }
     pub fn get_interpolated(&self, xyz: [f64; 3], scale: u8) -> u8 {
-        let max = self.zarr_contexts.len() as u8 - 1;
+        let Some(max) = self.zarr_contexts.iter().rposition(Option::is_some) else {
+            return 0;
+        };
+        let max = max as u8;
         for s in scale.min(max)..=max {
+            let Some(context) = self.zarr_contexts[s as usize].as_ref() else {
+                continue;
+            };
             let scaled_xyz = xyz.iter().map(|&x| x / (1 << s) as f64).collect::<Vec<f64>>();
-            let v = self.zarr_contexts[s as usize].get_interpolated(scaled_xyz.try_into().unwrap());
+            let v = context.get_interpolated(scaled_xyz.try_into().unwrap());
             if let Some(v) = v {
                 return v;
             }

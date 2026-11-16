@@ -32,7 +32,7 @@ use vesuvius_zarr::{ChunkContext, OmeZarrContext, ZarrArray};
 pub struct OmeZarrBackfiller {
     volume_id: String,
     extent_xyz: [u32; 3],
-    arrays: Vec<ZarrArray<3, u8>>,
+    arrays: Vec<Option<ZarrArray<3, u8>>>,
     /// When true, the v3 plan covers (decodes + persists) every 64³ cache
     /// chunk inside a decoded 256³ sub-chunk on the first request, instead
     /// of just the requesting chunk. The lazy default suits interactive
@@ -45,17 +45,25 @@ pub struct OmeZarrBackfiller {
 
 impl OmeZarrBackfiller {
     pub fn from_ome(volume_id: impl Into<String>, ome: OmeZarrContext) -> Self {
-        let shape0 = ome
+        let extent_xyz = ome
             .zarr_contexts
-            .first()
-            .map(|c| c.shape().to_vec())
-            .unwrap_or_else(|| vec![0, 0, 0]);
-        let extent_xyz = [
-            *shape0.get(2).unwrap_or(&0) as u32,
-            *shape0.get(1).unwrap_or(&0) as u32,
-            *shape0.first().unwrap_or(&0) as u32,
-        ];
-        let arrays = ome.zarr_contexts.iter().map(|ctx| ctx.array().clone()).collect();
+            .iter()
+            .enumerate()
+            .find_map(|(lod, ctx)| ctx.as_ref().map(|ctx| (lod, ctx.shape())))
+            .map(|(lod, shape)| {
+                let scale = 1u64.checked_shl(lod as u32).unwrap_or(u64::MAX);
+                std::array::from_fn(|axis| {
+                    (*shape.get(2 - axis).unwrap_or(&0) as u64)
+                        .saturating_mul(scale)
+                        .min(u32::MAX as u64) as u32
+                })
+            })
+            .unwrap_or([0, 0, 0]);
+        let arrays = ome
+            .zarr_contexts
+            .iter()
+            .map(|ctx| ctx.as_ref().map(|ctx| ctx.array().clone()))
+            .collect();
         Self {
             volume_id: volume_id.into(),
             extent_xyz,
@@ -74,7 +82,7 @@ impl OmeZarrBackfiller {
 
 impl ChunkBackfiller for OmeZarrBackfiller {
     fn max_lod(&self) -> u8 {
-        self.arrays.len().saturating_sub(1) as u8
+        self.arrays.iter().rposition(Option::is_some).unwrap_or(0) as u8
     }
 
     fn voxel_extent(&self) -> [u32; 3] {
@@ -83,7 +91,11 @@ impl ChunkBackfiller for OmeZarrBackfiller {
 
     fn plan(&self, key: ChunkKey) -> Result<BackfillPlan, BackfillError> {
         let lod = key.lod as usize;
-        let array = self.arrays.get(lod).ok_or(BackfillError::OutOfBounds)?;
+        let array = self
+            .arrays
+            .get(lod)
+            .and_then(Option::as_ref)
+            .ok_or(BackfillError::OutOfBounds)?;
 
         // V3 sharded c3d remote arrays take a specialized planning path
         // that issues HTTP Range requests for individual sub-chunks
@@ -472,4 +484,80 @@ pub(super) fn fill_covered_chunks<D: NativeSample>(
         started.elapsed()
     );
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backfiller(name: &str) -> OmeZarrBackfiller {
+        let path = format!(
+            "{}/../vesuvius-zarr/tests/data/PHerc0800-levels/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        OmeZarrBackfiller::from_ome(name, OmeZarrContext::from_path(&path))
+    }
+
+    #[test]
+    fn partial_ct_pyramids_keep_cache_lod_indices() {
+        let references: [&[u8]; 3] = [
+            include_bytes!("../../../../vesuvius-zarr/tests/data/PHerc0800-levels/reference-0.raw"),
+            include_bytes!("../../../../vesuvius-zarr/tests/data/PHerc0800-levels/reference-1.raw"),
+            include_bytes!("../../../../vesuvius-zarr/tests/data/PHerc0800-levels/reference-2.raw"),
+        ];
+        for (name, present) in [
+            ("complete", [true, true, true]),
+            ("middle-missing", [true, false, true]),
+            ("base-missing", [false, true, true]),
+        ] {
+            let source = backfiller(name);
+            assert_eq!(source.voxel_extent(), [32, 32, 20]);
+            assert_eq!(source.max_lod(), 2);
+            for lod in 0..3 {
+                let key = ChunkKey::new(lod, 0, 0, 0);
+                let plan = source.plan(key);
+                if !present[lod as usize] {
+                    assert!(matches!(plan, Err(BackfillError::OutOfBounds)));
+                    continue;
+                }
+                let plan = plan.unwrap();
+                let inputs = plan
+                    .sources
+                    .into_iter()
+                    .map(|source| match source {
+                        SourceSpec::Compute { fetch, .. } => fetch(),
+                        _ => panic!("local CT fixture should use compute sources"),
+                    })
+                    .collect::<Vec<_>>();
+                let output = (plan.extract)(&inputs).unwrap();
+                let (output_key, chunk) = output.into_iter().find(|(output_key, _)| *output_key == key).unwrap();
+                assert_eq!(output_key, key);
+                let ExtractedChunk::Bytes(bytes) = chunk else {
+                    panic!("CT chunk should contain bytes")
+                };
+                let side = 32 >> lod;
+                for z in 0..(20 >> lod) {
+                    for y in 0..side {
+                        for x in 0..side {
+                            assert_eq!(
+                                bytes[(z * CHUNK_SIDE + y) * CHUNK_SIDE + x],
+                                references[lod as usize][(z * side + y) * side + x],
+                                "{name}, L{lod} at {z},{y},{x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_pyramid_has_no_cache_plan() {
+        let source = backfiller("empty");
+        assert_eq!(source.voxel_extent(), [0, 0, 0]);
+        assert!(matches!(
+            source.plan(ChunkKey::new(0, 0, 0, 0)),
+            Err(BackfillError::OutOfBounds)
+        ));
+    }
 }

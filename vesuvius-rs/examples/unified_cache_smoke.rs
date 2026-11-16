@@ -23,6 +23,7 @@ fn main() {
     let ome = OmeZarrContext::from_url_blocking_to_default_cache_dir(URL);
     println!("opened in {:?} ({} multiscale levels)", t0.elapsed(), ome.zarr_contexts.len());
     for (i, ctx) in ome.zarr_contexts.iter().enumerate() {
+        let Some(ctx) = ctx else { continue };
         println!("  L{}: shape={:?} chunks={:?}", i, ctx.shape(), ctx.array().def().chunks);
     }
 

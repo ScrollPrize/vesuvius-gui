@@ -134,7 +134,7 @@ impl<C: ColorScheme + 'static + Send + Sync> PaintVolume for OmeZarrPaintVolume<
         buffer: &mut Image,
     ) {
         if !self.inner.cache_missing {
-            self.inner.zarr_contexts.iter().for_each(|ctx| {
+            self.inner.zarr_contexts.iter().flatten().for_each(|ctx| {
                 ctx.purge_missing_cache();
             });
         }
@@ -173,14 +173,14 @@ impl<C: ColorScheme + 'static + Send + Sync> PaintVolume for OmeZarrPaintVolume<
             .inner
             .zarr_contexts
             .iter()
-            .map(|ctx| ctx.shareable())
+            .map(|ctx| ctx.as_ref().map(|ctx| ctx.shareable()))
             .collect::<Vec<_>>();
 
         Box::new(move || {
             let inner = OmeZarrContext {
                 ome_zarr: ome_zarr.clone(),
                 cache_missing,
-                zarr_contexts: zarr_contexts.into_iter().map(|ctx| ctx()).collect(),
+                zarr_contexts: zarr_contexts.into_iter().map(|ctx| ctx.map(|ctx| ctx())).collect(),
             };
             OmeZarrPaintVolume::<C>::new(inner).into_volume()
         })
@@ -211,7 +211,7 @@ impl<C: ColorScheme> VoxelVolume for OmeZarrPaintVolume<C> {
         )
     }
     fn reset_for_painting(&self) {
-        self.inner.zarr_contexts.iter().for_each(|ctx| {
+        self.inner.zarr_contexts.iter().flatten().for_each(|ctx| {
             ctx.reset_for_painting();
         });
     }
