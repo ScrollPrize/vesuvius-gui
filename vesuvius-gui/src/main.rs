@@ -18,6 +18,16 @@ pub struct Args {
     #[clap(short, long)]
     data_directory: Option<String>,
 
+    #[clap(
+        long,
+        num_args = 3,
+        action = clap::ArgAction::Set,
+        value_names = ["X", "Y", "Z"],
+        value_parser = clap::value_parser!(i32).range(0..),
+        help = "Initial volume position in voxel coordinates"
+    )]
+    xyz: Option<Vec<i32>>,
+
     /// Browse segment from obj file. You need to also provide --width and --height. Provide the --volume if the segment does not target Scroll 1a / 20230205180739
     #[clap(long, conflicts_with = "tifxyz")]
     obj: Option<String>,
@@ -146,6 +156,7 @@ impl TryFrom<Args> for VesuviusConfig {
 
         Ok(VesuviusConfig {
             data_dir: args.data_directory,
+            coord: args.xyz.map(|xyz| [xyz[0], xyz[1], xyz[2]]),
             obj_file,
             tifxyz_dir,
             overlay_dir: args.overlay,
@@ -257,5 +268,39 @@ async fn main() -> eframe::Result<()> {
             eprintln!("{}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod initial_xyz_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_three_voxel_coordinates() {
+        for (values, expected) in [(["32", "24", "16"], [32, 24, 16]), (["0", "0", "0"], [0, 0, 0])] {
+            let args = Args::try_parse_from(["gui", "--xyz", values[0], values[1], values[2]]).unwrap();
+            let config = VesuviusConfig::try_from(args).unwrap();
+            assert_eq!(config.coord, Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_negative_or_overflowing_coordinates() {
+        for arguments in [
+            vec!["gui", "--xyz", "1", "2"],
+            vec!["gui", "--xyz", "1", "2", "3", "4"],
+            vec!["gui", "--xyz", "1", "2", "3", "--xyz", "4", "5", "6"],
+            vec!["gui", "--xyz=-1", "2", "3"],
+            vec!["gui", "--xyz", "1", "2", "no"],
+            vec!["gui", "--xyz", "2147483648", "2", "3"],
+        ] {
+            assert!(Args::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn omitting_xyz_leaves_the_initial_position_unset() {
+        let config = VesuviusConfig::try_from(Args::try_parse_from(["gui"]).unwrap()).unwrap();
+        assert_eq!(config.coord, None);
     }
 }
