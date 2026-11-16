@@ -24,7 +24,7 @@ use vesuvius_rs::catalog::Catalog;
 use vesuvius_rs::catalog::Segment;
 use vesuvius_rs::model::*;
 use vesuvius_rs::volume::*;
-use vesuvius_zarr::{base_cache_dir, ZarrArray};
+use vesuvius_zarr::ZarrArray;
 
 pub(crate) const ZOOM_MIN: f32 = 0.01;
 pub(crate) const ZOOM_MAX: f32 = 8.0;
@@ -462,8 +462,12 @@ impl TemplateApp {
                     match vref {
                         Ok(NewVolumeReference::OmeZarr { id, location }) => {
                             log::info!("Loading ome-zarr overlay '{}' from {}", id, segment_file);
-                            let cache =
-                                NewVolumeReference::open_ome_zarr_cache(&id, &location, base_cache_dir(), false);
+                            let cache = NewVolumeReference::open_ome_zarr_cache(
+                                &id,
+                                &location,
+                                app.data_dir.clone().into(),
+                                false,
+                            );
                             Some(UnifiedVolume::new(cache).into_volume())
                         }
                         Ok(other) => {

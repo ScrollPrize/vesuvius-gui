@@ -7,9 +7,7 @@ use crate::{
     volume::{LayersMappedVolume, Volume, VolumeGrid500Mapped, VolumeGrid64x4Mapped, VoxelPaintVolume},
 };
 use std::{path::Path, sync::Arc};
-use vesuvius_zarr::{
-    base_cache_dir, default_cache_dir_for_url, unified_volume_key, OmeZarrContext, ZarrArray,
-};
+use vesuvius_zarr::{default_cache_dir_for_url, unified_volume_key, OmeZarrContext, ZarrArray};
 
 #[derive(Copy, Clone, Debug)]
 pub struct Quality {
@@ -343,11 +341,7 @@ impl NewVolumeReference {
                 v.into_volume()
             }
             NewVolumeReference::OmeZarr { id, location } => {
-                // Use the single process-global cache base so every zarr store
-                // ends up under one `<base>/unified/` dir and shares one epoch
-                // counter / purge plan. (`open_ome_zarr_cache` is the shared
-                // construction the renderer and the overlay path also use.)
-                let cache = Self::open_ome_zarr_cache(id, location, base_cache_dir(), false);
+                let cache = Self::open_ome_zarr_cache(id, location, params.cache_dir.clone().into(), false);
                 UnifiedVolume::new(cache).into_volume()
             }
             NewVolumeReference::Zarr { location, .. } => match location {
@@ -474,5 +468,32 @@ impl NewVolumeReference {
             location_type, location_str
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod cache_directory_tests {
+    use super::*;
+
+    #[test]
+    fn ome_ct_cache_uses_each_requested_directory() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/PHerc0800-cache-root");
+        let reference = NewVolumeReference::OmeZarr {
+            id: "PHerc0800-cache-root".into(),
+            location: VolumeLocation::LocalPath(fixture.into()),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["cache one", "cache two"] {
+            let requested = temp.path().join(name);
+            let _volume = reference.volume(&VolumeCreationParams {
+                cache_dir: requested.to_str().unwrap().into(),
+            });
+            let unified = requested.join("unified");
+            assert!(unified.is_dir(), "OME CT cache must use the requested directory");
+            assert!(
+                std::fs::read_dir(unified).unwrap().next().is_some(),
+                "the volume cache must be created under that root"
+            );
+        }
     }
 }

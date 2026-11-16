@@ -242,7 +242,12 @@ async fn main() -> eframe::Result<()> {
     // survey shows we're over high water or low on free space, so the
     // app starts in a known good state instead of racing the
     // background watchdog through its first 30 s.
-    UnifiedCache::for_cache_dir(base_cache_dir()).run_startup_maintenance();
+    let cache_root = args
+        .data_directory
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(base_cache_dir);
+    UnifiedCache::for_cache_dir(cache_root).run_startup_maintenance();
 
     let native_options = Default::default();
 
