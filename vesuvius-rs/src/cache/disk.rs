@@ -767,7 +767,12 @@ pub(crate) fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std:
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+#[cfg(windows)]
+pub(crate) fn punch_hole_at(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    super::windows_sparse::punch_hole(file, offset, len)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 pub(crate) fn punch_hole_at(_file: &std::fs::File, _offset: u64, _len: u64) -> std::io::Result<()> {
     Ok(())
 }
@@ -805,6 +810,8 @@ impl DiskStoreInner {
         let total = self.shard_bytes();
         let path = self.root.join(shard_filename(lod, shard));
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        #[cfg(windows)]
+        super::windows_sparse::mark_sparse(&file)?;
         let cur_len = file.metadata()?.len();
         if cur_len == 0 {
             file.set_len(total)?;
