@@ -16,6 +16,7 @@ pub struct Quality {
     pub bit_mask: u8,
     pub downsampling_factor: u8,
 }
+
 impl Quality {
     pub const FULL: Quality = Quality {
         bit_mask: 0xff,
@@ -417,7 +418,14 @@ impl NewVolumeReference {
 
         let (id, location_str) = match &location {
             VolumeLocation::RemoteUrl(url) => (url.split('/').last().unwrap_or("unknown").to_string(), url.as_str()),
-            VolumeLocation::LocalPath(path) => (path.split('/').last().unwrap_or("unknown").to_string(), path.as_str()),
+            VolumeLocation::LocalPath(path) => (
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                path.as_str(),
+            ),
         };
 
         // Try OME-Zarr first (v2 .zattrs or v3 group zarr.json with multiscales)
@@ -474,5 +482,46 @@ impl NewVolumeReference {
             location_type, location_str
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod local_path_tests {
+    use super::*;
+
+    fn local_volume() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let volume = root.path().join("scan with spaces.zarr");
+        std::fs::create_dir(&volume).unwrap();
+        std::fs::write(volume.join(".zarray"), r#"{"zarr_format":2,"shape":[64,64,64],"chunks":[64,64,64],"dtype":"|u1","compressor":null,"fill_value":0,"order":"C","filters":null}"#).unwrap();
+        (root, volume)
+    }
+
+    #[test]
+    fn local_volume_id_is_the_directory_name() {
+        let (_root, volume) = local_volume();
+        let native = volume.to_str().unwrap();
+        for path in [native.to_string(), native.replace('\\', "/"), format!("{native}/")] {
+            let reference = NewVolumeReference::from_path(path).unwrap();
+            assert_eq!(reference.id(), "scan with spaces.zarr");
+        }
+    }
+
+    #[test]
+    fn local_volume_key_can_be_created_as_one_cache_directory() {
+        let (root, volume) = local_volume();
+        let path = volume.to_str().unwrap();
+        let reference = NewVolumeReference::from_path(path).unwrap();
+        let key = unified_volume_key(&format!("file://{path}"), &reference.id());
+        assert_eq!(Path::new(&key).components().count(), 1);
+        std::fs::create_dir(root.path().join(key)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_volume_id_accepts_a_trailing_backslash() {
+        let (_root, volume) = local_volume();
+        let reference = NewVolumeReference::from_path(format!("{}\\", volume.display())).unwrap();
+        assert_eq!(reference.id(), "scan with spaces.zarr");
     }
 }
