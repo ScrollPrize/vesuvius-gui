@@ -223,6 +223,11 @@ fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
+    tokio::task::block_in_place(run_gui)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_gui() -> eframe::Result<()> {
     let args = Args::parse();
     let catalog = load_catalog();
 
