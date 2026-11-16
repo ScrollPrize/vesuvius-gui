@@ -349,6 +349,9 @@ impl VoxelVolume for UnifiedVolume {
         let target_lod = lod_for(downsampling.max(1) as u8);
         let max_lod = self.cache.max_lod();
 
+        if xyz.iter().any(|&value| !value.is_finite() || value < 0.0) {
+            return 0;
+        }
         let target_sx = (xyz[0] as i64).max(0) as u64;
         let target_sy = (xyz[1] as i64).max(0) as u64;
         let target_sz = (xyz[2] as i64).max(0) as u64;
@@ -490,7 +493,16 @@ impl UnifiedVolume {
         let ext_z = self.extent[2] as f64 / scale;
 
         while remaining > 0 {
-            if px < 0.0 || py < 0.0 || pz < 0.0 || px >= ext_x || py >= ext_y || pz >= ext_z {
+            if !px.is_finite()
+                || !py.is_finite()
+                || !pz.is_finite()
+                || px < 0.0
+                || py < 0.0
+                || pz < 0.0
+                || px >= ext_x
+                || py >= ext_y
+                || pz >= ext_z
+            {
                 if !sink(0) {
                     return;
                 }
@@ -697,6 +709,9 @@ impl UnifiedVolume {
         let target_lod = lod_for(downsampling.max(1) as u8);
         let max_lod = self.cache.max_lod();
 
+        if xyz.iter().any(|&value| !value.is_finite() || value < 0.0) {
+            return 0;
+        }
         let target_sx = (xyz[0] as i64).max(0) as u64;
         let target_sy = (xyz[1] as i64).max(0) as u64;
         let target_sz = (xyz[2] as i64).max(0) as u64;
@@ -1591,5 +1606,104 @@ impl PaintVolume for UnifiedVolume {
     fn shared(&self) -> VolumeCons {
         let cache = self.cache.clone();
         Box::new(move || VoxelPaintVolume::into_volume(UnifiedVolume::new(cache)))
+    }
+}
+
+#[cfg(test)]
+mod invalid_sample_tests {
+    use super::*;
+    use crate::cache::backfillers::ome_zarr::OmeZarrBackfiller;
+    use crate::cache::UnifiedCache;
+    use std::time::Duration;
+    use vesuvius_zarr::OmeZarrContext;
+
+    fn setup(warm: bool) -> (tempfile::TempDir, ChunkCache, UnifiedVolume) {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/PHerc0800-invalid-samples");
+        let source = Arc::new(OmeZarrBackfiller::from_ome(
+            "PHerc0800-invalid-samples",
+            OmeZarrContext::from_path(path),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let cache = UnifiedCache::for_cache_dir(temp.path()).open_volume_with_shard_chunks_per_axis(source, 2);
+        if warm {
+            assert!(cache
+                .wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(2))
+                .as_resident()
+                .is_some());
+        }
+        let volume = UnifiedVolume::new(cache.clone());
+        (temp, cache, volume)
+    }
+
+    #[test]
+    fn negative_nearest_samples_do_not_repeat_the_border_ct() {
+        let (_root, _cache, volume) = setup(true);
+        for axis in 0..3 {
+            for value in [-1.0, -0.25] {
+                let mut point = [2.0, 2.0, 1.0];
+                point[axis] = value;
+                assert_eq!(volume.get(point, 1), 0, "{point:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn negative_interpolation_does_not_repeat_the_border_ct() {
+        let (_root, _cache, volume) = setup(true);
+        for axis in 0..3 {
+            let mut point = [2.25, 2.25, 1.25];
+            point[axis] = -0.25;
+            assert_eq!(volume.get_interpolated(point, 1), 0, "{point:?}");
+        }
+    }
+
+    #[test]
+    fn nonfinite_samples_return_zero_in_both_paths() {
+        let (_root, _cache, volume) = setup(true);
+        for axis in 0..3 {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut point = [2.0, 2.0, 1.0];
+                point[axis] = value;
+                assert_eq!(volume.get(point, 1), 0, "nearest {point:?}");
+                assert_eq!(volume.get_interpolated(point, 1), 0, "interpolated {point:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_coordinates_do_not_dispatch_the_origin_chunk() {
+        let (_root, cache, volume) = setup(false);
+        assert_eq!(volume.get([-0.25, 2.0, 1.0], 1), 0);
+        assert!(cache.peek(ChunkKey::new(0, 0, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn nonfinite_rays_return_zero_samples() {
+        let (_root, _cache, volume) = setup(true);
+        for (base, direction) in [
+            ([f64::NAN, 2.0, 1.0], [1.0, 0.0, 0.0]),
+            ([2.0, 2.0, 1.0], [f64::NAN, 0.0, 0.0]),
+        ] {
+            let mut samples = [255; 3];
+            volume.gather_along_normal(base, direction, 1, &mut samples);
+            assert_eq!(samples, [0; 3]);
+        }
+    }
+
+    #[test]
+    fn valid_origin_and_nearby_ct_values_are_preserved() {
+        let (_root, _cache, volume) = setup(true);
+        let raw = include_bytes!("../../tests/data/PHerc0800-invalid-samples/0/0.0.0");
+        assert_ne!(raw[0], 0);
+        assert_eq!(volume.get([-0.0, 0.0, 0.0], 1), raw[0]);
+        let mut sum = 0u16;
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    sum += raw[(z * 8 + y) * 8 + x] as u16;
+                }
+            }
+        }
+        assert_eq!(volume.get_interpolated([0.5, 0.5, 0.5], 1), (sum / 8) as u8);
     }
 }
