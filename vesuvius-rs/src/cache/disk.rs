@@ -821,7 +821,11 @@ impl DiskStoreInner {
                 ),
             ));
         }
-        let mmap = unsafe { MmapOptions::new().len(total as usize).map(&file)? };
+        let mmap = unsafe {
+            #[cfg(windows)]
+            let file = File::open(&path)?;
+            MmapOptions::new().len(total as usize).map(&file)?
+        };
         let sca = self.shard_chunks_per_axis as u64;
         let lf = LodFile {
             file: Arc::new(file),
