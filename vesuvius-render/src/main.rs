@@ -275,7 +275,7 @@ pub struct Args {
 
     /// The tile size to split a segment into (for ergonomic reasons) (default 1024)
     #[clap(long)]
-    tile_size: Option<u32>,
+    tile_size: Option<std::num::NonZeroU32>,
 
     /// Number of tiles to render in parallel (CPU-bound stage). Defaults to
     /// the number of CPU threads.
@@ -300,7 +300,7 @@ pub struct Args {
     /// render_concurrency + prefetch_depth + 2). Only the collect and render
     /// stages use blocking threads; the ensure stage waits asynchronously.
     #[clap(long)]
-    worker_threads: Option<usize>,
+    worker_threads: Option<std::num::NonZeroUsize>,
 
     /// Emit a single plain progress line every N seconds (flushed) instead of
     /// the interactive progress bars. Useful for non-interactive logs (e.g.
@@ -337,7 +337,10 @@ fn main() -> Result<()> {
     // the renders and the prefetch tiles' collects so prefetch isn't starved.
     let render_conc = args.render_concurrency.unwrap_or(num_cpus::get());
     let prefetch = args.prefetch_depth.unwrap_or(4);
-    let threads = args.worker_threads.unwrap_or(render_conc + prefetch + 2);
+    let threads = args
+        .worker_threads
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(render_conc + prefetch + 2);
 
     // The cache cap is read once (cached) the first time a cache is built, so
     // it has to be set before any cache construction happens.
@@ -592,7 +595,7 @@ impl From<&Args> for RenderParams {
             } else {
                 ProjectionKind::None
             },
-            tile_size: args.tile_size.unwrap_or(1024) as usize,
+            tile_size: args.tile_size.map(std::num::NonZeroU32::get).unwrap_or(1024) as usize,
             w_range: args.min_layer.unwrap_or(25) as usize..=args.max_layer.unwrap_or(41) as usize,
             crop: args.crop.clone(),
             mid_layer: args.middle_layer.unwrap_or(32) as usize,
@@ -1381,5 +1384,35 @@ impl VoxelVolume for TileCollectingVolume {
             self.add_tile(((xyz[0] as usize) >> 6, (xyz[1] as usize) >> 6, (xyz[2] as usize) >> 6));
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod positive_option_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut args = vec!["vesuvius-render", "--tifxyz", "surface", "--target-dir", "output"];
+        args.extend_from_slice(extra);
+        Args::try_parse_from(args)
+    }
+
+    #[test]
+    fn rejects_zero_tile_size() {
+        assert!(parse(&["--tile-size", "0"]).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_worker_threads() {
+        assert!(parse(&["--worker-threads", "0"]).is_err());
+    }
+
+    #[test]
+    fn accepts_defaults_and_positive_counts() {
+        assert!(parse(&[]).is_ok());
+        for value in ["1", "16", "1024"] {
+            assert!(parse(&["--tile-size", value, "--worker-threads", value]).is_ok());
+        }
+        assert!(parse(&["--prefetch-depth", "0", "--progress-interval", "0"]).is_ok());
     }
 }
