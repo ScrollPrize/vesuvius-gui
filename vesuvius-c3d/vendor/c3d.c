@@ -15,8 +15,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define c3d_assume_aligned(ptr, alignment) __builtin_assume_aligned(ptr, alignment)
+#define c3d_prefetch(ptr) __builtin_prefetch(ptr, 0, 0)
+#else
+#define c3d_assume_aligned(ptr, alignment) (ptr)
+#define c3d_prefetch(ptr) ((void)0)
+#endif
+
+#if defined(_WIN32)
+#include <malloc.h>
+static void *c3d_aligned_alloc(size_t alignment, size_t size) {
+    return _aligned_malloc(size, alignment);
+}
+static void c3d_aligned_free(void *ptr) {
+    _aligned_free(ptr);
+}
+#else
+#define c3d_aligned_alloc aligned_alloc
+#define c3d_aligned_free free
+#endif
+
 /* Endianness gate — LE only. */
-#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#if !(defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64) || defined(_M_ARM64))) \
+    && (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__)
 #  error "c3d requires a little-endian target"
 #endif
 
@@ -436,7 +458,7 @@ static size_t c3d_rans_enc_x8(const uint8_t *symbols,     /* each < 65 */
     /* Per-lane enc: fast path for sym 0, else call into c3d_rans_enc_put. */
     #define ENC_LANE(LANE, SYM) do {                                              \
         uint8_t s_ = (SYM);                                                        \
-        if (__builtin_expect(s_ == 0, 1)) {                                        \
+        if (c3d_likely(s_ == 0)) {                                                 \
             uint32_t x = states[LANE];                                             \
             while (x >= x_max_0) {                                                 \
                 c3d_assert(buf_ptr > buf_beg);                                     \
@@ -563,7 +585,7 @@ static void c3d_rans_dec_x8(const uint8_t *in, size_t in_len,
     #define DEC_LANE(SREF, OUT) do {                                          \
         uint32_t st = (SREF);                                                 \
         uint32_t slot = st & M_mask;                                          \
-        if (__builtin_expect(slot < freq0, 1)) {                              \
+        if (c3d_likely(slot < freq0)) {                                       \
             (OUT) = 0;                                                        \
             (SREF) = freq0 * (st >> ds) + slot;                               \
         } else {                                                              \
@@ -576,7 +598,7 @@ static void c3d_rans_dec_x8(const uint8_t *in, size_t in_len,
     #define RENORM(SREF) do {                                                 \
         while ((SREF) < C3D_RANS_BYTE_L) {                                    \
             c3d_assert(r < r_e);                                              \
-            __builtin_prefetch(r + 64, 0, 0);                                 \
+            c3d_prefetch(r + 64);                                             \
             (SREF) = ((SREF) << 8) | *r++;                                    \
         }                                                                     \
     } while (0)
@@ -1083,7 +1105,7 @@ static void c3d_dwt_1d_inv_x4(float *restrict x, size_t N, float *restrict aux) 
 
 static void c3d_dwt3_fwd_level(float *restrict buf, size_t side, float *scratch) {
     (void)scratch;  /* per-thread buffers supersede the shared scratch. */
-    buf = __builtin_assume_aligned(buf, C3D_ALIGN);
+    buf = c3d_assume_aligned(buf, C3D_ALIGN);
     /* side ∈ {256,128,64,32,16}: power-of-2 ≥ 16, ≤ 256. */
     c3d_invariant(side >= 16u && side <= 256u);
     c3d_invariant((side & (side - 1u)) == 0u);
@@ -1142,7 +1164,7 @@ static void c3d_dwt3_fwd_level(float *restrict buf, size_t side, float *scratch)
 
 static void c3d_dwt3_inv_level(float *restrict buf, size_t side, float *scratch) {
     (void)scratch;  /* per-thread buffers supersede the shared scratch. */
-    buf = __builtin_assume_aligned(buf, C3D_ALIGN);
+    buf = c3d_assume_aligned(buf, C3D_ALIGN);
     c3d_invariant(side >= 16u && side <= 256u);
     c3d_invariant((side & (side - 1u)) == 0u);
 
@@ -1722,7 +1744,7 @@ struct c3d_decoder {
 c3d_encoder *c3d_encoder_new(void) {
     c3d_encoder *e = malloc(sizeof *e);
     c3d_assert(e);
-    e->coeff_buf    = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
+    e->coeff_buf    = c3d_aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
     e->sub_symbols  = malloc((size_t)128 * 128 * 128);
     e->sub_escapes  = malloc((size_t)128 * 128 * 128 / 4 + 1024);
     e->rans_scratch = malloc((size_t)128 * 128 * 128 * 2 + 1024);
@@ -1749,7 +1771,7 @@ c3d_encoder *c3d_encoder_new(void) {
 }
 void c3d_encoder_free(c3d_encoder *e) {
     if (!e) return;
-    free(e->coeff_buf);   free(e->sub_symbols);
+    c3d_aligned_free(e->coeff_buf);   free(e->sub_symbols);
     free(e->sub_escapes); free(e->rans_scratch);
     /* thread_* slot 0 aliased the three above; slots 1..N-1 are independently
      * allocated.  thread_out_scratch[0] was NULL. */
@@ -1760,14 +1782,14 @@ void c3d_encoder_free(c3d_encoder *e) {
     }
     for (unsigned i = 0; i < C3D_OMP_MAX_THREADS; ++i)
         free(e->thread_out_scratch[i]);
-    free(e->in_scratch);
+    c3d_aligned_free(e->in_scratch);
     free(e);
 }
 
 c3d_decoder *c3d_decoder_new(void) {
     c3d_decoder *d = malloc(sizeof *d);
     c3d_assert(d);
-    d->coeff_buf   = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
+    d->coeff_buf   = c3d_aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
     d->sub_symbols = malloc((size_t)128 * 128 * 128);
     c3d_assert(d->coeff_buf && d->sub_symbols);
     memset(d->thread_sub_symbols, 0, sizeof d->thread_sub_symbols);
@@ -1784,7 +1806,7 @@ void c3d_decoder_set_denoise(c3d_decoder *d, bool enabled) {
 }
 void c3d_decoder_free(c3d_decoder *d) {
     if (!d) return;
-    free(d->coeff_buf); free(d->sub_symbols); free(d->cached_tables);
+    c3d_aligned_free(d->coeff_buf); free(d->sub_symbols); free(d->cached_tables);
     /* Index 0 aliases sub_symbols (already freed).  Free the rest. */
     for (unsigned i = 1; i < C3D_OMP_MAX_THREADS; ++i)
         free(d->thread_sub_symbols[i]);
@@ -3220,7 +3242,7 @@ static void c3d_fill_mask_ignore(const uint8_t *restrict in,
 /* Ensure e->in_scratch is allocated.  Called from the _masked entry points. */
 static void c3d_encoder_ensure_in_scratch(c3d_encoder *e) {
     if (!e->in_scratch) {
-        e->in_scratch = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+        e->in_scratch = c3d_aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
         c3d_assert(e->in_scratch);
     }
 }
