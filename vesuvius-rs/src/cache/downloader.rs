@@ -323,18 +323,27 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
                 }
-                // 200 OK is the un-ranged success; 206 Partial Content is the
-                // ranged success. Some servers return 200 with the full body
-                // when they ignore Range — caller decides whether that's
-                // acceptable. Here we surface either as Ok(Some(bytes)).
-                if code == 200 || code == 206 {
+                if code == 200 && job.range.is_some() {
+                    Err(DownloadError::Transient("server ignored Range header".into()))
+                } else if code == 206 && job.range.is_some_and(|range| {
+                    !resp.headers().get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| content_range_matches(value, range))
+                }) {
+                    Err(DownloadError::Transient("Content-Range does not match requested range".into()))
+                } else if code == 200 || code == 206 {
                     let t_body = Instant::now();
                     match resp.bytes() {
                         Ok(bytes) => {
                             body_ms = t_body.elapsed().as_millis() as u64;
                             got_bytes = bytes.len() as u64;
                             log::trace!("[{}] {} ({} bytes, {:?})", job.url, code, bytes.len(), t0.elapsed());
-                            Ok(Some(bytes))
+                            match job.range {
+                                Some((_, len)) if got_bytes != len => {
+                                    Err(DownloadError::Transient(format!("requested {} bytes, got {}", len, got_bytes)))
+                                }
+                                _ => Ok(Some(bytes)),
+                            }
                         }
                         Err(e) => Err(DownloadError::Transient(format!("read body: {}", e))),
                     }
@@ -384,5 +393,159 @@ fn worker_loop(inner: Arc<DownloaderInner>, client: Client) {
         }
 
         (job.on_done)(outcome);
+    }
+}
+
+fn content_range_matches(value: &str, (offset, len): (u64, u64)) -> bool {
+    let Some((unit, range)) = value.split_once(' ') else {
+        return false;
+    };
+    let Some((bounds, total)) = range.split_once('/') else {
+        return false;
+    };
+    let Some((first, last)) = bounds.split_once('-') else {
+        return false;
+    };
+    let (Ok(first), Ok(last)) = (first.parse::<u64>(), last.parse::<u64>()) else {
+        return false;
+    };
+    let Some(expected_last) = len.checked_sub(1).and_then(|len| offset.checked_add(len)) else {
+        return false;
+    };
+    unit.eq_ignore_ascii_case("bytes")
+        && first == offset
+        && last == expected_last
+        && (total == "*" || total.parse::<u64>().is_ok_and(|total| total > last))
+}
+
+#[cfg(test)]
+mod range_response_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    const CT: &[u8] =
+        include_bytes!("../../../vesuvius-c3d/tests/fixtures/subchunk_5_3_3__0_0_0.c3dc");
+
+    fn download(status: u16, body: Vec<u8>) -> DownloadResult {
+        download_with_range(
+            status,
+            body,
+            Some(format!("bytes 16-{}/{}", 16 + CT.len() - 1, 16 + CT.len())),
+        )
+    }
+
+    fn download_with_range(
+        status: u16,
+        body: Vec<u8>,
+        content_range: Option<String>,
+    ) -> DownloadResult {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/shard", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.contains(&format!("range: bytes=16-{}", 16 + CT.len() - 1)));
+            let range_header = content_range
+                .map(|value| format!("Content-Range: {value}\r\n"))
+                .unwrap_or_default();
+            let headers = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n{range_header}Connection: close\r\n\r\n", body.len());
+            stream.write_all(headers.as_bytes()).unwrap();
+            let _ = stream.write_all(&body);
+        });
+        let downloader = Downloader::with_workers(1);
+        let (send, receive) = mpsc::channel();
+        downloader.submit(
+            &url,
+            Some((16, CT.len() as u64)),
+            ChunkKey::new(0, 0, 0, 0),
+            Box::new(move |result| {
+                send.send(result).unwrap();
+            }),
+        );
+        let result = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn partial_ct_response_decodes_the_requested_chunk() {
+        let bytes = download(206, CT.to_vec()).unwrap().unwrap();
+        assert_eq!(bytes.as_ref(), CT);
+        let expected = vesuvius_c3d::with_decoder(|decoder| decoder.decode(CT)).unwrap();
+        let actual = vesuvius_c3d::with_decoder(|decoder| decoder.decode(&bytes)).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ignored_range_is_a_retryable_error() {
+        let mut shard = vec![0; 16];
+        shard.extend_from_slice(CT);
+        assert!(matches!(
+            download(200, shard),
+            Err(DownloadError::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn short_partial_ct_response_is_a_retryable_error() {
+        assert!(matches!(
+            download(206, CT[..CT.len() - 1].to_vec()),
+            Err(DownloadError::Transient(_))
+        ));
+    }
+    #[test]
+    fn wrong_partial_offset_is_a_retryable_error() {
+        let range = format!("bytes 17-{}/{}", 17 + CT.len() - 1, 17 + CT.len());
+        assert!(matches!(
+            download_with_range(206, CT.to_vec(), Some(range)),
+            Err(DownloadError::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn missing_content_range_is_a_retryable_error() {
+        assert!(matches!(
+            download_with_range(206, CT.to_vec(), None),
+            Err(DownloadError::Transient(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_content_ranges_are_retryable_errors() {
+        for range in [
+            "bytes 16-0/100",
+            "bytes 16-687272/687272",
+            "bytes 16-687272/not-a-number",
+            "items 16-687272/687273",
+            "bytes 16-184467440737095516160/184467440737095516161",
+        ] {
+            assert!(
+                matches!(
+                    download_with_range(206, CT.to_vec(), Some(range.into())),
+                    Err(DownloadError::Transient(_))
+                ),
+                "{range}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_complete_length_preserves_ct_bytes() {
+        let range = format!("BYTES 16-{}/*", 16 + CT.len() - 1);
+        let bytes = download_with_range(206, CT.to_vec(), Some(range))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.as_ref(), CT);
     }
 }
