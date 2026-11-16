@@ -1309,18 +1309,10 @@ async fn monitor_runtime_stats(multi: &MultiProgress) {
     });
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct TileCollectingVolumeState {
     requested_tiles: BTreeSet<(usize, usize, usize)>,
-    last_requested: (usize, usize, usize),
-}
-impl Default for TileCollectingVolumeState {
-    fn default() -> Self {
-        Self {
-            requested_tiles: BTreeSet::new(),
-            last_requested: (0, 0, 0),
-        }
-    }
+    last_requested: Option<(usize, usize, usize)>,
 }
 
 /// A VoxelVolume implementation that just collects needed tiles
@@ -1336,8 +1328,8 @@ impl TileCollectingVolume {
     }
     fn add_tile(&self, tile: (usize, usize, usize)) {
         let mut state = self.state.borrow_mut();
-        if state.last_requested != tile {
-            state.last_requested = tile;
+        if state.last_requested != Some(tile) {
+            state.last_requested = Some(tile);
             state.requested_tiles.insert(tile);
         }
     }
@@ -1381,5 +1373,41 @@ impl VoxelVolume for TileCollectingVolume {
             self.add_tile(((xyz[0] as usize) >> 6, (xyz[1] as usize) >> 6, (xyz[2] as usize) >> 6));
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod origin_chunk_tests {
+    use super::*;
+
+    #[test]
+    fn first_integer_sample_collects_the_origin_chunk() {
+        let collector = TileCollectingVolume::new();
+        collector.get([42.0, 32.0, 35.0], 1);
+        assert_eq!(collector.state.borrow().requested_tiles, BTreeSet::from([(0, 0, 0)]));
+    }
+
+    #[test]
+    fn first_interpolated_sample_collects_the_origin_chunk() {
+        let collector = TileCollectingVolume::new();
+        collector.get_interpolated([42.25, 32.5, 35.75], 1);
+        assert_eq!(collector.state.borrow().requested_tiles, BTreeSet::from([(0, 0, 0)]));
+    }
+
+    #[test]
+    fn repeated_samples_and_chunk_transitions_are_deduplicated() {
+        let collector = TileCollectingVolume::new();
+        for point in [
+            [42.0, 32.0, 35.0],
+            [43.0, 32.0, 35.0],
+            [64.0, 32.0, 35.0],
+            [42.0, 32.0, 35.0],
+        ] {
+            collector.get(point, 1);
+        }
+        assert_eq!(
+            collector.state.borrow().requested_tiles,
+            BTreeSet::from([(0, 0, 0), (1, 0, 0)])
+        );
     }
 }
