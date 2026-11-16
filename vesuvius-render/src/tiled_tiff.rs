@@ -14,10 +14,6 @@
 //! the small `TileOffsets`/`TileByteCounts` arrays are held until `finish`.
 //! Peak memory becomes O(a few in-flight tiles) instead of O(whole layer).
 //!
-//! TIFF stores edge tiles at *full* tile size with padding the reader clips to
-//! `ImageWidth`/`ImageLength`, which matches how the renderer paints full tiles
-//! that overhang the image — so tiles are written verbatim, no clipping.
-
 use anyhow::{bail, Result};
 use std::fs::File;
 use std::io::BufWriter;
