@@ -445,15 +445,6 @@ impl UnifiedVolume {
     /// sink so each `CompositorRef` arm gets its own monomorphization —
     /// `sink(v)` inlines to the concrete `CompositionState::update` body,
     /// no virtual dispatch in the hot loop.
-    ///
-    /// The inner loop is intentionally chunk-state-unaware: it reads
-    /// straight off the target-LOD shard mmap with no atomic probes, no
-    /// LOD climb, no slow-mode fallback. Pre-dispatch (see
-    /// `touch_aabb`, called per-triangle by `ObjVolume::paint`) lands the
-    /// chunks the ray crosses before this is called; un-arrived bytes
-    /// read as zero from the sparse mmap, and the optional one-level
-    /// upscale-from-parent path in `touch_aabb` fills target chunks with
-    /// a preview while the real bytes stream in.
     fn composite_along_normal_inner<F: FnMut(u8) -> bool>(
         &self,
         base: [f64; 3],
@@ -506,6 +497,16 @@ impl UnifiedVolume {
             let target_cx = (txu / 64) as u32;
             let target_cy = (tyu / 64) as u32;
             let target_cz = (tzu / 64) as u32;
+            if self.sidecar_state(target_lod, target_cx, target_cy, target_cz) == Some(STATE_EMPTY) {
+                if !sink(0) {
+                    return;
+                }
+                px += dx;
+                py += dy;
+                pz += dz;
+                remaining -= 1;
+                continue;
+            }
             let (shard, in_shard_idx) = self.shard_decompose(target_cx, target_cy, target_cz);
             self.populate_shard_slot(target_lod, shard);
 
@@ -580,7 +581,9 @@ impl UnifiedVolume {
                 // unwritten chunk reads kernel-zero from the sparse mmap.
                 let same_shard = nx_c >> sh == shard.0 && ny_c >> sh == shard.1 && nz_c >> sh == shard.2;
                 let home_slice = unsafe { std::slice::from_raw_parts(chunk_base, CHUNK_VOXELS) };
-                let v = if same_shard {
+                let v = if self.sidecar_state(target_lod, nx_c, ny_c, nz_c) == Some(STATE_EMPTY) {
+                    sample_boundary_1axis(home_slice, None, bx, by, bz, txu, tyu, tzu, px, py, pz)
+                } else if same_shard {
                     let nwx = (nx_c & mask) as u64;
                     let nwy = (ny_c & mask) as u64;
                     let nwz = (nz_c & mask) as u64;
@@ -706,11 +709,10 @@ impl UnifiedVolume {
         let target_cx = (target_sx / 64) as u32;
         let target_cy = (target_sy / 64) as u32;
         let target_cz = (target_sz / 64) as u32;
+        if self.sidecar_state(target_lod, target_cx, target_cy, target_cz) == Some(STATE_EMPTY) {
+            return 0;
+        }
 
-        // Trust-resident path (offline renderer): the ensure stage already
-        // made every chunk this tile touches resident, so skip the
-        // per-voxel chunk-state probe + DashMap lookup entirely and read
-        // straight off the target-LOD shard mmap, like the composite path.
         if self.cache.assume_resident() {
             return self.interpolate_u8_trusting(xyz, target_lod, target_cx, target_cy, target_cz);
         }
@@ -889,12 +891,6 @@ impl UnifiedVolume {
         result
     }
 
-    /// Trust-resident variant of `interpolate_u8` (see `ChunkCache`'s
-    /// `assume_resident` field). Reads straight off the target-LOD shard
-    /// mmap with no chunk-state probe, no DashMap lookup, and no LOD climb,
-    /// mirroring `composite_along_normal_inner`'s inner read. The offline
-    /// renderer's ensure stage guarantees the bytes are present; anything
-    /// un-arrived reads as zero from the sparse mmap.
     fn interpolate_u8_trusting(
         &self,
         xyz: [f64; 3],
@@ -972,6 +968,9 @@ impl UnifiedVolume {
         let cx = (sx / 64) as u32;
         let cy = (sy / 64) as u32;
         let cz = (sz / 64) as u32;
+        if self.sidecar_state(target_lod, cx, cy, cz) == Some(STATE_EMPTY) {
+            return 0;
+        }
         let (shard, in_shard_idx) = self.shard_decompose(cx, cy, cz);
         self.populate_shard_slot(target_lod, shard);
         let b = self.local.borrow();

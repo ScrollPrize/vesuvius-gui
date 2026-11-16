@@ -1,0 +1,24 @@
+{
+  "volume_url": "https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+  "native_chunk": "91/47/25",
+  "native_chunk_sha256": "6784a75ce2a9df9b28831a755e1c0524a252b1b93dabae5af4d0bb9d578f563f",
+  "roi_origin_xyz": [
+    3264,
+    6031,
+    11712
+  ],
+  "roi_shape_zyx": [
+    64,
+    64,
+    64
+  ],
+  "roi_sha256": "2949bae623b925e0977397bc58ef0148bfc0a2d2b1cc5b11ecc4e458955b824b",
+  "coarse_shape_zyx": [
+    32,
+    32,
+    32
+  ],
+  "coarse_sha256": "f3d5e91ed46c6d1fb6b673c98d116074f265525cc685e919570cf6d9c2f7dc3c",
+  "processing": "Unchanged real CT values at every second voxel, with scale 2 metadata",
+  "fine_chunk": "Intentionally absent to model a sparse or partially downloaded array; fill value is zero"
+}

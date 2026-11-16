@@ -2213,3 +2213,186 @@ fn upsample_from_parent(parent: &[u8], target_cx: u32, target_cy: u32, target_cz
     }
     out
 }
+
+#[cfg(test)]
+mod empty_preview_tests {
+    use super::*;
+    use crate::cache::backfillers::ome_zarr::OmeZarrBackfiller;
+    use crate::cache::UnifiedVolume;
+    use crate::volume::VoxelVolume;
+    use std::sync::mpsc;
+    use vesuvius_zarr::OmeZarrContext;
+
+    struct GatedPyramid {
+        inner: OmeZarrBackfiller,
+        gate: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+        extent: [u32; 3],
+    }
+
+    impl ChunkBackfiller for GatedPyramid {
+        fn max_lod(&self) -> u8 {
+            self.inner.max_lod()
+        }
+        fn voxel_extent(&self) -> [u32; 3] {
+            self.extent
+        }
+        fn volume_id(&self) -> String {
+            self.inner.volume_id()
+        }
+        fn plan(&self, key: ChunkKey) -> Result<BackfillPlan, BackfillError> {
+            let mut plan = self.inner.plan(key)?;
+            if key.lod == 0 {
+                if let Some(gate) = self.gate.clone() {
+                    plan.sources = plan
+                        .sources
+                        .into_iter()
+                        .map(|source| {
+                            let SourceSpec::Compute { key, fetch } = source else {
+                                panic!("expected local CT source")
+                            };
+                            let gate = gate.clone();
+                            SourceSpec::Compute {
+                                key,
+                                fetch: Box::new(move || {
+                                    gate.lock()
+                                        .unwrap()
+                                        .recv_timeout(Duration::from_secs(5))
+                                        .map_err(|error| {
+                                            BackfillError::Transient(error.to_string())
+                                        })?;
+                                    fetch()
+                                }),
+                            }
+                        })
+                        .collect();
+                }
+            }
+            Ok(plan)
+        }
+    }
+
+    fn setup(gate: Option<mpsc::Receiver<()>>) -> (tempfile::TempDir, ChunkCache, UnifiedVolume) {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/PHerc0800-empty-preview"
+        );
+        let source = GatedPyramid {
+            inner: OmeZarrBackfiller::from_ome(
+                "PHerc0800-empty-preview",
+                OmeZarrContext::from_path(path),
+            ),
+            gate: gate.map(|gate| Arc::new(Mutex::new(gate))),
+            extent: [64; 3],
+        };
+        let root = tempfile::tempdir().unwrap();
+        let cache = UnifiedCache::for_cache_dir(root.path())
+            .open_volume_with_shard_chunks_per_axis(Arc::new(source), 2);
+        let parent = cache.wait_for(ChunkKey::new(1, 0, 0, 0), Duration::from_secs(3));
+        assert!(parent.as_resident().is_some());
+        let volume = UnifiedVolume::new(cache.clone());
+        (root, cache, volume)
+    }
+
+    fn empty_volume() -> (tempfile::TempDir, ChunkCache, UnifiedVolume) {
+        let (root, cache, volume) = setup(None);
+        let state = cache.wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(3));
+        assert!(state.is_empty());
+        let preview = cache.peek_shard(0, (0, 0, 0)).unwrap();
+        assert!(
+            preview.mmap[..CHUNK_VOXELS].iter().any(|&value| value != 0),
+            "the real CT preview must exist in the sparse file"
+        );
+        assert_eq!(volume.get([20.0, 20.0, 20.0], 1), 0);
+        (root, cache, volume)
+    }
+
+    #[test]
+    fn trusting_interpolation_respects_empty_over_preview_bytes() {
+        let (_root, cache, volume) = empty_volume();
+        assert_eq!(volume.get_interpolated([20.25; 3], 1), 0);
+        cache.set_assume_resident(true);
+        assert_eq!(volume.get_interpolated([20.25; 3], 1), 0);
+    }
+
+    #[test]
+    fn ray_gather_and_max_respect_empty_over_preview_bytes() {
+        let (_root, _cache, volume) = empty_volume();
+        let mut samples = [255; 3];
+        volume.gather_along_normal([20.25; 3], [0.5, 0.0, 0.0], 1, &mut samples);
+        assert_eq!(samples, [0; 3]);
+        assert_eq!(
+            volume.max_along_normal([20.25; 3], [0.5, 0.0, 0.0], 0.0, 3.0, 1),
+            0
+        );
+    }
+
+    #[test]
+    fn cached_coarse_interpolation_stops_when_fine_becomes_empty() {
+        let (send, receive) = mpsc::channel();
+        let (_root, cache, volume) = setup(Some(receive));
+        assert_ne!(volume.get_interpolated([20.25; 3], 1), 0);
+        send.send(()).unwrap();
+        assert!(cache
+            .wait_for(ChunkKey::new(0, 0, 0, 0), Duration::from_secs(3))
+            .is_empty());
+        assert_eq!(volume.get_interpolated([20.25; 3], 1), 0);
+    }
+
+    #[test]
+    fn resident_ct_samples_are_unchanged() {
+        let (_root, cache, volume) = setup(None);
+        let expected = volume.get_interpolated([10.25; 3], 2);
+        assert_ne!(expected, 0);
+        cache.set_assume_resident(true);
+        assert_eq!(volume.get_interpolated([10.25; 3], 2), expected);
+        let expected: Vec<u8> = (0..3)
+            .map(|index| volume.get_interpolated([10.25 + index as f64 * 0.5, 10.25, 10.25], 2))
+            .collect();
+        let mut actual = [0; 3];
+        volume.gather_along_normal([10.25; 3], [0.5, 0.0, 0.0], 2, &mut actual);
+        assert_eq!(actual.as_slice(), expected);
+    }
+
+    #[test]
+    fn empty_neighbor_preview_is_zero_at_chunk_and_shard_boundaries() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/PHerc0800-empty-preview"
+        );
+        for home_x in [0, 1] {
+            let root = tempfile::tempdir().unwrap();
+            let source = GatedPyramid {
+                inner: OmeZarrBackfiller::from_ome(
+                    "PHerc0800-boundary-preview",
+                    OmeZarrContext::from_path(path),
+                ),
+                gate: None,
+                extent: [192, 64, 64],
+            };
+            let cache = UnifiedCache::for_cache_dir(root.path())
+                .open_volume_with_shard_chunks_per_axis(Arc::new(source), 2);
+            assert!(cache
+                .wait_for(ChunkKey::new(1, 0, 0, 0), Duration::from_secs(3))
+                .as_resident()
+                .is_some());
+            let bytes = cache.peek_shard(1, (0, 0, 0)).unwrap().mmap[..CHUNK_VOXELS].to_vec();
+            let home = ChunkKey::new(0, home_x, 0, 0);
+            let neighbor = ChunkKey::new(0, home_x + 1, 0, 0);
+            cache.inner.disk.write_atomic(home, &bytes).unwrap();
+            assert!(cache
+                .inner
+                .disk
+                .write_unconfirmed(neighbor, &bytes)
+                .unwrap());
+            cache.inner.disk.mark_empty(neighbor).unwrap();
+            let volume = UnifiedVolume::new(cache.clone());
+            let point = [home_x as f64 * 64.0 + 63.5, 20.25, 20.25];
+            let expected = volume.get_interpolated(point, 1);
+            cache.set_assume_resident(true);
+            assert_eq!(volume.get_interpolated(point, 1), expected);
+            let mut samples = [255];
+            volume.gather_along_normal(point, [0.0, 0.0, 0.0], 1, &mut samples);
+            assert_eq!(samples, [expected]);
+        }
+    }
+}
